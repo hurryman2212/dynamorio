@@ -351,6 +351,15 @@ typedef struct {
      * usage by not allocating bookkeeping data needed for dynamic handling.
      */
     bool never_enable_dynamic_handling;
+    /**
+     * Preserve application registers and arithmetic flags across the dispatcher even
+     * when the original block overwrites them before reading them. Set to true when
+     * instrumentation observes the incoming application context, including return
+     * values discarded by the application. By default, dead values may be clobbered.
+     * The pointer-sized boolean occupies a new field beyond older structure padding,
+     * so callers with an older struct_size retain the default behavior.
+     */
+    uintptr_t preserve_app_context;
 } drbbdup_options_t;
 
 /**
