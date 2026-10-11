@@ -1309,14 +1309,6 @@ dr_unregister_post_syscall_event(void (*func)(void *drcontext, int sysnum));
 
 #ifdef UNIX
 
-/* XXX: for PR 304708 I originally included siginfo_t in
- * dr_siginfo_t.  But can we really trust siginfo_t to be identical on
- * all supported platforms?  Esp. once we start supporting VMKUW,
- * MacOS, etc.  I'm removing it for now.  None of my samples need it,
- * and in my experience its fields are unreliable in any case.
- * PR 371370 covers re-adding it if users request it.
- * If we re-add it, we should use our kernel_siginfo_t version.
- */
 /**
  * Data structure passed with a signal event.  Contains the machine
  * context at the signal interruption point and other signal
@@ -1361,7 +1353,32 @@ typedef struct _dr_siginfo_t {
      * at the signal interruption point.
      */
     dr_fault_fragment_info_t fault_fragment_info;
+    /**
+     * Read-only OS signal information, valid only during this callback. On Linux,
+     * this points to the kernel's 128-byte siginfo layout for the current process
+     * architecture. Clients must check \p os_siginfo_size before copying it into
+     * their platform's siginfo_t. Addresses in this information may still refer to
+     * the code cache; use \p mcontext for the translated application PC. NULL on
+     * platforms where native signal information is not provided.
+     */
+    const void *os_siginfo;
+    /** Size in bytes of the information at \p os_siginfo, or zero if unavailable. */
+    size_t os_siginfo_size;
 } dr_siginfo_t;
+
+DR_API
+/**
+ * Copies the native signal information for a signal event into \p buffer. On
+ * Linux, \p buffer_size must match the kernel's 128-byte siginfo layout for the
+ * current process architecture. The supplied \p info must belong to the current
+ * signal callback. Addresses may still refer to the code cache: use
+ * \p info->mcontext for the translated application PC.
+ *
+ * Returns false without modifying \p buffer when native information is unavailable,
+ * a pointer is NULL, or the buffer size does not match the native information.
+ */
+bool
+dr_get_signal_siginfo(const dr_siginfo_t *info, void *buffer, size_t buffer_size);
 
 /**
  * Return value of client signal event callback, determining how DR will
