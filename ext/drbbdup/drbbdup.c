@@ -1028,10 +1028,14 @@ drbbdup_encode_runtime_case(void *drcontext, drbbdup_per_thread *pt, void *tag,
         manager->scratch_reg = DRBBDUP_SCRATCH_REG_NO_FLAGS;
     } else {
         drreg_are_aflags_dead(drcontext, where, &manager->are_flags_dead);
+        if (opts.preserve_app_context)
+            manager->are_flags_dead = false;
         manager->scratch_reg = DRBBDUP_SCRATCH_REG;
     }
     drreg_is_register_dead(drcontext, manager->scratch_reg, where,
                            &manager->is_scratch_reg_dead);
+    if (opts.preserve_app_context)
+        manager->is_scratch_reg_dead = false;
 #else
     /* Since RISC-V does not have a flags register, always use the standard reg. */
     manager->scratch_reg = DRBBDUP_SCRATCH_REG;
@@ -1047,6 +1051,8 @@ drbbdup_encode_runtime_case(void *drcontext, drbbdup_per_thread *pt, void *tag,
         manager->is_scratch_reg2_needed = true;
         drreg_is_register_dead(drcontext, DRBBDUP_SCRATCH_REG2, where,
                                &manager->is_scratch_reg2_dead);
+        if (opts.preserve_app_context)
+            manager->is_scratch_reg2_dead = false;
         if (!manager->is_scratch_reg2_dead) {
             drbbdup_spill_register(drcontext, bb, where, DRBBDUP_SCRATCH_REG2_SLOT,
                                    DRBBDUP_SCRATCH_REG2);
@@ -2374,6 +2380,7 @@ drbbdup_init(drbbdup_options_t *ops_in)
     /* Do not copy from beyond ops_in.  We ruled out ops_in being larger than opts
      * above.  Fields beyond ops_in will be left zero.
      */
+    memset(&opts, 0, sizeof(opts));
     memcpy(&opts, ops_in, ops_in->struct_size);
 
     drreg_options_t drreg_ops = { sizeof(drreg_ops), 0 /* no regs needed */, false, NULL,
