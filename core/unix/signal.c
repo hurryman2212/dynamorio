@@ -4168,6 +4168,18 @@ transfer_from_sig_handler_to_fcache_return(dcontext_t *dcontext, kernel_ucontext
     });
 }
 
+DR_API
+bool
+dr_get_signal_siginfo(const dr_siginfo_t *info, void *buffer, size_t buffer_size)
+{
+    if (info == NULL || buffer == NULL || info->os_siginfo == NULL ||
+        info->os_siginfo_size != sizeof(kernel_siginfo_t) ||
+        buffer_size != info->os_siginfo_size)
+        return false;
+    memcpy(buffer, info->os_siginfo, buffer_size);
+    return true;
+}
+
 static dr_signal_action_t
 send_signal_to_client(dcontext_t *dcontext, int sig, sigframe_rt_t *frame,
                       sigcontext_t *raw_sc, byte *access_address, bool blocked,
@@ -4227,6 +4239,13 @@ send_signal_to_client(dcontext_t *dcontext, int sig, sigframe_rt_t *frame,
      */
     si.access_address = access_address;
     si.blocked = blocked;
+#ifdef LINUX
+    si.os_siginfo = SIGINFO_FROM_RT_FRAME(frame);
+    si.os_siginfo_size = sizeof(*SIGINFO_FROM_RT_FRAME(frame));
+#else
+    si.os_siginfo = NULL;
+    si.os_siginfo_size = 0;
+#endif
     ucontext_to_mcontext(dr_mcontext_as_priv_mcontext(si.mcontext), uc);
     /* We disallow the client calling dr_redirect_execution(), so we
      * will not leak si
