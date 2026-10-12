@@ -943,6 +943,74 @@ DR_API
 bool
 dr_redirect_execution(dr_mcontext_t *context);
 
+DR_API
+/**
+ * Returns this thread's userspace-execution generation. Capture it before validating
+ * a userspace region and pass it to dr_redirect_userspace_execution(). A concurrent
+ * dr_cancel_suspended_userspace_execution() invalidates the generation, including
+ * decisions made before a redirect was queued. Supported only on Linux x86-64.
+ */
+uint64
+dr_userspace_execution_generation(void *drcontext);
+
+DR_API
+/**
+ * Resumes this thread directly at the application PC in \p context while retaining
+ * DynamoRIO's thread state and signal handlers. The context requirements and clean
+ * call restrictions are the same as for dr_redirect_execution(). Supported only on
+ * Linux x86-64. Returns false without redirecting on unsupported platforms.
+ * The clean call must use #DR_CLEANCALL_SAVE_FLOAT and
+ * #DR_CLEANCALL_ALWAYS_OUT_OF_LINE without any NOSAVE flags. Its saved x87, MMX,
+ * and MXCSR state is preserved as well as the GPR, flags, and SIMD context.
+ *
+ * The client must restrict execution to verified application code and arrange for every
+ * system call, thread creation, code modification, and transfer out of that region
+ * to re-enter the code cache before taking effect. DynamoRIO cannot intercept an
+ * unpatched system call or control transfer executed directly by the processor.
+ * JMP gateways encoded by dr_encode_userspace_gate() re-enter entirely in userspace.
+ * Application signals continue through the normal signal event and application-handler
+ * delivery paths.
+ * A signal interrupting userspace execution already has application addresses.
+ *
+ * Unlike #DR_EMIT_GO_NATIVE, this does not stop managing the thread, remove signal
+ * handlers, or affect any other thread. A pending signal may cause execution to
+ * resume in the code cache instead. As with dr_redirect_execution(), successful
+ * redirection does not return. The supplied \p generation must have been obtained
+ * before validating the userspace region. A cancelled generation returns false, or
+ * resumes in the code cache if cancellation happens after redirecting.
+ */
+bool
+dr_redirect_userspace_execution(dr_mcontext_t *context, uint64 generation);
+
+DR_API
+/**
+ * Encodes a Linux x86-64 userspace gateway into \p buffer and returns its size,
+ * or zero if unsupported or the buffer is too small. A capacity of 64 bytes is
+ * sufficient. The buffer must be writable DynamoRIO-owned memory; make it executable
+ * before publishing a JMP to it. The client owns and releases the allocation after
+ * no application thread can execute it.
+ *
+ * Enter only from dr_redirect_userspace_execution()'s managed userspace regions, by JMP
+ * (not CALL). The gateway preserves all GPRs, flags, SIMD, x87, MXCSR, and the original
+ * stack including its red zone, then resumes the code cache at \p application_pc.
+ * A #DR_XFER_CLIENT_USERSPACE_GATE event reports the original context before dispatch.
+ * The client must supply original bytes through dr_register_userspace_gate_decoder()
+ * for every instruction overwritten by its patch. Asynchronous signals during the
+ * gateway are deferred until ordinary dispatch can deliver the saved app context.
+ */
+size_t
+dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc);
+
+DR_API
+/**
+ * Returns whether \p drcontext is in a client-managed userspace region. Intended for
+ * signal event callbacks to distinguish original application PCs from code-cache
+ * PCs. This is independent of dr_is_thread_native(), since the thread remains under
+ * DynamoRIO's signal and lifecycle management. A NULL context returns false.
+ */
+bool
+dr_is_client_userspace(void *drcontext);
+
 /** Flags to request non-default preservation of state in a clean call */
 #define SPILL_SLOT_REDIRECT_NATIVE_TGT SPILL_SLOT_1
 

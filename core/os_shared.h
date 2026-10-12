@@ -474,6 +474,11 @@ void
 os_page_size_init(const char **env, bool env_followed_by_auxv);
 size_t
 os_minsigstksz(void);
+#    if defined(LINUX) && defined(X86) && defined(X64)
+/* Cached kernel capability, initialized from auxv before TLS setup. */
+bool
+os_fsgsbase_enabled(void);
+#    endif
 #endif
 bool
 get_memory_info(const byte *pc, byte **base_pc, size_t *size, uint *prot);

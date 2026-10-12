@@ -2069,7 +2069,11 @@ relocate_dynamorio(byte *dr_map, size_t dr_size, byte *sp)
     if (privload_get_os_privmod_data(dr_map, &opd))
         privload_early_relocate_os_privmod_data(&opd, dr_map);
 
-    os_page_size_init(env, true);
+    /* Ptrace injection reuses _start with a register context in place of argv,
+     * envp, and auxv.  Do not interpret that synthetic stack as kernel metadata.
+     */
+    if (argc != (ptr_uint_t)ARGC_PTRACE_SENTINEL)
+        os_page_size_init(env, true);
 }
 
 /* i#1227: on a conflict with the app we reload ourselves.

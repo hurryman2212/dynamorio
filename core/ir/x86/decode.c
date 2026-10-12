@@ -2512,6 +2512,12 @@ byte *
 decode_eflags_usage(void *drcontext, byte *pc, uint *usage, dr_opnd_query_flags_t flags)
 {
     dcontext_t *dcontext = (dcontext_t *)drcontext;
+    size_t original_length;
+    const byte *original = userspace_gate_original(pc, &original_length);
+    if (original != NULL) {
+        byte *next = decode_eflags_usage(drcontext, (byte *)original, usage, flags);
+        return next == original + original_length ? pc + original_length : NULL;
+    }
     const instr_info_t *info;
     decode_info_t di;
     IF_X64(di.x86_mode = get_x86_mode(dcontext));
@@ -2522,10 +2528,14 @@ decode_eflags_usage(void *drcontext, byte *pc, uint *usage, dr_opnd_query_flags_
 
     *usage = instr_eflags_conditionally(
         info->eflags, decode_predicate_from_instr_info(info->type, info), flags);
-    pc = decode_next_pc(dcontext, pc);
+    byte *next = decode_next_pc(dcontext, pc);
     /* failure handled fine -- we'll go ahead and return the NULL */
-
-    return pc;
+    original = userspace_gate_original(pc, &original_length);
+    if (original != NULL) {
+        next = decode_eflags_usage(drcontext, (byte *)original, usage, flags);
+        return next == original + original_length ? pc + original_length : NULL;
+    }
+    return next;
 }
 
 /* Decodes the opcode and eflags usage of instruction at address pc
@@ -2541,6 +2551,8 @@ decode_eflags_usage(void *drcontext, byte *pc, uint *usage, dr_opnd_query_flags_
 byte *
 decode_opcode(dcontext_t *dcontext, byte *pc, instr_t *instr)
 {
+    if (userspace_gate_decoding_enabled())
+        return decode(dcontext, pc, instr);
     const instr_info_t *info;
     decode_info_t di;
     int sz;
@@ -2788,7 +2800,39 @@ byte *
 decode(void *drcontext, byte *pc, instr_t *instr)
 {
     dcontext_t *dcontext = (dcontext_t *)drcontext;
-    return decode_common(dcontext, pc, pc, instr);
+    size_t original_length;
+    const byte *original = userspace_gate_original(pc, &original_length);
+    if (original != NULL) {
+        byte *next = decode_common(dcontext, (byte *)original, pc, instr);
+        if (next != original + original_length)
+            return NULL;
+        /* Raw RIP-relative displacements are relative to the original application
+         * address, not the client's saved-byte buffer.  Keep the fully decoded
+         * operands authoritative when the block builder relocates this instruction.
+         */
+        instr_set_raw_bits_valid(instr, false);
+        return pc + original_length;
+    }
+    byte *next = decode_common(dcontext, pc, pc, instr);
+    if (userspace_gate_decoding_enabled()) {
+        /* Gate publication may have replaced the opcode while we decoded it.
+         * Reconstruct from the published immutable bytes in that case.
+         */
+        original = userspace_gate_original(pc, &original_length);
+        if (original != NULL) {
+            instr_reset(dcontext, instr);
+            next = decode_common(dcontext, (byte *)original, pc, instr);
+            next = next == original + original_length ? pc + original_length : NULL;
+        }
+        if (next != NULL) {
+            /* Even an unpatched instruction can receive a gate before emission.
+             * Never leave the encoder a borrowed pointer to mutable app text.
+             */
+            instr_set_translation(instr, pc);
+            instr_set_raw_bits_valid(instr, false);
+        }
+    }
+    return next;
 }
 
 byte *

@@ -42,6 +42,17 @@
 
 #include "decode_api.h"
 
+/* NULL unless pc is a currently patched client-owned application instruction. */
+const byte *
+userspace_gate_original(app_pc pc, size_t *length);
+
+bool
+userspace_gate_decoding_enabled(void);
+
+/* Translate an unmodified userspace context stopped at a client JMP relay. */
+app_pc
+userspace_gate_target(app_pc pc);
+
 /* Public PREFIX_ constants are in instr_api.h.
  * decode_private.h may define additional constants only used during decoding.
  */

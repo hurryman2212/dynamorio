@@ -1011,6 +1011,9 @@ typedef enum {
      * This aligns with kernel behavior: the interrupted PC is not saved anywhere.
      */
     DR_XFER_RSEQ_ABORT,
+    /** A client JMP gateway re-entered the code cache from managed userspace execution.
+     */
+    DR_XFER_CLIENT_USERSPACE_GATE,
 } dr_kernel_xfer_type_t;
 
 /** Data structure passed for dr_register_kernel_xfer_event(). */

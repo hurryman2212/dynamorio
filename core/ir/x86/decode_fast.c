@@ -467,6 +467,13 @@ static const byte xop_a_extra[256] = {
 int
 decode_sizeof_ex(void *drcontext, byte *start_pc, int *num_prefixes, uint *rip_rel_pos)
 {
+    size_t original_length;
+    const byte *original = userspace_gate_original(start_pc, &original_length);
+    if (original != NULL) {
+        int size =
+            decode_sizeof_ex(drcontext, (byte *)original, num_prefixes, rip_rel_pos);
+        return size == original_length ? size : 0;
+    }
     dcontext_t *dcontext = (dcontext_t *)drcontext;
     byte *pc = start_pc;
     uint opc = (uint)*pc;
@@ -694,6 +701,12 @@ decode_sizeof_ex(void *drcontext, byte *start_pc, int *num_prefixes, uint *rip_r
         rip_rel_pc = start_pc + sz - 4;
 
 decode_sizeof_done:
+    original = userspace_gate_original(start_pc, &original_length);
+    if (original != NULL) {
+        int size =
+            decode_sizeof_ex(drcontext, (byte *)original, num_prefixes, rip_rel_pos);
+        return size == original_length ? size : 0;
+    }
     if (rip_rel_pos != NULL) {
         if (rip_rel_pc != NULL) {
             CLIENT_ASSERT(CHECK_TRUNCATE_TYPE_uint(rip_rel_pc - start_pc),
@@ -1313,6 +1326,8 @@ get_implied_mm_e_vex_opcode_bytes(byte *pc, int prefixes, byte vex_mm, byte *byt
 byte *
 decode_cti(void *drcontext, byte *pc, instr_t *instr)
 {
+    if (userspace_gate_decoding_enabled())
+        return decode(drcontext, pc, instr);
     dcontext_t *dcontext = (dcontext_t *)drcontext;
     byte byte0, byte1;
     byte *start_pc = pc;
@@ -1778,6 +1793,8 @@ decode_next_pc(void *drcontext, byte *pc)
 byte *
 decode_raw(dcontext_t *dcontext, byte *pc, instr_t *instr)
 {
+    if (userspace_gate_decoding_enabled())
+        return decode(dcontext, pc, instr);
     int sz = decode_sizeof(dcontext, pc, NULL _IF_X64(NULL));
     IF_X64(instr_set_x86_mode(instr, get_x86_mode(dcontext)));
     if (sz == 0) {

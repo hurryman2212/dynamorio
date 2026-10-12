@@ -331,6 +331,14 @@ shared_gencode_emit(generated_code_t *gencode _IF_X86_64(bool x86_mode))
     gencode->fcache_return = pc;
     pc = emit_fcache_return_shared(GLOBAL_DCONTEXT, gencode, pc);
     gencode->fcache_return_end = pc;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (!x86_mode) {
+        pc = check_size_and_cache_line(isa_mode, gencode, pc);
+        gencode->client_userspace_gate = pc;
+        pc = emit_client_userspace_gate(GLOBAL_DCONTEXT, gencode, pc);
+        gencode->client_userspace_gate_end = pc;
+    }
+#endif
     if (DYNAMO_OPTION(coarse_units)) {
         pc = check_size_and_cache_line(isa_mode, gencode, pc);
         gencode->fcache_return_coarse = pc;
@@ -2791,6 +2799,14 @@ fcache_return_shared_routine(IF_X86_64_ELSE(gencode_mode_t mode, void))
     else
         return code->fcache_return;
 }
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+cache_pc
+client_userspace_gate_routine(void)
+{
+    return get_shared_gencode(GLOBAL_DCONTEXT, GENCODE_X64)->client_userspace_gate;
+}
+#endif
 
 #ifdef TRACE_HEAD_CACHE_INCR
 cache_pc

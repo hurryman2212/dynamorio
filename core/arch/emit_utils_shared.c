@@ -2700,6 +2700,47 @@ append_fcache_return_common(dcontext_t *dcontext, generated_code_t *code,
     return instr_targets;
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+byte *
+emit_client_userspace_gate(dcontext_t *dcontext, generated_code_t *code, byte *pc)
+{
+    const bool absolute = false;
+    instrlist_t ilist;
+    instrlist_init(&ilist);
+    /* The small per-site entry saves app RAX in the ordinary direct-exit TLS slot
+     * and puts the original application PC in RAX. No app stack is touched.
+     */
+    APP(&ilist, INSTR_CREATE_endbr64(dcontext));
+    append_prepare_fcache_return(dcontext, code, &ilist, false, true);
+    APP(&ilist, SAVE_TO_DC(dcontext, REG_XAX, NEXT_TAG_OFFSET));
+    append_save_gpr(dcontext, &ilist, false, false, code, NULL, false);
+    APP(&ilist, RESTORE_FROM_DC(dcontext, REG_XSP, DSTACK_OFFSET));
+    append_save_clear_xflags(dcontext, &ilist, false);
+    append_save_simd_reg(dcontext, &ilist, false);
+
+    /* Capture x87 and MXCSR before any C callback. The ordinary cache entrance
+     * restores this image immediately before restoring the saved SIMD context.
+     */
+    APP(&ilist,
+        INSTR_CREATE_lea(
+            dcontext, opnd_create_reg(REG_XAX),
+            OPND_CREATE_MEM_lea(REG_DCTXT, DR_REG_NULL, 0,
+                                offsetof(dcontext_t, client_userspace_fpstate) + 15)));
+    APP(&ilist,
+        INSTR_CREATE_and(dcontext, opnd_create_reg(REG_XAX), OPND_CREATE_INT8(-16)));
+    dr_insert_save_fpstate(dcontext, &ilist, NULL,
+                           opnd_create_base_disp(REG_XAX, DR_REG_NULL, 0, 0, OPSZ_512));
+    dr_insert_call_noreturn(dcontext, &ilist, NULL,
+                            (void *)client_userspace_gate_dispatch, 1,
+                            opnd_create_reg(REG_DCTXT));
+    pc = instrlist_encode_to_copy(dcontext, &ilist, vmcode_get_writable_addr(pc), pc,
+                                  NULL, true);
+    ASSERT(pc != NULL);
+    instrlist_clear(dcontext, &ilist);
+    return vmcode_get_executable_addr(pc);
+}
+#endif
+
 byte *
 emit_fcache_return(dcontext_t *dcontext, generated_code_t *code, byte *pc)
 {

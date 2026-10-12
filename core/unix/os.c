@@ -730,7 +730,8 @@ is_our_environ_followed_by_auxv(void)
      */
     return false;
 #else
-    return true;
+    /* Ptrace injection supplies a synthetic environment, not the initial stack. */
+    return !dynamo_control_via_attach;
 #endif
 }
 
@@ -9019,12 +9020,16 @@ handle_app_mremap(dcontext_t *dcontext, byte *base, size_t size, byte *old_base,
         app_memory_deallocation(dcontext, (app_pc)old_base, old_size,
                                 false /* don't own thread_initexit_lock */,
                                 false /* not image, XXX: somewhat arbitrary */);
-        DOCHECK(1, {
-            /* we don't expect to see remappings of modules */
-            os_get_module_info_lock();
-            ASSERT_CURIOSITY(!module_overlaps(base, size));
-            os_get_module_info_unlock();
-        });
+        if (base != old_base) {
+            /* MREMAP_FIXED can replace existing executable pages while keeping
+             * the same permissions. Allocation/protection tracking alone would
+             * retain their old fragments. Flush the destination after success,
+             * before publishing its new allocation or resuming the application.
+             */
+            app_memory_deallocation(dcontext, base, size,
+                                    false /* don't own thread_initexit_lock */,
+                                    false /* destination may replace part of an image */);
+        }
         /* Verify that the current prot on the new region (according to
          * the os) is the same as what the prot used to be for the old
          * region.
@@ -11622,6 +11627,21 @@ bool
 os_thread_take_over_suspended_native(dcontext_t *dcontext)
 {
     os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+    if (dcontext->client_userspace_active) {
+        if (ksynch_get_value(&ostd->suspended) != 1 || ostd->suspended_sigcxt == NULL)
+            return false;
+        sigcontext_t *sc = ostd->suspended_sigcxt->sc;
+        /* A userspace signal callback can itself be interrupted by suspension.
+         * Its C/handler context must finish normally, not be mistaken for the
+         * original application context and redirected through fcache_return.
+         */
+        if (thread_synch_state_no_xfer(dcontext) ||
+            is_on_dstack(dcontext, (byte *)sc->SC_XSP) ||
+            is_dynamo_address((app_pc)sc->SC_XIP) || is_in_client_lib((app_pc)sc->SC_XIP))
+            return false;
+        ostd->retakeover = true;
+        return true;
+    }
     if (!is_thread_currently_native(dcontext->thread_record) ||
         ksynch_get_value(&ostd->suspended) < 0)
         return false;

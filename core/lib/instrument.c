@@ -4907,8 +4907,8 @@ dr_suspend_all_other_threads_ex(DR_PARAM_OUT void ***drcontexts,
                      */
                     (*drcontexts)[out_suspended] = (void *)dcontext;
                     out_suspended++;
-                    CLIENT_ASSERT(!dcontext->client_data->mcontext_in_dcontext,
-                                  "internal inconsistency in where mcontext is");
+                    dcontext->client_data->suspended_mcontext_in_dcontext =
+                        dcontext->client_data->mcontext_in_dcontext;
                     /* officially get_mcontext() doesn't always set pc: we do anyway */
                     get_mcontext(dcontext)->pc = dcontext->next_tag;
                     dcontext->client_data->mcontext_in_dcontext = true;
@@ -4962,11 +4962,21 @@ dr_resume_all_other_threads(DR_PARAM_IN void **drcontexts, DR_PARAM_IN uint num_
     num_threads = (int)(ptr_int_t)drcontexts[num_suspended + 1];
     for (i = 0; i < num_suspended; i++) {
         dcontext_t *dcontext = (dcontext_t *)drcontexts[i];
-        if (dcontext->client_data->cur_mc != NULL) {
-            /* clear any cached mc from dr_get_mcontext_priv() */
+        if (dcontext->client_data->suspended && dcontext->client_data->cur_mc != NULL) {
+            /* Clear only a translation allocated by dr_get_mcontext_priv(). A
+             * NO_XFER peer can own a callback's borrowed cur_mc: do not free it.
+             */
             heap_free(dcontext, dcontext->client_data->cur_mc,
                       sizeof(*dcontext->client_data->cur_mc) HEAPACCT(ACCT_CLIENT));
             dcontext->client_data->cur_mc = NULL;
+        }
+        if (!dcontext->client_data->suspended) {
+            /* The NO_XFER branch of dr_suspend_all_other_threads_ex borrowed the
+             * peer's saved mcontext. Once it resumes, clean calls must read their
+             * fresh dstack frame rather than that now-stale context.
+             */
+            dcontext->client_data->mcontext_in_dcontext =
+                dcontext->client_data->suspended_mcontext_in_dcontext;
         }
         dcontext->client_data->suspended = false;
     }
@@ -4995,10 +5005,39 @@ dr_retakeover_suspended_native_thread(void *drcontext)
     /* XXX: I don't quite see why I need to pop these 2 when I'm doing
      * what a regular retakeover would do
      */
-    KSTOP_NOT_MATCHING_DC(dcontext, fcache_default);
-    KSTOP_NOT_MATCHING_DC(dcontext, dispatch_num_exits);
+    if (!dcontext->client_userspace_active) {
+        KSTOP_NOT_MATCHING_DC(dcontext, fcache_default);
+        KSTOP_NOT_MATCHING_DC(dcontext, dispatch_num_exits);
+    }
     res = os_thread_take_over_suspended_native(dcontext);
     return res;
+}
+
+DR_API
+bool
+dr_cancel_suspended_userspace_execution(void *drcontext)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
+    if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
+        dcontext == get_thread_private_dcontext() ||
+        (!dcontext->client_data->suspended &&
+         !(thread_synch_state_no_xfer(dcontext) &&
+           dcontext->client_data->mcontext_in_dcontext)))
+        return false;
+    CLIENT_ASSERT(OWN_MUTEX(&all_threads_synch_lock) && OWN_MUTEX(&thread_initexit_lock),
+                  "userspace cancellation requires suspended threads");
+    atomic_add_exchange_int64(&dcontext->client_userspace_generation, 1);
+    dcontext->client_userspace_target = NULL;
+    /* A queued redirect has abandoned its clean-call FXRSTOR. Keep that image
+     * valid so the ordinary cache entrance still restores the application state.
+     */
+    if (dcontext->client_userspace_active)
+        return os_thread_take_over_suspended_native(dcontext);
+    return true;
+#else
+    return false;
+#endif
 }
 
 #ifdef UNIX
@@ -6918,6 +6957,119 @@ dr_redirect_native_target(void *drcontext)
     /* The client has no way to know the mode of our gencode so we set LSB here */
     return PC_AS_JMP_TGT(DEFAULT_ISA_MODE, get_client_ibl_xfer_entry(dcontext));
 #endif
+}
+
+DR_API
+uint64
+dr_userspace_execution_generation(void *drcontext)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
+    if (dcontext != NULL && dcontext != GLOBAL_DCONTEXT)
+        return (uint64)atomic_aligned_read_int64(&dcontext->client_userspace_generation);
+#endif
+    return 0;
+}
+
+DR_API
+bool
+dr_redirect_userspace_execution(dr_mcontext_t *mcontext, uint64 generation)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    if (dcontext == NULL || mcontext == NULL || mcontext->size != sizeof(dr_mcontext_t) ||
+        mcontext->flags != DR_MC_ALL || mcontext->pc == NULL ||
+        dr_get_isa_mode(dcontext) != DR_ISA_AMD64 ||
+        generation != dr_userspace_execution_generation(dcontext))
+        return false;
+    const size_t fpstate_size = proc_fpstate_save_size();
+    if (fpstate_size != 512)
+        return false;
+    /* SAVE_FLOAT follows the full aligned out-of-line context frame. Copy it
+     * before dispatch resets the clean-call stack; a non-returning redirect does
+     * not execute the usual FXRSTOR cleanup emitted after the call.
+     */
+    byte *fpstate = (byte *)ALIGN_FORWARD(dcontext->client_userspace_fpstate, 16);
+    memcpy(fpstate,
+           (byte *)dcontext->dstack - get_clean_call_switch_stack_size() - fpstate_size,
+           fpstate_size);
+    dcontext->client_userspace_fpstate_valid = true;
+    dcontext->client_userspace_request_generation = generation;
+    dcontext->client_userspace_target = mcontext->pc;
+    if (generation != dr_userspace_execution_generation(dcontext)) {
+        dcontext->client_userspace_target = NULL;
+        dcontext->client_userspace_fpstate_valid = false;
+        return false;
+    }
+    if (!dr_redirect_execution(mcontext)) {
+        dcontext->client_userspace_target = NULL;
+        dcontext->client_userspace_fpstate_valid = false;
+        return false;
+    }
+#endif
+    return false;
+}
+
+DR_API
+size_t
+dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* ENDBR64; MOV GS:[spill],RAX; MOVABS RAX,app_pc; JMP [RIP]; entry-pointer. */
+    byte stub[] = { 0xf3, 0x0f, 0x1e, 0xfa, 0x65, 0x48, 0x89, 0x04, 0x25, 0,
+                    0,    0,    0,    0x48, 0xb8, 0,    0,    0,    0,    0,
+                    0,    0,    0,    0xff, 0x25, 0,    0,    0,    0,    0,
+                    0,    0,    0,    0,    0,    0,    0 };
+    if (buffer == NULL || application_pc == NULL || capacity < sizeof(stub) ||
+        !is_dynamo_address(buffer) ||
+        TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask))
+        return 0;
+    uint spill = DIRECT_STUB_SPILL_SLOT;
+    cache_pc entry = client_userspace_gate_routine();
+    memcpy(stub + 9, &spill, sizeof(spill));
+    memcpy(stub + 15, &application_pc, sizeof(application_pc));
+    memcpy(stub + 29, &entry, sizeof(entry));
+    memcpy(buffer, stub, sizeof(stub));
+    return sizeof(stub);
+#else
+    return 0;
+#endif
+}
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+void
+client_userspace_gate_dispatch(dcontext_t *dcontext)
+{
+    /* Userspace execution still has app FS installed. DR TLS (GS) and dstack remain
+     * available throughout the gateway; switch library TLS before C callbacks.
+     */
+    os_swap_context(dcontext, false, DR_STATE_ALL);
+    ENTERING_DR();
+    dcontext->client_userspace_active = false;
+    dcontext->client_userspace_fpstate_valid = true;
+    priv_mcontext_t *mc = get_mcontext(dcontext);
+    mc->pc = dcontext->next_tag;
+    if (kernel_xfer_callbacks.num > 0) {
+        dr_mcontext_t source = { sizeof(source), DR_MC_ALL };
+        priv_mcontext_to_dr_mcontext(&source, mc);
+        instrument_kernel_xfer(dcontext, DR_XFER_CLIENT_USERSPACE_GATE, osc_empty,
+                               &source, NULL, mc->pc, mc->xsp, osc_empty, mc, 0);
+        dcontext->next_tag = mc->pc;
+    }
+    set_last_exit(dcontext, (linkstub_t *)get_client_linkstub());
+    dcontext->whereami = DR_WHERE_FCACHE;
+    d_r_dispatch(dcontext);
+    ASSERT_NOT_REACHED();
+}
+#endif
+
+DR_API
+bool
+dr_is_client_userspace(void *drcontext)
+{
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
+    return dcontext != NULL && dcontext != GLOBAL_DCONTEXT &&
+        dcontext->client_userspace_active;
 }
 
 /***************************************************************************
