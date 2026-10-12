@@ -172,6 +172,49 @@ d_r_dispatch(dcontext_t *dcontext)
      * cache due to flushing before we get there.
      */
     do {
+#if defined(LINUX) && defined(X86) && defined(X64)
+        if (dcontext->client_userspace_target != NULL) {
+            app_pc target = dcontext->client_userspace_target;
+            dcontext->client_userspace_target = NULL;
+            /* Signal delivery can replace the requested destination while entering
+             * dispatch. Its handler must pass through ordinary instrumentation.
+             */
+            if (target == dcontext->next_tag) {
+                /* Publish the transition before the last generation check. A
+                 * suspender must retry a transition already in progress, while
+                 * cancellation of an earlier request keeps this entry in cache.
+                 */
+                dcontext->client_userspace_active = true;
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+                if (dcontext->client_userspace_request_generation !=
+                    (uint64)atomic_aligned_read_int64(
+                        &dcontext->client_userspace_generation)) {
+                    dcontext->client_userspace_active = false;
+                    continue;
+                }
+                enter_nolinking(dcontext, NULL, false);
+                dcontext->asynch_target = target;
+                /* Native instructions use the application's library TLS directly.
+                 * Keep DR's separate TLS installed for signal gateways.
+                 */
+                os_swap_context(dcontext, true /*to app*/, DR_STATE_ALL);
+                KSTART(fcache_default);
+                enter_fcache(dcontext, get_fcache_enter_gonative_routine(dcontext),
+                             target);
+                /* The entrance routine returns only if a signal arrived before
+                 * restoring application state. Deliver it without discarding it.
+                 */
+                os_swap_context(dcontext, false /*to DR*/, DR_STATE_ALL);
+                dcontext->client_userspace_active = false;
+                KSTOP_NOT_MATCHING(fcache_default);
+                dcontext->whereami = DR_WHERE_DISPATCH;
+                enter_couldbelinking(dcontext, NULL, true);
+                dcontext->next_tag = dcontext->asynch_target;
+                receive_pending_signal(dcontext);
+                continue;
+            }
+        }
+#endif
         if (is_in_dynamo_dll(dcontext->next_tag) ||
             dcontext->next_tag == BACK_TO_NATIVE_AFTER_SYSCALL || dcontext->go_native) {
             handle_special_tag(dcontext);
@@ -577,6 +620,13 @@ enter_fcache(dcontext_t *dcontext, fcache_enter_func_t entry, cache_pc pc)
      */
     PTHREAD_JIT_READ();
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (dcontext->client_userspace_fpstate_valid) {
+        dcontext->client_userspace_fpstate_valid = false;
+        proc_restore_fpstate(
+            (byte *)ALIGN_FORWARD(dcontext->client_userspace_fpstate, 16));
+    }
+#endif
     (*entry)(DCONTEXT_ACTUAL_TO_TLS_PTR(dcontext));
     IF_WINDOWS(ASSERT_NOT_REACHED()); /* returns for signals on unix */
 }
@@ -760,6 +810,7 @@ set_next_tag_to_prior_syscall(dcontext_t *dcontext)
 static void
 dispatch_enter_dynamorio(dcontext_t *dcontext)
 {
+    dcontext->client_userspace_active = false;
     /* We're transitioning to DynamoRIO from somewhere: either the fcache,
      * the kernel (DR_WHERE_TRAMPOLINE), or the app itself via our start/stop API.
      * N.B.: set whereami to DR_WHERE_APP iff this is the first d_r_dispatch() entry

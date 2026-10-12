@@ -407,6 +407,7 @@ typedef struct _client_data_t {
     bool invoke_another_syscall;
     /* flags for dr_get_mcontext (i#117/PR 395156) */
     bool mcontext_in_dcontext;
+    bool suspended_mcontext_in_dcontext; /* restored after a NO_XFER suspension */
     bool suspended;
     /* 2 other ways to point at a context for dr_{g,s}et_mcontext() */
     priv_mcontext_t *cur_mc;
@@ -1071,6 +1072,21 @@ struct _dcontext_t {
     bool currently_stopped;
     /* This is a flag requesting that this thread go native. */
     bool go_native;
+    /* A client-managed userspace region keeps signal handling and thread state active.
+     * The target is consumed by dispatch; active lasts until a managed re-entry.
+     */
+    app_pc client_userspace_target;
+    bool client_userspace_active;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Cancellation invalidates both queued redirects and clients still checking
+     * whether a userspace region is ready. Only a suspended thread is cancelled.
+     */
+    volatile int64 client_userspace_generation;
+    uint64 client_userspace_request_generation;
+    /* The x86-64 FXSAVE image is 512 bytes and requires 16-byte alignment. */
+    byte client_userspace_fpstate[512 + 15];
+    bool client_userspace_fpstate_valid;
+#endif
 #ifdef LINUX
     /* State for handling restartable sequences ("rseq"). */
     rseq_entry_state_t rseq_entry_state;

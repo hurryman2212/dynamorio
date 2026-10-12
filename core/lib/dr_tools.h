@@ -2279,10 +2279,30 @@ DR_API
  * code cache again once it is resumed.  The thread must currently be
  * suspended (typically by dr_suspend_all_other_threads_ex() with
  * #DR_SUSPEND_NATIVE) and must be currently native (typically from
- * #DR_EMIT_GO_NATIVE).  \return whether successful.
+ * #DR_EMIT_GO_NATIVE). Also accepts a suspended client-managed userspace region
+ * identified by dr_is_client_userspace(); it resumes in the code cache without
+ * detaching or reinitializing its existing thread and signal state.
+ * \return whether successful.
  */
 bool
 dr_retakeover_suspended_native_thread(void *drcontext);
+
+DR_API
+/**
+ * Cancels a suspended thread's pending client-managed userspace redirect and invalidates
+ * decisions made with earlier userspace-execution generations. If it is already in a
+ * userspace region, also requests re-entry into the code cache. May only be called for
+ * contexts returned by dr_suspend_all_other_threads_ex(), before resuming them.
+ * Ordinary managed threads are accepted, so call this for every suspended context.
+ *
+ * Returns false when a userspace transition or signal callback must finish first. In
+ * that case resume the threads and retry before removing userspace gates or changing
+ * their backing code. Such retryable failures still invalidate earlier generations.
+ * Floating-point state saved by a queued redirect is retained for cache resumption.
+ * Supported only on Linux x86-64.
+ */
+bool
+dr_cancel_suspended_userspace_execution(void *drcontext);
 
 /* We do not translate the context to avoid lock issues (PR 205795).
  * We do not delay until a safe point (via regular delayable signal path)

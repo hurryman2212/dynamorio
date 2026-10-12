@@ -42,6 +42,46 @@
  * @brief Decoding routines.
  */
 
+/** Supplies immutable original bytes for an application userspace gate, or NULL. */
+typedef const byte *(*dr_userspace_gate_decoder_t)(app_pc pc, size_t *length);
+
+DR_API
+/**
+ * Registers an original-instruction provider for client-owned x86 userspace gates.
+ * The returned buffer must contain at least 15 readable bytes, with the original
+ * instruction length in \p length. Supply every overwritten instruction start,
+ * including instructions covered by a multi-byte JMP patch.
+ * NULL means that the address is not an active gate. The decoder uses the original
+ * application PC for relative operands and returns original application addresses.
+ *
+ * The callback runs under internal locks and during signal-state reconstruction:
+ * it must not allocate, block, or call DynamoRIO. Returned buffers must remain
+ * immutable and valid until all corresponding fragments are flushed and decoding
+ * has stopped. Register before application execution; unregister with NULL after
+ * application threads stop, before releasing buffers. Only one provider is allowed.
+ */
+bool
+dr_register_userspace_gate_decoder(dr_userspace_gate_decoder_t callback);
+
+/** Maps a userspace JMP relay's instruction PC to its logical application PC. */
+typedef app_pc (*dr_userspace_gate_target_t)(app_pc pc);
+
+DR_API
+/**
+ * Registers a logical-PC resolver for userspace JMP relays placed in application
+ * padding. Return the original application PC only at relay instructions whose
+ * context is still entirely unchanged; return NULL or the input PC elsewhere.
+ * Userspace signal delivery, suspension, and context translation use this mapping
+ * so an interrupted relay resumes the intended application instruction instead
+ * of the padding's original bytes. Original-byte decoding itself is unaffected.
+ *
+ * The callback must not allocate, block, or call DynamoRIO. Register before app
+ * execution and unregister with NULL after all app threads stop. The same lifetime
+ * and publication rules as dr_register_userspace_gate_decoder() apply.
+ */
+bool
+dr_register_userspace_gate_target(dr_userspace_gate_target_t callback);
+
 DR_API
 /**
  * Decodes only enough of the instruction at address \p pc to determine

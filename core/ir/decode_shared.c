@@ -42,6 +42,81 @@
 #include "instr.h"
 #include "decode.h"
 
+static dr_userspace_gate_decoder_t userspace_gate_decoder;
+static dr_userspace_gate_target_t userspace_gate_target_resolver;
+
+bool
+userspace_gate_decoding_enabled(void)
+{
+    return userspace_gate_decoder != NULL;
+}
+
+DR_API
+bool
+dr_register_userspace_gate_decoder(dr_userspace_gate_decoder_t callback)
+{
+    if (callback != NULL && userspace_gate_decoder != NULL &&
+        callback != userspace_gate_decoder)
+        return false;
+#if !defined(STANDALONE_DECODER) && defined(LINUX) && defined(X86) && defined(X64)
+    /* Native islands can execute their first AVX-512 instruction before the
+     * block builder sees it. Preserve the full enabled vector state from startup.
+     */
+    if (callback != NULL && ZMM_ENABLED()) {
+        d_r_set_avx512_code_in_use(true, NULL);
+        proc_set_num_simd_saved(MCXT_NUM_SIMD_SLOTS);
+    }
+#endif
+#ifndef STANDALONE_DECODER
+    SELF_UNPROTECT_DATASEC(DATASEC_RARELY_PROT);
+#endif
+    userspace_gate_decoder = callback;
+#ifndef STANDALONE_DECODER
+    SELF_PROTECT_DATASEC(DATASEC_RARELY_PROT);
+#endif
+    return true;
+}
+
+DR_API
+bool
+dr_register_userspace_gate_target(dr_userspace_gate_target_t callback)
+{
+    if (callback != NULL && userspace_gate_target_resolver != NULL &&
+        callback != userspace_gate_target_resolver)
+        return false;
+#ifndef STANDALONE_DECODER
+    SELF_UNPROTECT_DATASEC(DATASEC_RARELY_PROT);
+#endif
+    userspace_gate_target_resolver = callback;
+#ifndef STANDALONE_DECODER
+    SELF_PROTECT_DATASEC(DATASEC_RARELY_PROT);
+#endif
+    return true;
+}
+
+app_pc
+userspace_gate_target(app_pc pc)
+{
+    if (userspace_gate_target_resolver != NULL) {
+        app_pc target = userspace_gate_target_resolver(pc);
+        if (target != NULL)
+            return target;
+    }
+    return pc;
+}
+
+const byte *
+userspace_gate_original(app_pc pc, size_t *length)
+{
+    if (userspace_gate_decoder == NULL || pc == NULL)
+        return NULL;
+    *length = 0;
+    const byte *original = userspace_gate_decoder(pc, length);
+    if (original == NULL || *length == 0 || *length > 15)
+        return NULL;
+    return original;
+}
+
 #ifdef DEBUG
 /* case 10450: give messages to clients */
 /* we can't undef ASSERT b/c of DYNAMO_OPTION */

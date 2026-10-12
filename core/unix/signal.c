@@ -4089,6 +4089,7 @@ transfer_from_sig_handler_to_fcache_return(dcontext_t *dcontext, kernel_ucontext
                                            app_pc next_pc, linkstub_t *last_exit,
                                            bool is_kernel_xfer)
 {
+    dcontext->client_userspace_active = false;
     sigcontext_t *sc = SIGCXT_FROM_UCXT(uc);
     if (is_kernel_xfer) {
         sig_full_cxt_t sc_interrupted_full = { sc_interrupted, NULL /*not provided*/ };
@@ -4288,7 +4289,7 @@ handle_client_action_from_cache(dcontext_t *dcontext, int sig, dr_signal_action_
          */
         transfer_from_sig_handler_to_fcache_return(
             dcontext, uc, sc_interrupted, sig, (app_pc)sc->SC_XIP,
-            (linkstub_t *)get_asynch_linkstub(), true);
+            (linkstub_t *)get_asynch_linkstub(), !dcontext->client_userspace_active);
         if (is_building_trace(dcontext)) {
             LOG(THREAD, LOG_ASYNCH, 3, "\tsquashing trace-in-progress\n");
             trace_abort(dcontext);
@@ -4873,6 +4874,9 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
     sigpending_t *pend;
     fragment_t *f = NULL;
     fragment_t wrapper;
+    const bool client_userspace = dcontext->client_userspace_active &&
+        !safe_is_in_fcache(dcontext, pc, xsp) && !is_dynamo_address(pc) &&
+        !is_in_client_lib(pc);
 
     /* We no longer block SUSPEND_SIGNAL (i#184/PR 450670) or SIGSEGV (i#193/PR 287309).
      * But we can have re-entrancy issues in this routine if the app uses the same
@@ -4979,6 +4983,11 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
             execute_native_handler(dcontext, sig, frame, /*cur_xsp=*/NULL);
             handled = true;
         }
+    } else if (client_userspace) {
+        /* This is already an application context. Native islands cannot wait
+         * for a cache exit, so deliver both faults and asynchronous signals now.
+         */
+        receive_now = true;
     } else if (safe_is_in_fcache(dcontext, pc, xsp)) {
         LOG(THREAD, LOG_ASYNCH, 2, "record_pending_signal(%d) from cache pc " PFX "\n",
             sig, pc);
@@ -5184,7 +5193,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
 
         sc_orig = *sc;
         ASSERT(!forged);
-        xl8_success =
+        xl8_success = client_userspace ||
             translate_sigcontext(dcontext, ucxt, !can_always_delay[sig], &f, &wrapper);
 
         if (can_always_delay[sig] && !xl8_success) {
@@ -5228,9 +5237,11 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
          * to avoid the in-cache check for delayable signals => safer.
          */
         if (blocked && !forged && !reroute && !can_always_delay[sig] &&
-            safe_is_in_fcache(dcontext, pc, xsp)) {
+            (client_userspace || safe_is_in_fcache(dcontext, pc, xsp))) {
             sc_orig = *sc;
-            translate_sigcontext(dcontext, ucxt, true /*shouldn't fail*/, &f, &wrapper);
+            if (!client_userspace)
+                translate_sigcontext(dcontext, ucxt, true /*shouldn't fail*/, &f,
+                                     &wrapper);
 
             if (!send_signal_to_client_and_handle_action(
                     dcontext, sig, frame, sc, &sc_orig, access_address, true /*blocked*/,
@@ -5253,7 +5264,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
             /* If forged we're likely couldbelinking, and we don't need to xl8. */
             if (forged)
                 ASSERT(is_couldbelinking(dcontext));
-            else
+            else if (!client_userspace)
                 translate_sigcontext(dcontext, ucxt, true /*shouldn't fail*/, NULL, NULL);
             /* the process should be terminated */
             execute_default_from_cache(dcontext, sig, frame, &sc_orig, forged);
@@ -5748,6 +5759,19 @@ main_signal_handler_C(byte *xsp)
 #endif
 
     dcontext_t *dcontext = get_thread_private_dcontext();
+#if defined(LINUX) && defined(X86) && defined(X64)
+    const bool client_userspace_tls = dcontext != NULL && dcontext != GLOBAL_DCONTEXT &&
+        dcontext->client_userspace_active && os_using_app_state(dcontext);
+    if (client_userspace_tls)
+        os_swap_context(dcontext, false /*to DR*/, DR_STATE_ALL);
+    if (dcontext != NULL && dcontext != GLOBAL_DCONTEXT &&
+        dcontext->client_userspace_active) {
+        /* A short-JMP gate may be interrupted at its in-image padding relay.
+         * No app register has changed there: expose and resume the logical PC.
+         */
+        sc->SC_XIP = (reg_t)userspace_gate_target((app_pc)sc->SC_XIP);
+    }
+#endif
 
 #if defined(MACOS) && !defined(AARCH64)
 #    ifdef X64
@@ -6140,7 +6164,8 @@ main_signal_handler_C(byte *xsp)
         LOG(THREAD, LOG_ALL, 1,
             "** Received SIG%s at cache pc " PFX " in thread " TIDFMT "\n",
             (sig == SIGSEGV) ? "SEGV" : "BUS", pc, d_r_get_thread_id());
-        ASSERT(syscall_signal || safe_is_in_fcache(dcontext, pc, (byte *)sc->SC_XSP));
+        ASSERT(syscall_signal || dcontext->client_userspace_active ||
+               safe_is_in_fcache(dcontext, pc, (byte *)sc->SC_XSP));
         /* we do not call trace_abort() here since we may need to
          * translate from a temp private bb (i#376): but all paths
          * that deliver the signal or redirect will call it
@@ -6218,6 +6243,10 @@ main_signal_handler_C(byte *xsp)
     if (local)
         SELF_PROTECT_LOCAL(dcontext, READONLY);
     EXITING_DR();
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (client_userspace_tls && dcontext->client_userspace_active)
+        os_swap_context(dcontext, true /*to app*/, DR_STATE_ALL);
+#endif
 }
 
 static bool
@@ -6497,6 +6526,12 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
      * location and convert to non-rt if necessary
      */
     copy_frame_to_stack(dcontext, info, sig, frame, xsp, true /*pending*/);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* The signal frame now owns the interrupted userspace x87/MXCSR image. Do not
+     * restore it over the handler's initial floating-point context on entry.
+     */
+    dcontext->client_userspace_fpstate_valid = false;
+#endif
     /* now point at the app's frame */
     sc = get_sigcontext_from_app_frame(info, sig, (void *)xsp);
 
@@ -8904,6 +8939,17 @@ handle_suspend_signal(dcontext_t *dcontext, kernel_siginfo_t *siginfo,
 
     if (ostd->retakeover) {
         ostd->retakeover = false;
+        if (dcontext->client_userspace_active) {
+            /* This thread still owns its DR TLS and signal state. Resume through
+             * the normal cache-return gateway using the untouched kernel FP state,
+             * rather than running the full native-thread attachment procedure.
+             */
+            sigcontext_t *sc = SIGCXT_FROM_UCXT(ucxt);
+            transfer_from_sig_handler_to_fcache_return(
+                dcontext, ucxt, NULL, SUSPEND_SIGNAL, (app_pc)sc->SC_XIP,
+                (linkstub_t *)get_asynch_linkstub(), false);
+            return false;
+        }
         sig_take_over(ucxt); /* shouldn't return for this case */
         ASSERT_NOT_REACHED();
     } else if (ostd->do_detach) {

@@ -375,6 +375,17 @@ save_fpstate(dcontext_t *dcontext, sigframe_rt_t *frame)
     }
 
     save_xmm(dcontext, frame);
+#ifdef X64
+    if (dcontext->client_userspace_fpstate_valid) {
+        /* A userspace userspace gate resets x87 before calling C. Pending delivery
+         * must use the app image captured by that gate, not the temporary DR
+         * floating-point state. Preserve XSAVE headers and the SIMD state copied
+         * above; only replace the legacy x87/MXCSR portion.
+         */
+        memcpy(sc->fpstate, (byte *)ALIGN_FORWARD(dcontext->client_userspace_fpstate, 16),
+               offsetof(struct i387_fxsave_struct, xmm_space));
+    }
+#endif
 }
 
 #ifdef DEBUG

@@ -151,6 +151,12 @@ instrument_kernel_xfer(dcontext_t *dcontext, dr_kernel_xfer_type_t type,
                        os_cxt_ptr_t target_os_cxt, priv_mcontext_t *target_mc, int sig);
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Entered on dstack with all application state captured by the userspace gateway. */
+void
+client_userspace_gate_dispatch(dcontext_t *dcontext);
+#endif
+
 void
 instrument_nudge(dcontext_t *dcontext, client_id_t id, uint64 arg);
 #ifdef WINDOWS

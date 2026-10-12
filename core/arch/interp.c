@@ -3279,7 +3279,8 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
              /* to split riprel, need to decode every instr */
              /* in x86_to_x64, need to translate every x86 instr */
              IF_X64(|| DYNAMO_OPTION(coarse_split_riprel) || DYNAMO_OPTION(x86_to_x64)) ||
-        INTERNAL_OPTION(full_decode)
+        INTERNAL_OPTION(full_decode) ||
+        userspace_gate_decoding_enabled()
         /* We separate rseq regions into their own blocks to make this check easier. */
         IF_LINUX(||
                  (!vmvector_empty(d_r_rseq_areas) &&

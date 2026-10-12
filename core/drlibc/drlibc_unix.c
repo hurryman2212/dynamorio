@@ -515,6 +515,19 @@ static size_t page_size = 0;
 
 static size_t auxv_minsigstksz = 0;
 
+#ifdef LINUX
+static bool auxv_initialized;
+#    if defined(X86) && defined(X64)
+static bool auxv_fsgsbase_enabled;
+
+bool
+os_fsgsbase_enabled(void)
+{
+    return auxv_fsgsbase_enabled;
+}
+#    endif
+#endif
+
 /* Return true if size is a multiple of the page size.
  * XXX: This function may be called when DynamoRIO is in a fragile state, or not
  * yet relocated, so keep this self-contained and do not use global variables or
@@ -609,27 +622,33 @@ os_page_size_init(const char **env, bool env_followed_by_auxv)
      * at the stack as we're so late, so we do not try to read off the end of it
      * (i#2122).
      */
-    if (!env_followed_by_auxv)
+    if (!env_followed_by_auxv || env == NULL || auxv_initialized)
         return;
-    size_t size = page_size; /* atomic read */
-    if (size == 0) {
-        ELF_AUXV_TYPE *auxv;
-        /* Skip environment. */
-        while (*env != 0)
-            ++env;
-        /* Look for AT_PAGESZ and other values in the auxiliary vector. */
-        for (auxv = (ELF_AUXV_TYPE *)(env + 1); auxv->a_type != AT_NULL; auxv++) {
-            if (auxv->a_type == AT_PAGESZ) {
-                os_set_page_size(auxv->a_un.a_val);
-                break;
-            }
-#    ifdef AT_MINSIGSTKSZ
-            else if (auxv->a_type == AT_MINSIGSTKSZ) {
-                auxv_minsigstksz = auxv->a_un.a_val;
-                break;
-            }
-#    endif
+    ELF_AUXV_TYPE *auxv;
+    /* Skip environment. */
+    while (*env != 0)
+        ++env;
+    /* This runs before TLS setup and worker creation.  Scan all entries even if
+     * page size discovery already ran, and retain the process capabilities once.
+     */
+    for (auxv = (ELF_AUXV_TYPE *)(env + 1); auxv->a_type != AT_NULL; auxv++) {
+        if (auxv->a_type == AT_PAGESZ) {
+            os_set_page_size(auxv->a_un.a_val);
         }
+#    ifdef AT_MINSIGSTKSZ
+        else if (auxv->a_type == AT_MINSIGSTKSZ) {
+            auxv_minsigstksz = auxv->a_un.a_val;
+        }
+#    endif
+#    if defined(X86) && defined(X64)
+        else if (auxv->a_type == AT_HWCAP2) {
+            /* Linux HWCAP2_FSGSBASE is bit 1.  Unlike CPUID, this also guarantees
+             * that the kernel enabled the instructions for user mode.
+             */
+            auxv_fsgsbase_enabled = (auxv->a_un.a_val & (1UL << 1)) != 0;
+        }
+#    endif
     }
+    auxv_initialized = true;
 #endif /* LINUX */
 }

@@ -1451,6 +1451,14 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
             "generated routines for thread " TIDFMT "\n",
             tdcontext->owning_thread);
         return RECREATE_FAILURE;
+    } else if (tdcontext->client_userspace_active &&
+               !is_on_dstack(tdcontext, (byte *)mcontext->xsp) &&
+               !is_dynamo_address(mcontext->pc) && !is_in_client_lib(mcontext->pc)) {
+        /* Managed userspace regions carry original application state already. This
+         * also permits normal thread suspension while another thread patches code.
+         */
+        mcontext->pc = userspace_gate_target(mcontext->pc);
+        return res;
     } else if (in_fcache(mcontext->pc)) {
         /* XXX: what if pc is in separate direct stub???
          * do we have to read the &l from the stub to find linkstub_t and thus

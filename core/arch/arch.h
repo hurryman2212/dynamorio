@@ -981,6 +981,10 @@ typedef struct _generated_code_t {
     byte *fcache_enter;
     byte *fcache_return;
     byte *fcache_return_end;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    byte *client_userspace_gate;
+    byte *client_userspace_gate_end;
+#endif
 #ifdef WINDOWS_PC_SAMPLE
     byte *fcache_enter_return_end;
 #endif
@@ -1099,6 +1103,12 @@ byte *
 emit_fcache_enter_shared(dcontext_t *dcontext, generated_code_t *code, byte *pc);
 byte *
 emit_fcache_return_shared(dcontext_t *dcontext, generated_code_t *code, byte *pc);
+#if defined(LINUX) && defined(X86) && defined(X64)
+byte *
+emit_client_userspace_gate(dcontext_t *dcontext, generated_code_t *code, byte *pc);
+cache_pc
+client_userspace_gate_routine(void);
+#endif
 fcache_enter_func_t
 fcache_enter_shared_routine(dcontext_t *dcontext);
 /* the fcache_return routines are queried by get_direct_exit_target and need more

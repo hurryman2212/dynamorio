@@ -663,6 +663,17 @@ tls_get_fs_gs_segment_base(uint seg)
     if (seg != SEG_FS && seg != SEG_GS)
         return (byte *)POINTER_MAX;
 
+#    ifdef X64
+    if (os_fsgsbase_enabled()) {
+        byte *base;
+        if (seg == SEG_FS)
+            __asm__ volatile("rdfsbase %0" : "=r"(base) : : "memory");
+        else
+            __asm__ volatile("rdgsbase %0" : "=r"(base) : : "memory");
+        return base;
+    }
+#    endif
+
     if (TESTANY(SELECTOR_IS_LDT, selector)) {
         LOG(THREAD_GET, LOG_THREADS, 4, "selector is LDT\n");
         /* we have to read the entire ldt from 0 to the index */
@@ -727,7 +738,8 @@ tls_get_fs_gs_segment_base(uint seg)
 }
 
 /* Assumes it's passed either SEG_FS or SEG_GS.
- * Sets only the base: does not change the segment selector register.
+ * Sets the base.  The ARCH_PRCTL path also clears the segment selector, while
+ * descriptor-based callers reload their selector after this function returns.
  */
 bool
 tls_set_fs_gs_segment_base(tls_type_t tls_type, uint seg,
@@ -743,6 +755,21 @@ tls_set_fs_gs_segment_base(tls_type_t tls_type, uint seg,
     switch (tls_type) {
 #    ifdef X64
     case TLS_TYPE_ARCH_PRCTL: {
+        /* ARCH_SET_* clears the selector and rejects non-user addresses.  Keep
+         * its behavior for descriptor-based TLS and unusual bases, including
+         * invalid inputs.  Ordinary 48-bit user bases with a zero selector can
+         * be switched entirely in user mode.  Reserve Linux's final guard page
+         * below 2^47; high five-level-paging addresses retain the syscall path.
+         */
+        if (os_fsgsbase_enabled() && read_thread_register(seg) == 0 &&
+            (ptr_uint_t)base < (((ptr_uint_t)1 << 47) - 4096)) {
+            if (seg == SEG_FS)
+                __asm__ volatile("wrfsbase %0" : : "r"(base) : "memory");
+            else
+                __asm__ volatile("wrgsbase %0" : : "r"(base) : "memory");
+            res = 0;
+            break;
+        }
         int prctl_code = (seg == SEG_FS ? ARCH_SET_FS : ARCH_SET_GS);
         res = dynamorio_syscall(SYS_arch_prctl, 2, prctl_code, base);
         ASSERT(res >= 0);
