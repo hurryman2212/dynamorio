@@ -303,9 +303,12 @@ typedef struct _thread_record_t {
     bool retakeover;
 #else
     process_id_t pid; /* thread group id */
-    bool execve;      /* exiting due to execve (i#237/PR 498284) */
+    bool execve;      /* in-flight exec attempt, not proof of departure */
 #    ifdef LINUX
-    bool group_exit_requested; /* closes creation from this runtime group */
+    bool group_exit_requested;      /* closes creation from this runtime group */
+    runtime_thread_id_t exec_owner; /* serializes this group's exec attempt */
+    bool exec_suspended;            /* this attempt owns one safe suspension reference */
+    bool exec_departed; /* exact old-image departure, never merely preparation */
 #    endif
 #endif
     uint num;                  /* creation ordinal */

@@ -51,6 +51,9 @@ bool
 os_thread_suspend_acknowledge(dcontext_t *dcontext, uint64 ticket);
 bool
 os_thread_suspend_release(dcontext_t *dcontext, bool other_thread);
+/* Exact broker proof only; transport loss or an absent record is not death. */
+bool
+os_thread_suspend_departed(thread_record_t *target);
 bool
 os_thread_suspend_quiesce_for_exec(dcontext_t *dcontext);
 bool

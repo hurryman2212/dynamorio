@@ -2572,11 +2572,14 @@ os_runtime_clone_prepare(dcontext_t *parent, uint64 flags)
     if (data->runtime_child_bootstrap != NULL)
         runtime_identity_failed();
     data->runtime_clone_shares_files = TESTANY(CLONE_FILES, flags);
+    data->runtime_clone_vfork = TESTANY(CLONE_VFORK, flags);
     data->runtime_child_bootstrap = os_runtime_identity_prepare(
         INVALID_RUNTIME_THREAD_ID,
         TESTANY(CLONE_THREAD, flags) ? get_runtime_thread_group()
                                      : INVALID_RUNTIME_THREAD_ID,
         os_get_app_tls_base(parent, SEG_GS));
+    data->runtime_vfork_child =
+        ((os_local_state_t *)data->runtime_child_bootstrap)->runtime_id;
     return data->runtime_child_bootstrap;
 #else
     return NULL;
@@ -2589,6 +2592,17 @@ os_runtime_clone_complete(dcontext_t *parent, bool succeeded)
 #ifdef LINUX
     os_thread_data_t *data = parent->os_field;
 #    if defined(X86) && defined(X64)
+    if (succeeded && data->runtime_clone_vfork) {
+        /* Kernel completion of this exact vfork proves that its child has
+         * released our mm. The child bootstrap may already have been freed. */
+        d_r_mutex_lock(&thread_initexit_lock);
+        thread_record_t *child = thread_lookup_runtime(data->runtime_vfork_child);
+        if (child != NULL && child->execve)
+            child->exec_departed = true;
+        d_r_mutex_unlock(&thread_initexit_lock);
+    }
+    data->runtime_vfork_child = INVALID_RUNTIME_THREAD_ID;
+    data->runtime_clone_vfork = false;
     if (!succeeded) {
         os_runtime_identity_discard(data->runtime_child_bootstrap);
         file_table_snapshot_release(data->runtime_file_snapshot);
@@ -3655,6 +3669,31 @@ os_thread_init_finalize(dcontext_t *dcontext, void *os_data)
 #endif
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* The caller holds the registry lock. Only failed/aborted attempts reach this
+ * point: successful old-image departure leaves peer records for proven cleanup. */
+static void
+exec_group_clear_owner(dcontext_t *dcontext)
+{
+    thread_record_t *self = dcontext->thread_record;
+    if (self->exec_owner != self->runtime_id || self->execve)
+        return;
+    ASSERT(!((os_thread_data_t *)dcontext->os_field)->exec_synch_lock_owned);
+    thread_record_t **threads;
+    int count;
+    get_list_of_threads_ex(&threads, &count, true);
+    for (int i = 0; i < count; ++i) {
+        thread_record_t *peer = threads[i];
+        if (peer->exec_owner == self->runtime_id) {
+            ASSERT(!peer->exec_suspended);
+            __atomic_store_n(&peer->exec_owner, INVALID_RUNTIME_THREAD_ID,
+                             __ATOMIC_SEQ_CST);
+        }
+    }
+    global_heap_free(threads, count * sizeof(*threads) HEAPACCT(ACCT_THREAD_MGT));
+}
+#endif
+
 void
 os_thread_exit(dcontext_t *dcontext, bool other_thread)
 {
@@ -3663,6 +3702,9 @@ os_thread_exit(dcontext_t *dcontext, bool other_thread)
 #if defined(LINUX) && defined(X86) && defined(X64)
     if (other_thread)
         os_thread_suspend_release(dcontext, true);
+    /* A client post callback may legitimately be terminated at a safe point.
+     * The failed syscall has already released all of its suspension references. */
+    exec_group_clear_owner(dcontext);
 #endif
 
     /* i#237/PR 498284: if we had a vfork child call execve we need to clean up
@@ -3956,7 +3998,9 @@ os_new_thread_pre(dcontext_t *dcontext, bool client_thread)
         __atomic_add_fetch(&uninit_thread_count, 1, __ATOMIC_SEQ_CST);
         if (!__atomic_load_n(&thread_creation_closed, __ATOMIC_SEQ_CST) &&
             !__atomic_load_n(&dcontext->thread_record->group_exit_requested,
-                             __ATOMIC_SEQ_CST))
+                             __ATOMIC_SEQ_CST) &&
+            __atomic_load_n(&dcontext->thread_record->exec_owner, __ATOMIC_SEQ_CST) ==
+                INVALID_RUNTIME_THREAD_ID)
             return true;
         __atomic_sub_fetch(&uninit_thread_count, 1, __ATOMIC_SEQ_CST);
         /* No signal inheritance, child stack or TLS transition exists yet.
@@ -8022,6 +8066,158 @@ free_and_return:
     return ret;
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Admission uses the same registry lock as group exit. No lock crosses exec. */
+static void
+exec_group_begin(dcontext_t *dcontext)
+{
+    thread_record_t *self = dcontext->thread_record;
+    uint attempts = 0;
+    for (;;) {
+        /* Arbitrate against a foreign all-thread stop before publishing an
+         * attempt. Otherwise it could stop us after we stopped one peer and
+         * then wait on that peer for our exec to complete. */
+        while (!d_r_mutex_trylock(&all_threads_synch_lock)) {
+            check_wait_at_safe_spot(dcontext, THREAD_SYNCH_NO_LOCKS_NO_XFER);
+            synch_thread_yield();
+        }
+        d_r_mutex_lock(&thread_initexit_lock);
+        if (!self->group_exit_requested &&
+            self->exec_owner == INVALID_RUNTIME_THREAD_ID) {
+            thread_record_t **threads;
+            int count;
+            get_list_of_threads_ex(&threads, &count, true);
+            for (int i = 0; i < count; ++i) {
+                if (threads[i]->runtime_group == self->runtime_group)
+                    __atomic_store_n(&threads[i]->exec_owner, self->runtime_id,
+                                     __ATOMIC_SEQ_CST);
+            }
+            global_heap_free(threads, count * sizeof(*threads) HEAPACCT(ACCT_THREAD_MGT));
+            ((os_thread_data_t *)dcontext->os_field)->exec_synch_lock_owned = true;
+            d_r_mutex_unlock(&thread_initexit_lock);
+            return;
+        }
+        d_r_mutex_unlock(&thread_initexit_lock);
+        d_r_mutex_unlock(&all_threads_synch_lock);
+        if (DYNAMO_OPTION(synch_all_threads_max_loops) != UINT_MAX &&
+            attempts++ >= DYNAMO_OPTION(synch_all_threads_max_loops))
+            REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                        get_application_name(), get_application_pid());
+        check_wait_at_safe_spot(dcontext, THREAD_SYNCH_NO_LOCKS_NO_XFER);
+        synch_thread_yield();
+    }
+}
+
+/* Called after loader/resource preparation. Peers must hold no runtime locks
+ * when the kernel kills them on successful exec, even if another CLONE_VM group
+ * will keep this runtime alive. Failed exec releases these references below. */
+static bool
+exec_group_quiesce(dcontext_t *dcontext)
+{
+    thread_record_t *self = dcontext->thread_record;
+    uint attempts = 0;
+    d_r_mutex_lock(&thread_initexit_lock);
+    while (__atomic_load_n(&uninit_thread_count, __ATOMIC_SEQ_CST) != 0) {
+        d_r_mutex_unlock(&thread_initexit_lock);
+        if (DYNAMO_OPTION(synch_all_threads_max_loops) != UINT_MAX &&
+            attempts++ >= DYNAMO_OPTION(synch_all_threads_max_loops))
+            return false;
+        synch_thread_yield();
+        d_r_mutex_lock(&thread_initexit_lock);
+    }
+    thread_record_t **threads;
+    int count;
+    get_list_of_threads_ex(&threads, &count, true);
+    runtime_thread_id_t *members =
+        global_heap_alloc(count * sizeof(*members) HEAPACCT(ACCT_THREAD_MGT));
+    int member_count = 0;
+    for (int i = 0; i < count; ++i) {
+        if (threads[i] != self && threads[i]->runtime_group == self->runtime_group)
+            members[member_count++] = threads[i]->runtime_id;
+    }
+    global_heap_free(threads, count * sizeof(*threads) HEAPACCT(ACCT_THREAD_MGT));
+    bool ready = true;
+    mark_thread_execve(self, true);
+    for (int i = 0; i < member_count; ++i) {
+        thread_record_t *peer = thread_lookup_runtime(members[i]);
+        if (peer == NULL)
+            continue;
+        thread_synch_result_t result =
+            synch_with_thread_runtime(members[i], true, true, THREAD_SYNCH_NONE,
+                                      THREAD_SYNCH_SUSPENDED_VALID_MCONTEXT_OR_NO_XFER,
+                                      THREAD_SYNCH_SUSPEND_FAILURE_ABORT);
+        peer = thread_lookup_runtime(members[i]);
+        if (peer == NULL)
+            continue;
+        if (result != THREAD_SYNCH_RESULT_SUCCESS &&
+            result != THREAD_SYNCH_RESULT_DEPARTED) {
+            ready = false;
+            break;
+        }
+        if (peer->exec_departed) {
+            dynamo_other_thread_exit(peer);
+            continue;
+        }
+        peer->exec_suspended = true;
+    }
+    global_heap_free(members, count * sizeof(*members) HEAPACCT(ACCT_THREAD_MGT));
+    d_r_mutex_unlock(&thread_initexit_lock);
+    return ready && os_thread_suspend_quiesce_for_exec(dcontext);
+}
+#endif
+
+bool
+os_execve_departed(thread_record_t *thread)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (!thread->exec_departed && os_thread_suspend_departed(thread))
+        thread->exec_departed = true;
+    return thread->exec_departed;
+#else
+    return thread->execve;
+#endif
+}
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+static void
+exec_group_release_peers(dcontext_t *dcontext)
+{
+    thread_record_t *self = dcontext->thread_record;
+    if (self->exec_owner != self->runtime_id)
+        return;
+    /* Core rollback has restored the signal route, mask and arguments. Keep
+     * admission closed through the client post callback, but release peers now
+     * so that callback can itself synchronize with other threads. */
+    d_r_mutex_lock(&thread_initexit_lock);
+    if (self->execve)
+        mark_thread_execve(self, false);
+    thread_record_t **threads;
+    int count;
+    get_list_of_threads_ex(&threads, &count, true);
+    for (int i = 0; i < count; ++i) {
+        thread_record_t *peer = threads[i];
+        if (peer->exec_owner == self->runtime_id && peer->exec_suspended) {
+            peer->exec_suspended = false;
+            os_thread_resume(peer);
+        }
+    }
+    global_heap_free(threads, count * sizeof(*threads) HEAPACCT(ACCT_THREAD_MGT));
+    d_r_mutex_unlock(&thread_initexit_lock);
+}
+#endif
+
+void
+os_execve_complete(dcontext_t *dcontext)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (dcontext->thread_record->exec_owner == dcontext->thread_record->runtime_id) {
+        d_r_mutex_lock(&thread_initexit_lock);
+        exec_group_clear_owner(dcontext);
+        d_r_mutex_unlock(&thread_initexit_lock);
+    }
+#endif
+}
+
 static int
 handle_execve(dcontext_t *dcontext)
 {
@@ -8079,6 +8275,9 @@ handle_execve(dcontext_t *dcontext)
             return ret;
     }
 
+#if !defined(LINUX) || !defined(X86) || !defined(X64)
+    mark_thread_execve(dcontext->thread_record, true);
+#endif
     fname = (char *)*execve_param_addr(dcontext, 0);
 #if defined(LINUX) || defined(DEBUG)
     argv = (const char **)*execve_param_addr(dcontext, 1);
@@ -8116,32 +8315,6 @@ handle_execve(dcontext_t *dcontext)
             }
         }
     });
-
-    /* i#237/PR 498284: if we're a vfork "thread" we're really in a different
-     * process and if we exec then the parent process will still be alive.  We
-     * can't easily clean our own state (dcontext, dstack, etc.) up in our
-     * parent process: we need it to invoke the syscall and the syscall might
-     * fail.  We could expand cleanup_and_terminate to also be able to invoke
-     * SYS_execve: but execve seems more likely to fail than termination
-     * syscalls.  Our solution is to mark this thread as "execve" and hide it
-     * from regular thread queries; we clean it up in the process-exiting
-     * synch_with_thread(), or if the same parent thread performs another vfork
-     * (to prevent heap accumulation from repeated vfork+execve).  Since vfork
-     * on linux suspends the parent, there cannot be any races with the execve
-     * syscall completing: there can't even be peer vfork threads, so we could
-     * set a flag and clean up in d_r_dispatch, but that seems overkill.  (If vfork
-     * didn't suspend the parent we'd need to touch a marker file or something
-     * to know the execve was finished.)
-     */
-    mark_thread_execve(dcontext->thread_record, true);
-#if defined(LINUX) && defined(X86) && defined(X64)
-    /* A successful kernel exec replaces our signal handler. First prevent any
-     * new relay notification and wait until all accepted ones reached us. */
-    if (!os_thread_suspend_quiesce_for_exec(dcontext)) {
-        mark_thread_execve(dcontext->thread_record, false);
-        return EIO;
-    }
-#endif
 
 #ifdef STATIC_LIBRARY
     /* no way we can inject, we just lose control */
@@ -8191,7 +8364,6 @@ handle_execve(dcontext_t *dcontext)
         if (!signal_exec_snapshot(dcontext, &exec_ignored, &exec_blocked)) {
             if (descriptor_exec == NULL && file != INVALID_FILE)
                 os_close(file);
-            mark_thread_execve(dcontext->thread_record, false);
             return EIO;
         }
         snprintf(exec_signals, sizeof(exec_signals),
@@ -8210,7 +8382,6 @@ handle_execve(dcontext_t *dcontext)
                 os_close(file);
             dcontext->sys_param0 = dcontext->sys_param1 = 0;
             dcontext->sys_param3 = dcontext->sys_param4 = 0;
-            mark_thread_execve(dcontext->thread_record, false);
             return EIO;
         }
         if (descriptor_exec != NULL) {
@@ -8261,7 +8432,6 @@ handle_execve(dcontext_t *dcontext)
         dcontext->sys_param3 = dcontext->sys_param4 = 0;
         d_r_config_exit();
         if (!signal_exec_block(dcontext, exec_ignored)) {
-            mark_thread_execve(dcontext->thread_record, false);
             return EIO;
         }
         return 0;
@@ -8312,7 +8482,6 @@ handle_execve(dcontext_t *dcontext)
      * Other exec paths have no cooperating consumer to remove it. */
     if (exec_signals[0] != '\0' && dcontext->sys_param4 != 0 &&
         !signal_exec_block(dcontext, exec_ignored)) {
-        mark_thread_execve(dcontext->thread_record, false);
         return EIO;
     }
 #endif
@@ -8402,7 +8571,7 @@ handle_execve_post(dcontext_t *dcontext)
         i++; /* need to de-allocate final null slot too */
         heap_free(dcontext, new_envp, sizeof(char *) * i HEAPACCT(ACCT_OTHER));
         /* restore prev envp if we're post-syscall */
-        if (!dcontext->thread_record->execve)
+        if (dcontext->owning_runtime_id == get_runtime_thread_id())
             *execve_param_addr(dcontext, 2) = (reg_t)old_envp;
     }
 #if defined(LINUX) && defined(X64) && defined(SYS_execveat)
@@ -8496,7 +8665,6 @@ handle_execveat(dcontext_t *dcontext)
             release_execveat(dcontext);
             dcontext->sys_param0 = dcontext->sys_param1 = 0;
             dcontext->sys_param3 = dcontext->sys_param4 = 0;
-            mark_thread_execve(dcontext->thread_record, true);
             return 0;
         }
         file_t private_file = fcntl_syscall(readable, F_DUPFD_CLOEXEC, 3);
@@ -8562,13 +8730,15 @@ cleanup_after_vfork_execve(dcontext_t *dcontext)
 {
     thread_record_t **threads;
     int num_threads, i;
-    if (num_execve_threads == 0)
-        return;
-
     d_r_mutex_lock(&thread_initexit_lock);
     get_list_of_threads_ex(&threads, &num_threads, true /*include execve*/);
     for (i = 0; i < num_threads; i++) {
-        if (threads[i]->execve) {
+        if ((threads[i]->execve
+#if defined(LINUX) && defined(X86) && defined(X64)
+             || threads[i]->exec_suspended
+#endif
+             ) &&
+            os_execve_departed(threads[i])) {
             LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up earlier vfork thread " TIDFMT "\n",
                 threads[i]->id);
             dynamo_other_thread_exit(threads[i]);
@@ -8734,6 +8904,18 @@ handle_exit(dcontext_t *dcontext)
         global_heap_free(closing_threads,
                          closing_count *
                              sizeof(*closing_threads) HEAPACCT(ACCT_THREAD_MGT));
+    }
+    uint exec_attempts = 0;
+    while (dcontext->sys_num == SYSNUM_EXIT_PROCESS &&
+           dcontext->thread_record->exec_owner != INVALID_RUNTIME_THREAD_ID) {
+        d_r_mutex_unlock(&thread_initexit_lock);
+        if (DYNAMO_OPTION(synch_all_threads_max_loops) != UINT_MAX &&
+            exec_attempts++ >= DYNAMO_OPTION(synch_all_threads_max_loops))
+            REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                        get_application_name(), get_application_pid());
+        check_wait_at_safe_spot(dcontext, THREAD_SYNCH_NO_LOCKS_NO_XFER);
+        synch_thread_yield();
+        d_r_mutex_lock(&thread_initexit_lock);
     }
     /* A successful CLONE_VM child may still be absent from the thread list.
      * Decide which groups survive only after its startup record is published.
@@ -9824,6 +10006,9 @@ pre_system_call(dcontext_t *dcontext)
 
 #if defined(LINUX) && defined(X64) && defined(SYS_execveat)
     case SYS_execveat: {
+#    ifdef X86
+        exec_group_begin(dcontext);
+#    endif
         int ret = handle_execveat(dcontext);
         if (ret != 0) {
             execute_syscall = false;
@@ -9834,9 +10019,11 @@ pre_system_call(dcontext_t *dcontext)
 #endif
 
     case SYS_execve: {
+#if defined(LINUX) && defined(X86) && defined(X64)
+        exec_group_begin(dcontext);
+#endif
         int ret = handle_execve(dcontext);
         if (ret != 0) {
-            mark_thread_execve(dcontext->thread_record, false);
             handle_execve_post(dcontext);
             execute_syscall = false;
             set_failure_return_val(dcontext, ret);
@@ -10806,6 +10993,20 @@ pre_system_call(dcontext_t *dcontext)
     } /* end switch */
 
 #if defined(LINUX) && defined(X86) && defined(X64)
+    if (execute_syscall &&
+        dcontext->thread_record->exec_owner == dcontext->thread_record->runtime_id &&
+        !exec_group_quiesce(dcontext)) {
+        handle_execve_post(dcontext);
+        set_failure_return_val(dcontext, EIO);
+        execute_syscall = false;
+    }
+    if (!execute_syscall)
+        exec_group_release_peers(dcontext);
+    os_thread_data_t *exec_data = dcontext->os_field;
+    if (exec_data->exec_synch_lock_owned) {
+        exec_data->exec_synch_lock_owned = false;
+        d_r_mutex_unlock(&all_threads_synch_lock);
+    }
     if (!execute_syscall)
         os_stdio_post_syscall(dcontext, dcontext->sys_num,
                               syscall_successful(mc, dcontext->sys_num),
@@ -11711,7 +11912,9 @@ post_system_call(dcontext_t *dcontext)
     case SYS_execve: {
         /* if we get here it means execve failed (doesn't return on success) */
         success = false;
+#if !defined(LINUX) || !defined(X86) || !defined(X64)
         mark_thread_execve(dcontext->thread_record, false);
+#endif
         ASSERT(result < 0);
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: execve failed\n");
         handle_execve_post(dcontext);
@@ -11989,6 +12192,9 @@ post_system_call(dcontext_t *dcontext)
 
 exit_post_system_call:
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    exec_group_release_peers(dcontext);
+#endif
     /* The instrument_post_syscall should be called after DR finishes all
      * its operations, since DR needs to know the real syscall results,
      * and any changes made by the client are simply to fool the app.
@@ -11997,6 +12203,7 @@ exit_post_system_call:
      */
     /* after restore of xbp so client sees it as though was sysenter */
     instrument_post_syscall(dcontext, sysnum);
+    os_execve_complete(dcontext);
 
     dcontext->whereami = old_whereami;
 }

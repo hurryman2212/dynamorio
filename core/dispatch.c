@@ -2265,6 +2265,7 @@ handle_system_call(dcontext_t *dcontext)
          */
         if (execute_syscall) {
             instrument_post_syscall(dcontext, dcontext->sys_num);
+            IF_UNIX(os_execve_complete(dcontext));
         }
 #    ifdef WINDOWS
         if (get_syscall_method() == SYSCALL_METHOD_SYSENTER) {

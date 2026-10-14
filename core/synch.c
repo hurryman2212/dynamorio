@@ -1019,13 +1019,23 @@ synch_with_thread_runtime(runtime_thread_id_t id, bool block, bool hold_initexit
             }
         });
 #ifdef UNIX
-        if (trec != NULL && trec->execve) {
-            /* i#237/PR 498284: clean up vfork "threads" that invoked execve.
-             * There should be no race since vfork suspends the parent.
-             */
-            res = THREAD_SYNCH_RESULT_SUCCESS;
-            actually_suspended = false;
-            break;
+        if (trec != NULL &&
+            (trec->execve
+#    if defined(LINUX) && defined(X86) && defined(X64)
+             || (trec->exec_suspended && trec->exec_owner != my_id)
+#    endif
+                 )) {
+            if (os_execve_departed(trec)) {
+                res = THREAD_SYNCH_IS_CLEANED(desired_state)
+                    ? THREAD_SYNCH_RESULT_SUCCESS
+                    : THREAD_SYNCH_RESULT_DEPARTED;
+                actually_suspended = false;
+                break;
+            }
+            /* Preparation and kernel entry are not departure. Let rollback or
+             * the new image finish while holding no registry lock. Sending a
+             * suspension signal could instead reach the new image's handler. */
+            goto wait_for_exec;
         }
 #endif
         if (trec != NULL) {
@@ -1073,6 +1083,9 @@ synch_with_thread_runtime(runtime_thread_id_t id, bool block, bool hold_initexit
                 break;
             }
         }
+#ifdef UNIX
+    wait_for_exec:
+#endif
         /* don't loop if !block, before we ever release initexit_lock in case
          * caller is holding it and not blocking, (i.e. wants to keep it) */
         if (!block)
@@ -1080,7 +1093,7 @@ synch_with_thread_runtime(runtime_thread_id_t id, bool block, bool hold_initexit
         /* see if someone is waiting for us */
         if (dcontext != NULL && caller_state != THREAD_SYNCH_NONE &&
             should_wait_at_safe_spot(dcontext)) {
-            if (trec != NULL)
+            if (trec != NULL && !first_loop)
                 adjust_wait_at_safe_spot(trec->dcontext, -1);
             d_r_mutex_unlock(&thread_initexit_lock);
             /* ref case 5552, if we've inc'ed the exiting thread count need to
@@ -1112,7 +1125,7 @@ synch_with_thread_runtime(runtime_thread_id_t id, bool block, bool hold_initexit
                     STATS_INC(synch_yields_for_exiting_thread);
                 }
             });
-            if (trec != NULL)
+            if (trec != NULL && !first_loop)
                 adjust_wait_at_safe_spot(trec->dcontext, 1);
         }
         STATS_INC(synch_yields);
@@ -1129,13 +1142,14 @@ synch_with_thread_runtime(runtime_thread_id_t id, bool block, bool hold_initexit
         d_r_mutex_lock(&thread_initexit_lock);
     }
     /* reset this back to before */
-    adjust_wait_at_safe_spot(trec->dcontext, -1);
+    if (!first_loop)
+        adjust_wait_at_safe_spot(trec->dcontext, -1);
     /* success!, is suspended (or already exited) put in desired state */
     if (res == THREAD_SYNCH_RESULT_SUCCESS) {
         LOG(THREAD, LOG_SYNCH, 2,
             "Success synching with thread " RUNTIME_TIDFMT " performing cleanup\n", id);
         if (THREAD_SYNCH_IS_TERMINATED(desired_state)) {
-            if (IF_UNIX_ELSE(!trec->execve, true))
+            if (IF_UNIX_ELSE(actually_suspended, true))
                 os_thread_terminate(trec);
 #ifdef UNIX
             /* We need to ensure the target thread has received the
@@ -1468,8 +1482,9 @@ synch_with_all_threads(thread_synch_state_t desired_synch_state,
                     synch_array[i] = SYNCH_WITH_ALL_SYNCHED;
                     if (!THREAD_SYNCH_IS_CLEANED(desired_synch_state))
                         adjust_wait_at_safe_spot(threads[i]->dcontext, -1);
-                } else if (synch_res == THREAD_SYNCH_RESULT_SUSPEND_FAILURE &&
-                           TESTANY(THREAD_SYNCH_SUSPEND_FAILURE_IGNORE, flags)) {
+                } else if (synch_res == THREAD_SYNCH_RESULT_DEPARTED ||
+                           (synch_res == THREAD_SYNCH_RESULT_SUSPEND_FAILURE &&
+                            TESTANY(THREAD_SYNCH_SUSPEND_FAILURE_IGNORE, flags))) {
                     /* This target was attempted, not suspended. Continue the
                      * group without retrying it or holding its safe-spot request. */
                     synch_array[i] = SYNCH_WITH_ALL_UNSUSPENDED;

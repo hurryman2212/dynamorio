@@ -2017,8 +2017,8 @@ is_thread_known(thread_id_t tid)
 }
 
 #ifdef UNIX
-/* i#237/PR 498284: a thread about to execute SYS_execve should be considered
- * exited, but we can't easily clean up it for real immediately
+/* Mark an in-flight exec attempt. The flag alone does not prove that the task
+ * has left this image: failed exec still returns to the live runtime context.
  */
 void
 mark_thread_execve(thread_record_t *tr, bool execve)
@@ -2027,10 +2027,7 @@ mark_thread_execve(thread_record_t *tr, bool execve)
     tr->execve = execve;
     d_r_mutex_lock(&all_threads_lock);
     if (execve) {
-        /* since we free on a second vfork we should never accumulate
-         * more than one
-         */
-        ASSERT(num_execve_threads == 0);
+        /* Independent CLONE_VM groups may execute concurrently. */
         num_execve_threads++;
     } else {
         ASSERT(num_execve_threads > 0);
@@ -2043,7 +2040,12 @@ mark_thread_execve(thread_record_t *tr, bool execve)
 int
 d_r_get_num_threads(void)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* An exec attempt is still using this runtime until departure is proven. */
+    return num_known_threads;
+#else
     return num_known_threads IF_UNIX(-num_execve_threads);
+#endif
 }
 
 bool
@@ -2078,7 +2080,7 @@ get_list_of_threads_common(thread_record_t ***list,
     ASSERT_OWN_MUTEX(true, &thread_initexit_lock);
 
     d_r_mutex_lock(&all_threads_lock);
-    /* Do not include vfork threads that exited via execve, unless we're exiting */
+    /* Reserve space before filtering completed exec records below. */
     max_num = IF_UNIX_ELSE((include_execve || dynamo_exiting) ? num_known_threads
                                                               : d_r_get_num_threads(),
                            d_r_get_num_threads());
@@ -2087,10 +2089,15 @@ get_list_of_threads_common(thread_record_t ***list,
     for (i = 0; i < HASHTABLE_SIZE(ALL_THREADS_HASH_BITS); i++) {
         for (tr = all_threads[i]; tr != NULL; tr = tr->next) {
             /* include those for which !tr->under_dynamo_control */
-            /* don't include those that exited for execve.  there should be
-             * no race b/c vfork suspends the parent.  xref i#237/PR 498284.
+            /* Linux x64 keeps live exec attempts visible and excludes only
+             * proven departures. Other platforms retain legacy vfork handling.
+             * Explicit cleanup snapshots include the departed records as well.
              */
+#if defined(LINUX) && defined(X86) && defined(X64)
+            if (!tr->exec_departed || include_execve || dynamo_exiting) {
+#else
             if (IF_UNIX_ELSE(!tr->execve || include_execve || dynamo_exiting, true)) {
+#endif
                 mylist[cur] = tr;
                 cur++;
             }
@@ -2243,14 +2250,20 @@ add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid
      * an empty registry, so its sole surviving thread starts open again.
      */
     tr->group_exit_requested = false;
+    tr->exec_owner = INVALID_RUNTIME_THREAD_ID;
+    tr->exec_suspended = false;
+    tr->exec_departed = false;
     for (uint i = 0;
          i < HASHTABLE_SIZE(ALL_THREADS_HASH_BITS) && !tr->group_exit_requested; ++i) {
         for (thread_record_t *member = all_threads[i]; member != NULL;
              member = member->next) {
-            if (member->runtime_group == runtime_group &&
-                __atomic_load_n(&member->group_exit_requested, __ATOMIC_SEQ_CST)) {
-                tr->group_exit_requested = true;
-                break;
+            if (member->runtime_group == runtime_group) {
+                if (__atomic_load_n(&member->group_exit_requested, __ATOMIC_SEQ_CST))
+                    tr->group_exit_requested = true;
+                tr->exec_owner = __atomic_load_n(&member->exec_owner, __ATOMIC_SEQ_CST);
+                if (tr->group_exit_requested ||
+                    tr->exec_owner != INVALID_RUNTIME_THREAD_ID)
+                    break;
             }
         }
     }
