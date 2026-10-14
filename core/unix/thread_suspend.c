@@ -104,9 +104,11 @@ suspend_exchange(file_t destination, file_t channel,
             bool valid = !TESTANY(MSG_TRUNC | MSG_CTRUNC, message.msg_flags) &&
                 reply->magic == DR_THREAD_SUSPEND_MAGIC &&
                 reply->version == DR_THREAD_SUSPEND_VERSION && reply->sequence != 0 &&
-                reply->reserved == 0 && reply->status <= DR_THREAD_SUSPEND_TRANSPORT &&
+                reply->reserved == 0 && reply->status <= DR_THREAD_SUSPEND_UNKNOWN &&
                 reply->system_error >= 0 &&
-                (reply->status != DR_THREAD_SUSPEND_OK || reply->system_error == 0);
+                ((reply->status != DR_THREAD_SUSPEND_OK &&
+                  reply->status < DR_THREAD_SUSPEND_LIVE) ||
+                 reply->system_error == 0);
             if (!valid)
                 return false;
             if (drain && reply->sequence < request->sequence) {
@@ -358,6 +360,46 @@ os_thread_suspend_restore_after_exec(dcontext_t *dcontext)
     return true;
 }
 
+/* The caller owns the exchange channel. The peer's numeric fd and readiness
+ * are irrelevant, including after a successful exec in another CLONE_VM group. */
+static uint
+suspend_peer_control(dcontext_t *target, uint operation)
+{
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT || dcontext->os_field == NULL ||
+        target == NULL || target->os_field == NULL)
+        return DR_THREAD_SUSPEND_UNKNOWN;
+    thread_suspend_channel_t *caller =
+        &((os_thread_data_t *)dcontext->os_field)->suspend_channel;
+    const thread_suspend_channel_t *peer =
+        &((os_thread_data_t *)target->os_field)->suspend_channel;
+    if (!caller->channel_owned || caller->generation != suspend_generation ||
+        peer->generation != suspend_generation || caller->realm != peer->realm ||
+        peer->task == 0 || caller->sequence == UINT64_MAX ||
+        !atomic_compare_exchange_int(&caller->busy, 0, 1))
+        return DR_THREAD_SUSPEND_UNKNOWN;
+    dr_thread_suspend_request_t request = { 0 };
+    dr_thread_suspend_reply_t reply;
+    request.magic = DR_THREAD_SUSPEND_MAGIC;
+    request.version = DR_THREAD_SUSPEND_VERSION;
+    request.operation = operation;
+    request.sequence = ++caller->sequence;
+    request.realm = peer->realm;
+    request.task = peer->task;
+    bool valid = suspend_exchange(caller->channel, caller->channel, &request, NULL,
+                                  &reply, NULL, true);
+    atomic_compare_exchange_int(&caller->busy, 1, 0);
+    return valid ? reply.status : DR_THREAD_SUSPEND_UNKNOWN;
+}
+
+bool
+os_thread_suspend_departed(thread_record_t *target)
+{
+    return target != NULL &&
+        suspend_peer_control(target->dcontext, DR_THREAD_SUSPEND_STATUS) ==
+        DR_THREAD_SUSPEND_DEPARTED;
+}
+
 bool
 os_thread_suspend_release(dcontext_t *dcontext, bool other_thread)
 {
@@ -369,6 +411,10 @@ os_thread_suspend_release(dcontext_t *dcontext, bool other_thread)
         return true;
     bool own_task =
         !other_thread && dcontext->owning_runtime_id == get_runtime_thread_id();
+    /* Forget only when the runtime has established that this context can be
+     * disposed of. This is resource retirement, never departure evidence. */
+    if (other_thread)
+        (void)suspend_peer_control(dcontext, DR_THREAD_SUSPEND_FORGET);
     /* A peer's FD is meaningful only in the same file table. Its pidfd death or
      * channel disconnect retires the registration in the broker. A live caller
      * that unshared its table retains its own copied descriptor. */
@@ -377,6 +423,7 @@ os_thread_suspend_release(dcontext_t *dcontext, bool other_thread)
     if (own_task) {
         if (!suspend_control(dcontext, DR_THREAD_SUSPEND_RELEASE))
             return false; /* Keep both descriptors until the retirement barrier. */
+        (void)suspend_peer_control(dcontext, DR_THREAD_SUSPEND_FORGET);
     }
     state->ready = false;
     os_close_protected(state->channel);

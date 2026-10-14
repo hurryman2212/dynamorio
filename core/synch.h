@@ -96,6 +96,7 @@ typedef enum {
     THREAD_SYNCH_RESULT_SUCCESS = 1,
     THREAD_SYNCH_RESULT_SUSPEND_FAILURE = 2,
     THREAD_SYNCH_RESULT_NOT_SAFE = 3,
+    THREAD_SYNCH_RESULT_DEPARTED = 4, /* no suspended context or resume obligation */
 } thread_synch_result_t;
 
 /* option bits that affect both synch_with_all_threads() and synch_with_thread(),

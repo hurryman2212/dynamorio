@@ -171,6 +171,7 @@ typedef struct _os_thread_data_t {
 
     /* Saved execveat arguments and pinned target, owned by os.c. */
     void *execveat_state;
+    bool exec_synch_lock_owned;
     /* Client data belongs to this exec attempt, not another thread's exec. */
     uint64 client_exec_data;
 
@@ -214,6 +215,8 @@ typedef struct _os_thread_data_t {
     void *runtime_child_bootstrap;
     struct _file_table_snapshot_t *runtime_file_snapshot;
     bool runtime_clone_shares_files;
+    bool runtime_clone_vfork;
+    runtime_thread_id_t runtime_vfork_child;
     uint64 runtime_clone_mask;
     bool runtime_clone_mask_valid;
 #    endif

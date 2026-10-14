@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define DR_THREAD_SUSPEND_MAGIC UINT64_C(0x3150535553524444)
-#define DR_THREAD_SUSPEND_VERSION 1
+#define DR_THREAD_SUSPEND_VERSION 2
 #define DR_THREAD_SUSPEND_PAYLOAD_SIZE 128
 #define DR_THREAD_SUSPEND_REGISTER_FILES 3
 /* Linux x86-64 SI_QUEUE si_value holds the notification ticket. The registered
@@ -23,6 +23,8 @@ enum {
     DR_THREAD_SUSPEND_RELEASE = 3,
     DR_THREAD_SUSPEND_QUIESCE = 4,
     DR_THREAD_SUSPEND_RESUME = 5,
+    DR_THREAD_SUSPEND_STATUS = 6,
+    DR_THREAD_SUSPEND_FORGET = 7,
 };
 
 enum {
@@ -32,6 +34,9 @@ enum {
     DR_THREAD_SUSPEND_DEAD = 3,
     DR_THREAD_SUSPEND_UNAUTHORIZED = 4,
     DR_THREAD_SUSPEND_TRANSPORT = 5,
+    DR_THREAD_SUSPEND_LIVE = 6,
+    DR_THREAD_SUSPEND_DEPARTED = 7,
+    DR_THREAD_SUSPEND_UNKNOWN = 8,
 };
 
 /* REGISTER is sent on the inherited service endpoint with exactly three
@@ -55,8 +60,8 @@ enum {
  * other identity and payload fields are zero. SEND is thread-directed (the broker
  * uses PIDFD_SIGNAL_THREAD), never a process-group signal. The other operations
  * apply only to the calling channel's own task. RELEASE permanently rejects new
- * sends, waits for the outstanding notification ACK before replying, then closes
- * the broker's pidfd. It is idempotent for that exact handle. QUIESCE temporarily
+ * sends and waits for the outstanding notification ACK before replying. It does
+ * not prove task death. It is idempotent for that exact handle. QUIESCE temporarily
  * rejects sends with UNAVAILABLE/EBUSY and uses the same ACK barrier while keeping
  * the pidfd/channel. RESUME is permitted only after that barrier completes and
  * cannot undo RELEASE. This lets a failed exec restore the existing registration.
@@ -65,6 +70,18 @@ enum {
  * barrier reply. A client that timed out discards older valid replies while
  * reconciling the newest barrier. It must observe completion before RESUME or
  * before removing its signal handler; a timeout is not permission to do either.
+ *
+ * STATUS and FORGET also use the caller's private channel and identify an exact
+ * target in the same realm. STATUS sends no signal and works while the target
+ * is quiesced for exec. It returns LIVE, DEPARTED or UNKNOWN, all with zero
+ * system_error. DEPARTED proves that the target pidfd reported kernel exit, or
+ * an authenticated replacement image committed exec. RELEASE, missing handles,
+ * invalid acknowledgments, channel loss and transport failure are not departure
+ * proof. Such failures return UNKNOWN or an ordinary failure response. The
+ * broker retains departure proof until FORGET or family-service teardown.
+ * FORGET discards a runtime record whose owner has completed its cleanup; it is
+ * idempotent and does not establish departure. An owner must not forget a record
+ * still needed by another thread in its address space.
  *
  * Handles and nonzero sequences are not recycled during the service lifetime.
  * A kernel delivery acknowledgement is not a DR suspension acknowledgement. */

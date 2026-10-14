@@ -293,6 +293,14 @@ bool
 pre_system_call(dcontext_t *dcontext);
 void
 post_system_call(dcontext_t *dcontext);
+#ifdef UNIX
+/* Finish failed exec only after the client post-syscall callback. */
+void
+os_execve_complete(dcontext_t *dcontext);
+/* Requires the registry lock; true only after exact old-image departure. */
+bool
+os_execve_departed(thread_record_t *thread);
+#endif
 int
 os_normalized_sysnum(int num_raw, instr_t *gateway, dcontext_t *dcontext_live);
 
