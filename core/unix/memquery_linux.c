@@ -45,6 +45,8 @@
 #include "memquery.h"
 #include "os_private.h"
 #include "module_private.h"
+#include "include/syscall.h"
+#include <linux/fs.h>
 #include <sys/mman.h>
 
 #ifndef LINUX
@@ -353,6 +355,65 @@ memquery_library_bounds(const char *name, app_pc *start /*IN/OUT*/, app_pc *end 
  * QUERY
  */
 
+#ifdef PROCMAP_QUERY
+/* Linux 6.11's maps ioctl returns one self-consistent live VMA without parsing
+ * all earlier mappings. Keep the textual iterator for holes (which need the
+ * preceding and following bounds), unsupported kernels, and incomplete data.
+ * The descriptor is local to this call and current file table: never retain it
+ * across fork, unshare, namespace changes, or descriptor reuse.
+ */
+static bool
+memquery_from_os_ioctl(const byte *pc, DR_PARAM_OUT dr_mem_info_t *info)
+{
+    struct procmap_query query = { 0 };
+    bool found = false;
+    d_r_mutex_lock(&memory_info_buf_lock);
+    file_t maps = os_open_procfs("thread-self/maps", false);
+    if (maps == INVALID_FILE)
+        maps = os_open_procfs("self/maps", false);
+    if (maps != INVALID_FILE) {
+        query.size = sizeof(query);
+        query.query_addr = (ptr_uint_t)pc;
+        query.vma_name_size = sizeof(comment_buf_scratch);
+        query.vma_name_addr = (ptr_uint_t)comment_buf_scratch;
+        comment_buf_scratch[0] = '\0';
+        const ptr_int_t result =
+            dynamorio_syscall(SYS_ioctl, 3, maps, PROCMAP_QUERY, &query);
+        os_close(maps);
+        found = result == 0 && query.vma_start <= (ptr_uint_t)pc &&
+            query.vma_end > (ptr_uint_t)pc && query.vma_end <= POINTER_MAX &&
+            (query.vma_flags &
+             ~(uint64)(PROCMAP_QUERY_VMA_READABLE | PROCMAP_QUERY_VMA_WRITABLE |
+                       PROCMAP_QUERY_VMA_EXECUTABLE | PROCMAP_QUERY_VMA_SHARED)) == 0 &&
+            query.vma_name_size <= sizeof(comment_buf_scratch) &&
+            (query.vma_name_size == 0 ||
+             comment_buf_scratch[query.vma_name_size - 1] == '\0');
+        if (found) {
+            info->base_pc = (app_pc)(ptr_uint_t)query.vma_start;
+            info->size = (size_t)(query.vma_end - query.vma_start);
+            info->prot =
+                ((query.vma_flags & PROCMAP_QUERY_VMA_READABLE) ? MEMPROT_READ : 0) |
+                ((query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) ? MEMPROT_WRITE : 0) |
+                ((query.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) ? MEMPROT_EXEC : 0);
+            if (vdso_page_start != NULL && pc >= vdso_page_start &&
+                pc < vdso_page_start + vdso_size) {
+                info->prot = MEMPROT_READ | MEMPROT_EXEC | MEMPROT_VDSO;
+            } else if (query.vma_name_size != 0 &&
+                       strncmp(comment_buf_scratch, VVAR_PAGE_MAPS_NAME_PREFIX,
+                               strlen(VVAR_PAGE_MAPS_NAME_PREFIX)) == 0) {
+                info->prot |= MEMPROT_VDSO;
+            }
+#    ifdef ANDROID
+            if (query.vma_name_size != 0 && comment_buf_scratch[0] != '\0')
+                info->prot |= MEMPROT_HAS_COMMENT;
+#    endif
+        }
+    }
+    d_r_mutex_unlock(&memory_info_buf_lock);
+    return found;
+}
+#endif
+
 bool
 memquery_from_os(const byte *pc, DR_PARAM_OUT dr_mem_info_t *info,
                  DR_PARAM_OUT bool *have_type)
@@ -364,6 +425,12 @@ memquery_from_os(const byte *pc, DR_PARAM_OUT dr_mem_info_t *info,
     ASSERT(info != NULL);
     info->type = DR_MEMTYPE_ERROR;
     *have_type = true;
+#ifdef PROCMAP_QUERY
+    if (memquery_from_os_ioctl(pc, info)) {
+        *have_type = false; /* Preserve the caller's ELF-header type check. */
+        return true;
+    }
+#endif
     if (!memquery_iterator_start(&iter, (app_pc)pc, false /*won't alloc*/))
         return false;
     *have_type = false;
