@@ -70,6 +70,10 @@ typedef struct _thread_synch_data_t {
      * trylock, as it could have been suspended while holding synch_lock (i#2805).
      */
     thread_synch_permission_t synch_perm;
+    /* Signal handlers must not abandon this wait before its cleanup finishes.
+     * Read without taking synch_lock, including from nested signal handlers.
+     */
+    volatile int safe_wait_active;
     /* Only valid while holding all_threads_synch_lock and thread_initexit_lock.  Set
      * to whether synch_with_all_threads was successful in synching this thread.
      */
@@ -136,6 +140,7 @@ synch_thread_init(dcontext_t *dcontext)
     dcontext->synch_field = (void *)tsd;
     tsd->pending_synch_count = 0;
     tsd->synch_perm = THREAD_SYNCH_NONE;
+    tsd->safe_wait_active = 0;
     tsd->synch_with_success = false;
     tsd->set_mcontext = NULL;
     tsd->set_context = NULL;
@@ -179,6 +184,13 @@ thread_synch_state_no_xfer(dcontext_t *dcontext)
         return res;
     }
     return false;
+}
+
+bool
+thread_synch_waiting_at_safe_spot(dcontext_t *dcontext)
+{
+    thread_synch_data_t *tsd = (thread_synch_data_t *)dcontext->synch_field;
+    return atomic_aligned_read_int(&tsd->safe_wait_active) != 0;
 }
 
 bool
@@ -706,6 +718,7 @@ check_wait_at_safe_spot(dcontext_t *dcontext, thread_synch_permission_t cur_stat
         IF_WINDOWS(set_last_error(dcontext->app_errno));
     }
     spinmutex_lock(tsd->synch_lock);
+    atomic_exchange_int(&tsd->safe_wait_active, 1);
     tsd->synch_perm = cur_state;
     /* Since can be killed, suspended, etc. must call the exit dr hook. But, to
      * avoid races, we must do so before giving up the synch_lock. This is why
@@ -766,6 +779,10 @@ check_wait_at_safe_spot(dcontext_t *dcontext, thread_synch_permission_t cur_stat
         }
         synch_thread_free_setcontext(tsd); /* sets to NULL for us */
     }
+    /* Clear before either the ordinary return or the non-returning context
+     * transfer below, after all state owned by this wait has been consumed.
+     */
+    atomic_exchange_int(&tsd->safe_wait_active, 0);
     spinmutex_unlock(tsd->synch_lock);
     LOG(THREAD, LOG_SYNCH, 2, "done waiting for synch with state %d (pc " PFX ")\n",
         cur_state, pc);

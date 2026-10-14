@@ -5211,10 +5211,16 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
     } else if (thread_synch_check_state(dcontext, THREAD_SYNCH_NO_LOCKS) &&
                /* Avoid grabbing locks for xl8 while in a suspended state (i#3026). */
                ksynch_get_value(&ostd->suspended) == 0) {
-        /* The signal interrupted DR or the client but it's at a safe spot so
-         * deliver it now.
+        /* A synchronization wait owns cleanup and possibly a queued context
+         * change. Delivering now would abandon that stack and leave its valid
+         * mcontext permission set during later execution. Let the wait finish;
+         * dispatch will deliver the queued asynchronous signal afterwards.
+         * Other safe regions, including application-lock waits, remain eligible
+         * for immediate delivery.
          */
-        receive_now = true;
+        receive_now = !thread_synch_waiting_at_safe_spot(dcontext) ||
+            (!can_always_delay[sig] &&
+             !is_sys_kill(dcontext, pc, (byte *)sc->SC_XSP, &frame->info));
     } else {
         /* the signal interrupted DR itself => do not run handler now! */
         LOG(THREAD, LOG_ASYNCH, 2, "record_pending_signal(%d) from DR at pc " PFX "\n",
