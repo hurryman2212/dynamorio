@@ -109,6 +109,14 @@ typedef struct _tls_info_t {
     privmod_t *mods[MAX_NUM_TLS_MOD];
 } tls_info_t;
 static tls_info_t tls_info;
+#ifdef X86
+/* Private libc's exit-function list is shared by the address space, including
+ * CLONE_VM tasks in other thread groups. Its mangled pointers require the same
+ * guard in every private TCB, regardless of the corresponding application TCB.
+ */
+static ptr_uint_t private_pointer_guard;
+static bool private_pointer_guard_initialized;
+#endif
 
 /* Maximum size of TLS for client private libraries.
  * We will round this up to a multiple of the page size.
@@ -607,6 +615,22 @@ privload_tls_init(void *app_tp, bool use_safe_read)
     ASSERT(tls_info.offset <=
            client_tls_alloc_size - TLS_PRE_TCB_SIZE - tcb_size_estimate);
 #ifdef X86
+    if (INTERNAL_OPTION(private_loader)) {
+        if (!private_pointer_guard_initialized) {
+            /* The primary TCB precedes private-library constructors and all
+             * secondary thread initialization. Early injection can precede the
+             * application's TLS: use explicit zero instead of uninitialized
+             * allocation bytes unless the complete guard was copied.
+             */
+            ASSERT(!dynamo_initialized);
+            const size_t guard_end =
+                (byte *)&dr_tcb->pointer_guard - dr_start + sizeof(dr_tcb->pointer_guard);
+            private_pointer_guard =
+                tls_bytes_read >= guard_end ? dr_tcb->pointer_guard : 0;
+            private_pointer_guard_initialized = true;
+        }
+        dr_tcb->pointer_guard = private_pointer_guard;
+    }
     /* Update two self pointers. */
     dr_tcb->tcb = dr_tcb;
     dr_tcb->self = dr_tcb;
@@ -647,6 +671,18 @@ privload_tls_exit(void *dr_tp)
 #endif
     heap_munmap(dr_tp, client_tls_alloc_size, VMM_SPECIAL_MMAP | VMM_PER_THREAD);
 }
+
+#ifdef X86
+void
+privload_tls_reset_pointer_guard(void)
+{
+    /* Only after every private-library fini/unload: a fork inherits both the
+     * existing mangled objects and this key, so per-thread exit must not reset it.
+     */
+    private_pointer_guard = 0;
+    private_pointer_guard_initialized = false;
+}
+#endif
 
 /****************************************************************************
  * Function Redirection

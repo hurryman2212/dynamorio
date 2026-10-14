@@ -325,6 +325,10 @@ os_loader_init_epilogue(void)
 void
 os_loader_exit(void)
 {
+#if defined(LINUX) && defined(X86) && !defined(ANDROID)
+    /* Private fini callbacks have consumed the old domain's mangled pointers. */
+    privload_tls_reset_pointer_guard();
+#endif
     if (libdr_opd != NULL) {
         HEAP_ARRAY_FREE(GLOBAL_DCONTEXT, libdr_opd->os_data.segments, module_segment_t,
                         libdr_opd->os_data.alloc_segments, ACCT_OTHER, PROTECTED);
