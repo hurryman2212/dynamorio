@@ -164,6 +164,24 @@ d_r_dispatch(dcontext_t *dcontext)
 #    endif
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (dcontext->client_userspace_request_pc != NULL) {
+        /* Dispatch can deliver pending signals before entering the requested
+         * body. Its application continuation must already be an original PC:
+         * otherwise the signal frame would return into copied gateway bytes
+         * through ordinary DR decoding. Keep the physical target separately.
+         */
+        if (dcontext->next_tag == dcontext->client_userspace_request_pc)
+            dcontext->next_tag = dcontext->client_userspace_original_pc;
+        if (dcontext->client_userspace_target == NULL ||
+            dcontext->client_userspace_request_generation !=
+                (uint64)atomic_aligned_read_int64(
+                    &dcontext->client_userspace_generation)) {
+            dcontext->client_userspace_target = NULL;
+            dcontext->client_userspace_request_pc = NULL;
+        }
+    }
+#endif
     dispatch_enter_dynamorio(dcontext);
     LOG(THREAD, LOG_INTERP, 2, "\nd_r_dispatch: target = " PFX "\n", dcontext->next_tag);
 
@@ -181,7 +199,7 @@ d_r_dispatch(dcontext_t *dcontext)
             /* Signal delivery can replace the requested destination while entering
              * dispatch. Its handler must pass through ordinary instrumentation.
              */
-            if (target == dcontext->next_tag) {
+            if (dcontext->next_tag == dcontext->client_userspace_original_pc) {
                 /* Publish the transition before the last generation check. A
                  * suspender must retry a transition already in progress, while
                  * cancellation of an earlier request keeps this entry in cache.
@@ -192,10 +210,12 @@ d_r_dispatch(dcontext_t *dcontext)
                     (uint64)atomic_aligned_read_int64(
                         &dcontext->client_userspace_generation)) {
                     dcontext->client_userspace_active = false;
+                    dcontext->next_tag = dcontext->client_userspace_original_pc;
+                    dcontext->client_userspace_request_pc = NULL;
                     continue;
                 }
                 enter_nolinking(dcontext, NULL, false);
-                dcontext->asynch_target = target;
+                dcontext->asynch_target = dcontext->client_userspace_original_pc;
                 /* Native instructions use the application's library TLS directly.
                  * Keep DR's separate TLS installed for signal gateways.
                  */

@@ -945,6 +945,16 @@ dr_redirect_execution(dr_mcontext_t *context);
 
 DR_API
 /**
+ * Returns whether Linux enabled FSGSBASE for this process at startup. This
+ * reports the cached kernel capability, not merely CPU instruction support.
+ * False is returned on other platforms. A true result permits fast userspace
+ * TLS switches; unusual segment selectors or bases may still use syscalls.
+ */
+bool
+dr_is_fsgsbase_enabled(void);
+
+DR_API
+/**
  * Returns this thread's userspace-execution generation. Capture it before validating
  * a userspace region and pass it to dr_redirect_userspace_execution(). A concurrent
  * dr_cancel_suspended_userspace_execution() invalidates the generation, including
@@ -952,6 +962,112 @@ DR_API
  */
 uint64
 dr_userspace_execution_generation(void *drcontext);
+
+/** One gateway in a batch, ordered by its non-overlapping code offset. */
+typedef struct _dr_userspace_bound_gate_t {
+    size_t offset;
+    app_pc application_pc;
+} dr_userspace_bound_gate_t;
+
+DR_API
+/**
+ * Batch form of dr_encode_userspace_bound_gate(). Encodes gateways at the
+ * strictly increasing, non-overlapping offsets in \p gates within the writable
+ * DR-owned \p buffer span. Uses consecutive \p application_pc_slots and one
+ * common \p runtime_entry_slot. The source descriptors, output code, output
+ * slots, and runtime slot must not overlap. Every source descriptor and output
+ * span must remain valid and immutable to other threads for the entire call.
+ * Validates every descriptor and all spans before making any write. Returns
+ * false without modifying outputs on validation failure. The same unpublished
+ * lifetime, reachability, protection and platform rules as the single-gate API
+ * apply. Writable spans are queried once per batch rather than once per gate.
+ */
+bool
+dr_encode_userspace_bound_gates(byte *buffer, size_t size,
+                                const dr_userspace_bound_gate_t *gates, size_t count,
+                                app_pc *application_pc_slots, app_pc *runtime_entry_slot);
+
+DR_API
+/**
+ * Batch form of dr_bind_userspace_gate_slots(), with no code emission. Copies
+ * \p count non-NULL original PCs into consecutive writable DR-owned private
+ * slots and sets the common runtime entry. Source/output arrays and runtime
+ * slot must not overlap and must remain stable until return. All validation
+ * precedes any write; false leaves outputs unchanged. This is suitable for
+ * binding a previously validated shared body without encoding it again.
+ */
+bool
+dr_bind_userspace_gate_slots_bulk(const app_pc *application_pcs, size_t count,
+                                  app_pc *application_pc_slots,
+                                  app_pc *runtime_entry_slot);
+
+/** One instruction in a relocated userspace body. */
+typedef struct _dr_userspace_pc_mapping_t {
+    size_t offset;      /**< Instruction offset from the copied region's start. */
+    size_t length;      /**< Encoded instruction length in the copied region. */
+    app_pc original_pc; /**< Corresponding original application instruction. */
+} dr_userspace_pc_mapping_t;
+
+/** Opaque registration token. Never dereference it or free it directly. */
+typedef struct _dr_userspace_code_t dr_userspace_code_t;
+
+DR_API
+/**
+ * Registers immutable original-PC mappings for a relocated userspace body.
+ * Supported only on Linux x86-64. Returns NULL on invalid input or overlap with
+ * another active registration. The mappings must be sorted, non-overlapping,
+ * nonempty instruction ranges inside [\p copy, \p copy + \p size). Holes are
+ * permitted for gateways which do not carry application state. DynamoRIO copies
+ * the table; the caller may release its input array after this call returns.
+ * The application code generation is reported unchanged by
+ * dr_lookup_userspace_code(). Generation zero is reserved and rejected.
+ *
+ * At every mapped instruction the complete machine state, other than PC, must
+ * already be the original application's state. Relocations must preserve memory
+ * operands and control-flow semantics. Do not map spills, TLS switches, or
+ * intermediate states in an expanded instruction sequence. Such sequences need
+ * a separate state restoration mechanism. This API does not validate code bytes,
+ * make memory executable, or take ownership of executable memory.
+ *
+ * Publish executable entry points only after registration succeeds. Keep the code
+ * and mapping alive while any thread can execute, return, or resume there.
+ * Registration and unregistration may allocate or acquire locks and must not be
+ * called from signal callbacks. Mapping lookup itself is lock-free and does not
+ * allocate. Retired mapping payloads are reclaimed at a thread-suspension safe
+ * point after all readers have finished. Nested signal readers are supported;
+ * reclamation never waits for them. Registration tokens are never reused in this
+ * address space, and exhausting the token space fails registration.
+ */
+dr_userspace_code_t *
+dr_register_userspace_code(app_pc copy, size_t size,
+                           const dr_userspace_pc_mapping_t *mappings, size_t count,
+                           uint64 generation);
+
+DR_API
+/**
+ * Retires a registration. Returns false for an unknown or already retired handle.
+ * Before calling, prevent new entries, stop other application threads and cancel
+ * pending userspace redirects, and ensure no saved return or signal context can
+ * still reach this region. Retiring a mapping does not stop execution or free code.
+ * A later registration may reuse its addresses, with a distinct handle/generation.
+ * Unknown or retired tokens are compared without dereferencing them. An in-progress
+ * lookup may still report the retired mapping; it must finish before reclaiming
+ * the corresponding executable code. The suspension/cancellation protocol above
+ * provides that guarantee. Payloads that cannot yet be reclaimed remain pending
+ * until a later unregister or dr_resume_all_other_threads() safe point.
+ */
+bool
+dr_unregister_userspace_code(dr_userspace_code_t *code);
+
+DR_API
+/**
+ * Looks up a PC inside an active relocated instruction. Returns false for holes,
+ * retired regions, or unsupported platforms. Optional outputs are written only
+ * on success. Interior bytes map to the original instruction's start as well.
+ * The lookup is allocation-free and safe during signal/context reconstruction.
+ */
+bool
+dr_lookup_userspace_code(app_pc pc, app_pc *original_pc, uint64 *generation);
 
 DR_API
 /**
@@ -970,7 +1086,10 @@ DR_API
  * JMP gateways encoded by dr_encode_userspace_gate() re-enter entirely in userspace.
  * Application signals continue through the normal signal event and application-handler
  * delivery paths.
- * A signal interrupting userspace execution already has application addresses.
+ * Original-address userspace code already carries application addresses. Relocated
+ * bodies must be registered with dr_register_userspace_code() so signals and
+ * suspended contexts expose original application PCs. Normal resumption after a
+ * delivered signal uses the code cache; suppressed signals retain the copied PC.
  *
  * Unlike #DR_EMIT_GO_NATIVE, this does not stop managing the thread, remove signal
  * handlers, or affect any other thread. A pending signal may cause execution to
@@ -1000,6 +1119,48 @@ DR_API
  */
 size_t
 dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc);
+
+DR_API
+/**
+ * Encodes a Linux x86-64 userspace gateway using separate address-binding slots.
+ * It has the same entry requirements, state preservation, and signal semantics as
+ * dr_encode_userspace_gate(), but embeds neither the original application PC nor
+ * the runtime entry address in its instruction bytes. The emitted RIP-relative
+ * loads are identical when the slots have identical offsets from each gateway,
+ * even when all runtime addresses differ. No extra ISA extension is required.
+ * A capacity of 64 bytes is sufficient; returns zero on any validation failure
+ * or in standalone-library mode, which has no runtime gateway.
+ *
+ * The code buffer and both pointer-sized slots must be writable DynamoRIO-owned
+ * memory. The slots must be pointer-aligned, distinct, outside the emitted code,
+ * and reachable using signed 32-bit RIP-relative displacements. They are private
+ * to this address space; the runtime-entry slot may serve multiple gateways.
+ * On success the slots receive application_pc and the current runtime entry,
+ * respectively. Validation failure leaves all three output ranges unchanged.
+ *
+ * Prepare the unpublished buffer and slots under caller synchronization, then
+ * make the code executable and publish it. The caller must prevent concurrent
+ * unmapping/protection changes during encoding. Keep the slots readable and their
+ * values unchanged while any thread can reach the code; retire code and bindings
+ * together only after the userspace cancellation/quiescence protocol completes.
+ */
+size_t
+dr_encode_userspace_bound_gate(byte *buffer, size_t capacity, app_pc application_pc,
+                               app_pc *application_pc_slot, app_pc *runtime_entry_slot);
+
+DR_API
+/**
+ * Populates the two private slots used by dr_encode_userspace_bound_gate() without
+ * encoding or modifying executable bytes. Intended for restoring a validated
+ * shared code image. The slots have the same alignment, writable DR-owned memory,
+ * quiescence, and lifetime requirements as that encoder. They must be distinct.
+ * Returns false without modifying either slot on validation failure, unsupported
+ * platforms, or standalone-library mode. This does not validate any shared image
+ * or prove that a gateway's RIP-relative operands refer to these slots.
+ */
+bool
+dr_bind_userspace_gate_slots(app_pc application_pc, app_pc *application_pc_slot,
+                             app_pc *runtime_entry_slot);
 
 DR_API
 /**

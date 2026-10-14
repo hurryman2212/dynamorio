@@ -4939,9 +4939,13 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
     sigpending_t *pend;
     fragment_t *f = NULL;
     fragment_t wrapper;
+    app_pc userspace_original = NULL;
+    const bool copied_userspace = dcontext->client_userspace_active &&
+        dr_lookup_userspace_code(pc, &userspace_original, NULL);
     const bool client_userspace = dcontext->client_userspace_active &&
-        !safe_is_in_fcache(dcontext, pc, xsp) && !is_dynamo_address(pc) &&
-        !is_in_client_lib(pc);
+        (copied_userspace ||
+         (!safe_is_in_fcache(dcontext, pc, xsp) && !is_dynamo_address(pc) &&
+          !is_in_client_lib(pc)));
 
     /* We no longer block SUSPEND_SIGNAL (i#184/PR 450670) or SIGSEGV (i#193/PR 287309).
      * But we can have re-entrancy issues in this routine if the app uses the same
@@ -5264,6 +5268,11 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
 
         sc_orig = *sc;
         ASSERT(!forged);
+        /* Preserve the physical PC in sc_orig for DR_SIGNAL_SUPPRESS, but expose
+         * original instruction addresses to clients and application handlers.
+         */
+        if (copied_userspace)
+            sc->SC_XIP = (reg_t)userspace_original;
         xl8_success = client_userspace ||
             translate_sigcontext(dcontext, ucxt, !can_always_delay[sig], &f, &wrapper);
 
@@ -5310,7 +5319,9 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
         if (blocked && !forged && !reroute && !can_always_delay[sig] &&
             (client_userspace || safe_is_in_fcache(dcontext, pc, xsp))) {
             sc_orig = *sc;
-            if (!client_userspace)
+            if (copied_userspace)
+                sc->SC_XIP = (reg_t)userspace_original;
+            else if (!client_userspace)
                 translate_sigcontext(dcontext, ucxt, true /*shouldn't fail*/, &f,
                                      &wrapper);
 
@@ -5335,6 +5346,8 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
             /* If forged we're likely couldbelinking, and we don't need to xl8. */
             if (forged)
                 ASSERT(is_couldbelinking(dcontext));
+            else if (copied_userspace)
+                sc->SC_XIP = (reg_t)userspace_original;
             else if (!client_userspace)
                 translate_sigcontext(dcontext, ucxt, true /*shouldn't fail*/, NULL, NULL);
             /* the process should be terminated */
@@ -6177,7 +6190,9 @@ main_signal_handler_C(byte *xsp)
              * process since can't delay or re-execute (i#195/PR 453964).
              */
             is_DR_exception = true;
-        } else if (!safe_is_in_fcache(dcontext, pc, (byte *)sc->SC_XSP) &&
+        } else if (!(dcontext->client_userspace_active &&
+                     dr_lookup_userspace_code(pc, NULL, NULL)) &&
+                   !safe_is_in_fcache(dcontext, pc, (byte *)sc->SC_XSP) &&
                    (in_generated_routine(dcontext, pc) ||
                     is_at_do_syscall(dcontext, pc, (byte *)sc->SC_XSP) ||
                     is_dynamo_address(pc))) {
@@ -6593,6 +6608,7 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
      */
     if (action == DR_SIGNAL_REDIRECT) {
         /* send_signal_to_client copied mcontext into frame's sc */
+        dcontext->client_userspace_target = NULL;
         priv_mcontext_t *mcontext = get_mcontext(dcontext);
         ucontext_to_mcontext(mcontext, uc);
         if (is_building_trace(dcontext)) {
@@ -6614,6 +6630,11 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
         LOG(THREAD, LOG_ASYNCH, 2, "%s: not delivering!\n",
             (action == DR_SIGNAL_SUPPRESS) ? "client suppressing signal"
                                            : "app signal handler is SIG_IGN");
+        if (info->sigpending[sig]->use_sigcontext) {
+            dcontext->next_tag = canonicalize_pc_target(dcontext, (app_pc)sc->SC_XIP);
+            ucontext_to_mcontext(get_mcontext(dcontext), uc);
+            IF_ARM(dr_set_isa_mode(dcontext, get_pc_mode_from_cpsr(sc), NULL));
+        }
         return false;
     } else if (action == DR_SIGNAL_BYPASS ||
                (info->sighand->action[sig] == NULL ||
@@ -6632,6 +6653,10 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
     }
     CLIENT_ASSERT(action == DR_SIGNAL_DELIVER, "invalid signal event return value");
 
+    /* A handler must enter through normal instrumentation even when its entry
+     * happens to equal the original PC of an interrupted userspace request.
+     */
+    dcontext->client_userspace_target = NULL;
     if (info->in_sigsuspend)
         terminate_sigsuspend(dcontext, info, uc);
 
@@ -9112,6 +9137,9 @@ handle_suspend_signal(dcontext_t *dcontext, kernel_siginfo_t *siginfo,
              * rather than running the full native-thread attachment procedure.
              */
             sigcontext_t *sc = SIGCXT_FROM_UCXT(ucxt);
+            app_pc original_pc;
+            if (dr_lookup_userspace_code((app_pc)sc->SC_XIP, &original_pc, NULL))
+                sc->SC_XIP = (reg_t)original_pc;
             transfer_from_sig_handler_to_fcache_return(
                 dcontext, ucxt, NULL, SUSPEND_SIGNAL, (app_pc)sc->SC_XIP,
                 (linkstub_t *)get_asynch_linkstub(), false);
