@@ -3709,10 +3709,11 @@ os_thread_exit(dcontext_t *dcontext, bool other_thread)
 }
 
 /* Happens in the parent prior to fork. */
-static void
+static bool
 os_fork_pre(dcontext_t *dcontext)
 {
     os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+    const bool client_snapshot = instrument_fork_events_registered();
 
     /* Otherwise a thread might wait for us. */
     ASSERT_OWN_NO_LOCKS();
@@ -3725,14 +3726,36 @@ os_fork_pre(dcontext_t *dcontext)
      */
     LOG(GLOBAL, 2, LOG_SYSCALLS | LOG_THREADS,
         "fork: synching with other threads to prevent deadlock in child\n");
-    if (!synch_with_all_threads(THREAD_SYNCH_SUSPENDED_VALID_MCONTEXT_OR_NO_XFER,
-                                &ostd->fork_threads, &ostd->fork_num_threads,
-                                THREAD_SYNCH_VALID_MCONTEXT,
-                                /* If we fail to suspend a thread, there is a
-                                 * risk of deadlock in the child, so it's worth
-                                 * retrying on failure.
-                                 */
-                                THREAD_SYNCH_SUSPEND_FAILURE_RETRY)) {
+    const bool synchronized = synch_with_all_threads(
+        THREAD_SYNCH_SUSPENDED_VALID_MCONTEXT_OR_NO_XFER, &ostd->fork_threads,
+        &ostd->fork_num_threads, THREAD_SYNCH_VALID_MCONTEXT,
+        /* A client snapshot must not inherit partially mutated state. ABORT
+         * releases the partial suspension and locks on failure. The legacy
+         * no-listener path keeps its existing best-effort retry policy.
+         */
+        client_snapshot ? THREAD_SYNCH_SUSPEND_FAILURE_ABORT
+                        : THREAD_SYNCH_SUSPEND_FAILURE_RETRY);
+    if (client_snapshot) {
+        bool complete = synchronized;
+        if (synchronized) {
+            for (int i = 0; i < ostd->fork_num_threads; ++i) {
+                thread_record_t *thread = ostd->fork_threads[i];
+                if (thread->runtime_id != get_runtime_thread_id() &&
+                    IS_CLIENT_THREAD(thread->dcontext) &&
+                    thread->dcontext->client_data->left_unsuspended)
+                    complete = false;
+            }
+        }
+        if (!complete) {
+            if (synchronized)
+                end_synch_with_all_threads(ostd->fork_threads, ostd->fork_num_threads,
+                                           true);
+            ostd->fork_threads = NULL;
+            ostd->fork_num_threads = 0;
+            return false;
+        }
+        instrument_fork_prepare(dcontext);
+    } else if (!synchronized) {
         /* If we failed to synch with all threads, we live with the possibility
          * of deadlock and continue as normal.
          */
@@ -3753,6 +3776,7 @@ os_fork_pre(dcontext_t *dcontext)
      */
     d_r_mutex_unlock(&thread_initexit_lock);
     d_r_mutex_unlock(&all_threads_synch_lock);
+    return true;
 }
 
 /* Happens after the fork in both the parent and child. */
@@ -3767,6 +3791,7 @@ os_fork_post(dcontext_t *dcontext, bool parent)
     if (parent) {
         LOG(GLOBAL, 2, LOG_SYSCALLS | LOG_THREADS,
             "fork: resuming other threads after fork\n");
+        instrument_fork_parent(dcontext);
     }
     end_synch_with_all_threads(ostd->fork_threads, ostd->fork_num_threads,
                                parent /*resume in parent, not in child*/);
@@ -9180,7 +9205,11 @@ handle_clone_pre(dcontext_t *dcontext)
             dcontext->sys_param1 = 0;
             dcontext->sys_param2 = 0;
         }
-        os_fork_pre(dcontext);
+        if (!os_fork_pre(dcontext)) {
+            set_failure_return_val(dcontext, EAGAIN);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            return false;
+        }
     }
     return true;
 }
@@ -9634,7 +9663,11 @@ pre_system_call(dcontext_t *dcontext)
 #ifdef SYS_fork
     case SYS_fork: {
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: fork\n");
-        os_fork_pre(dcontext);
+        execute_syscall = os_fork_pre(dcontext);
+        if (!execute_syscall) {
+            set_failure_return_val(dcontext, EAGAIN);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+        }
         break;
     }
 #endif

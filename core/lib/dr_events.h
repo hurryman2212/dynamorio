@@ -917,6 +917,47 @@ dr_allow_unsafe_static_behavior(void);
 #ifdef UNIX
 DR_API
 /**
+ * Registers a callback before an ordinary fork, after all other threads have
+ * reached consistent, lock-free suspension points. This includes clone/clone3
+ * without CLONE_VM, but excludes vfork and shared-address-space clones.
+ * Registering either this event or dr_register_fork_parent_event() requires
+ * complete thread synchronization: if that cannot be obtained, the application
+ * receives EAGAIN without executing the fork or invoking these callbacks.
+ *
+ * DR holds its thread-creation and synchronization locks during the callback.
+ * Do not create, suspend, or resume threads here. Client locks may be acquired
+ * temporarily, but all must be released before the callback returns. Other
+ * application threads remain suspended until the parent's paired event.
+ *
+ * The child instead receives dr_register_fork_init_event() after DR has
+ * initialized its process-local state. Valid on Linux only.
+ */
+void
+dr_register_fork_prepare_event(void (*func)(void *drcontext));
+
+DR_API
+/** Unregisters a fork-prepare callback; returns whether it was registered. */
+bool
+dr_unregister_fork_prepare_event(void (*func)(void *drcontext));
+
+DR_API
+/**
+ * Registers a callback in the fork parent after the syscall returns, before
+ * suspended peers resume. It also runs when the kernel rejects a prepared
+ * fork, but not when DR could not synchronize threads before preparation.
+ * The callback has the same locking restrictions as the fork-prepare event.
+ * Use the ordinary post-syscall event to inspect the syscall result.
+ */
+void
+dr_register_fork_parent_event(void (*func)(void *drcontext));
+
+DR_API
+/** Unregisters a fork-parent callback; returns whether it was registered. */
+bool
+dr_unregister_fork_parent_event(void (*func)(void *drcontext));
+
+DR_API
+/**
  * Registers a callback function for the fork event.  DR calls \p func
  * whenever the application forks a new process.
  * \note Valid on Linux only.

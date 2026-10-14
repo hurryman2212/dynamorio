@@ -96,6 +96,12 @@ instrument_thread_exit_event(dcontext_t *dcontext);
 void
 instrument_thread_exit(dcontext_t *dcontext);
 #ifdef UNIX
+bool
+instrument_fork_events_registered(void);
+void
+instrument_fork_prepare(dcontext_t *dcontext);
+void
+instrument_fork_parent(dcontext_t *dcontext);
 void
 instrument_fork_init(dcontext_t *dcontext);
 #endif

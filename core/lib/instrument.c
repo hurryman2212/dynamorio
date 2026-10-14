@@ -287,6 +287,12 @@ static callback_list_t thread_exit_callbacks = {
     0,
 };
 #ifdef UNIX
+static callback_list_t fork_prepare_callbacks = {
+    0,
+};
+static callback_list_t fork_parent_callbacks = {
+    0,
+};
 static callback_list_t fork_init_callbacks = {
     0,
 };
@@ -943,6 +949,8 @@ free_all_callback_lists(void)
     free_callback_list(&thread_init_callbacks);
     free_callback_list(&thread_exit_callbacks);
 #ifdef UNIX
+    free_callback_list(&fork_prepare_callbacks);
+    free_callback_list(&fork_parent_callbacks);
     free_callback_list(&fork_init_callbacks);
 #endif
     free_callback_list(&low_on_memory_callbacks);
@@ -1295,6 +1303,30 @@ dr_unregister_thread_exit_event(void (*func)(void *drcontext))
 
 #ifdef UNIX
 void
+dr_register_fork_prepare_event(void (*func)(void *drcontext))
+{
+    add_callback(&fork_prepare_callbacks, (void (*)(void))func, true);
+}
+
+bool
+dr_unregister_fork_prepare_event(void (*func)(void *drcontext))
+{
+    return remove_callback(&fork_prepare_callbacks, (void (*)(void))func, true);
+}
+
+void
+dr_register_fork_parent_event(void (*func)(void *drcontext))
+{
+    add_callback(&fork_parent_callbacks, (void (*)(void))func, true);
+}
+
+bool
+dr_unregister_fork_parent_event(void (*func)(void *drcontext))
+{
+    return remove_callback(&fork_parent_callbacks, (void (*)(void))func, true);
+}
+
+void
 dr_register_fork_init_event(void (*func)(void *drcontext))
 {
     add_callback(&fork_init_callbacks, (void (*)(void))func, true);
@@ -1609,6 +1641,24 @@ instrument_thread_init(dcontext_t *dcontext, bool client_thread, bool valid_mc)
 }
 
 #ifdef UNIX
+bool
+instrument_fork_events_registered(void)
+{
+    return fork_prepare_callbacks.num > 0 || fork_parent_callbacks.num > 0;
+}
+
+void
+instrument_fork_prepare(dcontext_t *dcontext)
+{
+    call_all(fork_prepare_callbacks, int (*)(void *), (void *)dcontext);
+}
+
+void
+instrument_fork_parent(dcontext_t *dcontext)
+{
+    call_all(fork_parent_callbacks, int (*)(void *), (void *)dcontext);
+}
+
 void
 instrument_fork_init(dcontext_t *dcontext)
 {
@@ -3756,6 +3806,16 @@ dr_mutex_create(void)
     ASSIGN_INIT_LOCK_FREE(*((mutex_t *)mutex), dr_client_mutex);
     return mutex;
 }
+
+#ifdef UNIX
+DR_API
+void
+dr_mutex_reset_after_fork(void *mutex)
+{
+    CLIENT_ASSERT(mutex != NULL, "dr_mutex_reset_after_fork: invalid mutex");
+    d_r_mutex_fork_reset((mutex_t *)mutex);
+}
+#endif
 
 DR_API
 /* Deletes mutex

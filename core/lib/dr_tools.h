@@ -724,6 +724,17 @@ DR_API
 void
 dr_mutex_destroy(void *mutex);
 
+#ifdef UNIX
+DR_API
+/**
+ * Resets an inherited client mutex in a fork child before application execution
+ * resumes. No other thread may access the mutex. Use only from the fork-init
+ * callback; this must never unlock a mutex in the parent process.
+ */
+void
+dr_mutex_reset_after_fork(void *mutex);
+#endif
+
 DR_API
 /** Locks \p mutex.  Waits until the mutex is successfully held. */
 void
