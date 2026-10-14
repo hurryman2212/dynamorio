@@ -72,7 +72,19 @@ d_r_strcmp(const char *left, const char *right)
     return 0;
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64) && !defined(LINUX_KERNEL)
+#    undef main_logfile
 WEAK file_t main_logfile;
+/* Standalone users of drlibc have no descriptor-domain runtime. */
+WEAK file_t *
+os_main_logfile_slot(void)
+{
+    return &main_logfile;
+}
+#    define main_logfile (*os_main_logfile_slot())
+#else
+WEAK file_t main_logfile;
+#endif
 WEAK options_t dynamo_options;
 
 #ifdef MACOS

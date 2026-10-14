@@ -562,3 +562,17 @@ signal_handle_close(dcontext_t *dcontext, file_t fd)
     }
     TABLE_RWLOCK(sigfd_table, write, unlock);
 }
+
+void
+signal_handle_close_range(dcontext_t *dcontext, uint first, uint last)
+{
+    if (first > INT_MAX || first > last)
+        return;
+    /* The table only contains real signed-int descriptors. Clamp before adding
+     * the exclusive upper bound, including on 32-bit platforms.
+     */
+    ptr_uint_t end = (ptr_uint_t)MIN(last, (uint)INT_MAX) + 1;
+    TABLE_RWLOCK(sigfd_table, write, lock);
+    generic_hash_range_remove(GLOBAL_DCONTEXT, sigfd_table, first, end);
+    TABLE_RWLOCK(sigfd_table, write, unlock);
+}

@@ -614,7 +614,7 @@ unlink_ibt_trace_head(dcontext_t *dcontext, fragment_t *f)
             dcontext_t *tgt_dcontext = threads[i]->dcontext;
             LOG(THREAD, LOG_FRAGMENT, 2, "  considering thread %d/%d = " TIDFMT "\n",
                 i + 1, num_threads, threads[i]->id);
-            ASSERT(is_thread_known(tgt_dcontext->owning_thread));
+            ASSERT(thread_lookup_runtime(tgt_dcontext->owning_runtime_id) != NULL);
             fragment_prepare_for_removal(
                 TESTANY(FRAG_SHARED, f->flags) ? GLOBAL_DCONTEXT : tgt_dcontext, f);
         }

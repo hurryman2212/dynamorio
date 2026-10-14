@@ -319,6 +319,17 @@ typedef struct _os_local_state_t {
     /* Whether privload_tls_init() was used to set up client thread TLS. */
     bool custom_privlib_tls;
 #endif
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Internal identity is independent of namespace-local kernel PID/TID. */
+    runtime_thread_id_t runtime_id;
+    runtime_thread_id_t runtime_group;
+    struct _file_table_domain_t *file_table;
+    struct _file_table_snapshot_t *file_snapshot;
+    struct _os_local_state_t *runtime_bootstrap_next;
+    void *runtime_app_gs;
+    uint64 runtime_signal_mask;
+    bool runtime_signal_mask_valid;
+#endif
 } os_local_state_t;
 
 os_local_state_t *

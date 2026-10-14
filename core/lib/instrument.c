@@ -66,6 +66,10 @@
 #    include "../unix/module.h" /* redirect_* functions */
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    include "../unix/thread_suspend.h"
+#endif
+
 /* in utils.c, not exported to everyone */
 extern ssize_t
 do_file_write(file_t f, const char *fmt, va_list ap);
@@ -4102,6 +4106,34 @@ dr_open_file(const char *fname, uint mode_flags)
     return os_open_protected(fname, flags);
 }
 
+#ifdef UNIX
+DR_API
+bool
+dr_set_thread_suspend_service(file_t broker_fd)
+{
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    return os_thread_suspend_set_service(broker_fd);
+#    else
+    return false;
+#    endif
+}
+
+DR_API
+bool
+dr_adopt_file_descriptor(file_t fd, bool inherit_exec)
+{
+    return os_adopt_file_descriptor(fd, inherit_exec, false);
+}
+
+DR_API
+bool
+dr_adopt_file_descriptor_ex(file_t fd, bool inherit_exec, bool close_on_fork)
+{
+    return os_adopt_file_descriptor(fd, inherit_exec, close_on_fork);
+}
+
+#endif
+
 DR_API
 /* Closes file f
  */
@@ -4876,9 +4908,8 @@ dr_suspend_all_other_threads_ex(DR_PARAM_OUT void ***drcontexts,
                                 THREAD_SYNCH_SUSPEND_FAILURE_IGNORE)) {
         LOG(GLOBAL, LOG_FRAGMENT, 2,
             "\ndr_suspend_all_other_threads: failed to suspend every thread\n");
-        /* some threads may have been successfully suspended so we must return
-         * their info so they'll be resumed.  I believe there is thus no
-         * scenario under which we return false.
+        /* Return the successfully suspended subset even on failure so the
+         * caller can resume it and release the synchronization locks.
          */
     }
     /* now we own the thread_initexit_lock */
@@ -4896,7 +4927,9 @@ dr_suspend_all_other_threads_ex(DR_PARAM_OUT void ***drcontexts,
         if (dcontext != NULL) { /* include my_dcontext here */
             if (dcontext != my_dcontext) {
                 /* must translate BEFORE freeing any memory! */
-                if (!thread_synch_successful(threads[i])) {
+                if (!thread_synch_successful(threads[i]) ||
+                    (IS_CLIENT_THREAD(dcontext) &&
+                     dcontext->client_data->left_unsuspended)) {
                     out_unsuspended++;
                 } else if (is_thread_currently_native(threads[i]) &&
                            !TESTANY(DR_SUSPEND_NATIVE, flags)) {
@@ -4940,7 +4973,7 @@ dr_suspend_all_other_threads_ex(DR_PARAM_OUT void ***drcontexts,
     *num_suspended = out_suspended;
     if (num_unsuspended != NULL)
         *num_unsuspended = out_unsuspended;
-    return true;
+    return out_unsuspended == 0;
 }
 
 DR_API
@@ -7888,7 +7921,7 @@ dr_prepopulate_cache(app_pc *tags, size_t tags_count)
      * want to enable our signal handlers, which might disrupt the app running
      * natively in parallel with us.
      */
-    thread_record_t *tr = thread_lookup(d_r_get_thread_id());
+    thread_record_t *tr = thread_lookup_runtime(get_runtime_thread_id());
     dcontext_t *dcontext = tr->dcontext;
     uint i;
     if (dcontext == NULL)
@@ -7935,7 +7968,7 @@ dr_prepopulate_indirect_targets(dr_indirect_branch_type_t branch_type, app_pc *t
                                 size_t tags_count)
 {
     /* We do the same setup as for dr_prepopulate_cache(). */
-    thread_record_t *tr = thread_lookup(d_r_get_thread_id());
+    thread_record_t *tr = thread_lookup_runtime(get_runtime_thread_id());
     dcontext_t *dcontext = tr->dcontext;
     ibl_branch_type_t ibl_type;
     uint i;

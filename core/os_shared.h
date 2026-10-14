@@ -760,6 +760,8 @@ remove_from_all_memory_areas(app_pc start, app_pc end);
 #define OS_OPEN_FORCE_OWNER 0x080   /* only used on win32, currently */
 #define OS_OPEN_ALLOW_LARGE 0x100   /* only used on linux32, currently */
 #define OS_OPEN_CLOSE_ON_FORK 0x200 /* only used on linux */
+/* Internal task channels must not survive independent CLONE_VM file copies. */
+#define OS_OPEN_TASK_CHANNEL 0x400
 #define OS_OPEN_RESERVED 0x10000000 /* used for fd_table on linux */
 /* always use OS_OPEN_REQUIRE_NEW when asking for OS_OPEN_WRITE, in
  * order to avoid hard link or symbolic link attacks if the file is in
@@ -770,6 +772,10 @@ file_t
 os_open(const char *fname, int os_open_flags);
 file_t
 os_open_protected(const char *fname, int os_open_flags);
+#ifdef UNIX
+bool
+os_adopt_file_descriptor(file_t fd, bool inherit_exec, bool close_on_fork);
+#endif
 file_t
 os_open_directory(const char *fname, int os_open_flags);
 bool

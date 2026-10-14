@@ -203,6 +203,24 @@ typedef unsigned long ulong;
  */
 #define INVALID_THREAD_ID 0
 
+/* Runtime ownership is independent of namespace-local kernel identifiers.
+ * Other platforms retain their existing identifier representation.
+ */
+#if defined(LINUX) && defined(X86) && defined(X64)
+typedef uint64 runtime_thread_id_t;
+#    define RUNTIME_TIDFMT UINT64_FORMAT_STRING
+#else
+typedef thread_id_t runtime_thread_id_t;
+#    define RUNTIME_TIDFMT TIDFMT
+#endif
+#define INVALID_RUNTIME_THREAD_ID 0
+
+runtime_thread_id_t
+get_runtime_thread_id(void);
+
+runtime_thread_id_t
+get_runtime_thread_group(void);
+
 typedef unsigned char uchar;
 typedef byte *cache_pc; /* fragment cache pc */
 
@@ -278,6 +296,8 @@ typedef enum {
 
 typedef struct _thread_record_t {
     thread_id_t id; /* thread id */
+    runtime_thread_id_t runtime_id;
+    runtime_thread_id_t runtime_group;
 #ifdef WINDOWS
     HANDLE handle; /* win32 thread handle */
     bool retakeover;
@@ -463,6 +483,7 @@ extern bool started_detach;
  */
 extern bool doing_detach;
 extern thread_id_t detacher_tid;
+extern runtime_thread_id_t detacher_runtime_id;
 
 extern event_t dr_app_started;
 extern event_t dr_attach_finished;
@@ -478,8 +499,14 @@ extern int num_execve_threads;
 /* global instance of statistics struct */
 extern dr_statistics_t *d_r_stats;
 
-/* the process-wide logfile */
+/* Keep the legacy symbol for standalone drlibc users. The managed Linux x64
+ * runtime resolves the log role in the current kernel descriptor table. */
 extern file_t main_logfile;
+#if defined(LINUX) && defined(X86) && defined(X64) && !defined(LINUX_KERNEL)
+file_t *
+os_main_logfile_slot(void);
+#    define main_logfile (*os_main_logfile_slot())
+#endif
 
 /* initial stack so we don't have to use app's */
 extern byte *d_r_initstack;
@@ -550,13 +577,20 @@ void
 standalone_exit(void);
 thread_record_t *
 thread_lookup(thread_id_t tid);
+thread_record_t *
+thread_lookup_runtime(runtime_thread_id_t id);
 void
 add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid,
+           runtime_thread_id_t runtime_id, runtime_thread_id_t runtime_group,
            bool under_dynamo_control, dcontext_t *dcontext);
 bool
 remove_thread(IF_WINDOWS_(HANDLE hthread) thread_id_t tid);
+bool
+remove_thread_runtime(IF_WINDOWS_(HANDLE hthread) runtime_thread_id_t id);
 uint
 get_thread_num(thread_id_t tid);
+uint
+get_thread_num_runtime(runtime_thread_id_t id);
 int
 d_r_get_num_threads(void);
 bool
@@ -716,6 +750,7 @@ typedef struct _try_except_t {
 extern try_except_t global_try_except;
 #ifdef UNIX
 extern thread_id_t global_try_tid;
+extern runtime_thread_id_t global_try_runtime_id;
 #endif
 
 typedef struct {
@@ -839,6 +874,8 @@ struct _dcontext_t {
      */
     bool initialized; /* has this context been used yet? */
     thread_id_t owning_thread;
+    runtime_thread_id_t owning_runtime_id;
+    runtime_thread_id_t owning_runtime_group;
 #ifdef UNIX
     process_id_t owning_process; /* handle shared address space w/o shared pid */
 #endif

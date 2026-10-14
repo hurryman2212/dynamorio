@@ -62,6 +62,9 @@
 #include "synch.h"
 #include "native_exec.h"
 #include "jit_opt.h"
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    include "unix/thread_suspend.h"
+#endif
 
 #ifdef ANNOTATIONS
 #    include "annotations.h"
@@ -250,7 +253,13 @@ data_section_exit(void);
 
 static uint starttime;
 
+#    if defined(LINUX) && defined(X86) && defined(X64) && !defined(LINUX_KERNEL)
+#        undef main_logfile
 file_t main_logfile = INVALID_FILE;
+#        define main_logfile (*os_main_logfile_slot())
+#    else
+file_t main_logfile = INVALID_FILE;
+#    endif
 
 #endif /* DEBUG ****************************/
 
@@ -398,6 +407,9 @@ dynamorio_app_init(void)
 void
 dynamorio_app_init_part_one_options(void)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_runtime_identity_init();
+#endif
     if (dynamo_initialized || dynamo_options_initialized) {
         if (standalone_library) {
             REPORT_FATAL_ERROR_AND_EXIT(STANDALONE_ALREADY, 2, get_application_name(),
@@ -677,6 +689,8 @@ dynamorio_app_init_part_two_finalize(void)
          * XXX: Should we rename this s/detacher_/singleton_/ or something?
          */
         detacher_tid = IF_UNIX_ELSE(get_sys_thread_id(), INVALID_THREAD_ID);
+        detacher_runtime_id =
+            IF_UNIX_ELSE(get_runtime_thread_id(), INVALID_RUNTIME_THREAD_ID);
         /* thread-specific initialization for the first thread we inject in
          * (in a race with injected threads, sometimes it is not the primary thread)
          */
@@ -864,7 +878,7 @@ dynamorio_fork_init(dcontext_t *dcontext)
     get_list_of_threads_ex(&threads, &num_threads, true /*include execve*/);
     for (i = 0; i < num_threads; i++) {
         if (threads[i] == dcontext->thread_record)
-            remove_thread(threads[i]->id);
+            remove_thread_runtime(threads[i]->runtime_id);
         else
             dynamo_other_thread_exit(threads[i]);
     }
@@ -872,8 +886,8 @@ dynamorio_fork_init(dcontext_t *dcontext)
     global_heap_free(threads,
                      num_threads * sizeof(thread_record_t *) HEAPACCT(ACCT_THREAD_MGT));
 
-    add_thread(get_process_id(), d_r_get_thread_id(), true /*under dynamo control*/,
-               dcontext);
+    add_thread(get_process_id(), d_r_get_thread_id(), get_runtime_thread_id(),
+               get_runtime_thread_group(), true /*under dynamo control*/, dcontext);
 
     GLOBAL_STAT(num_threads) = 1;
 #    ifdef DEBUG
@@ -895,6 +909,11 @@ dynamorio_fork_init(dcontext_t *dcontext)
     fragment_fork_init(dcontext);
     /* this must be called after dynamo_other_thread_exit() above */
     signal_fork_init(dcontext);
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    /* The inherited channels were invalidated/closed before vanished records
+     * were discarded. Register this kernel task in a new address-space realm. */
+    os_thread_suspend_register(dcontext);
+#    endif
 
     if (CLIENTS_EXIST()) {
         instrument_fork_init(dcontext);
@@ -910,6 +929,9 @@ dynamorio_fork_init(dcontext_t *dcontext)
 dcontext_t *
 standalone_init(void)
 {
+#if defined(STANDALONE_UNIT_TEST) && defined(LINUX) && defined(X86) && defined(X64)
+    os_runtime_identity_init();
+#endif
     dcontext_t *dcontext;
     int count = atomic_add_exchange_int(&standalone_init_count, 1);
     if (count > 1 || dynamo_initialized)
@@ -1020,11 +1042,14 @@ standalone_exit(void)
     options_exit();
     d_r_config_exit();
     doing_detach = false;
-    standalone_library = false;
     dynamo_initialized = false;
     dynamo_options_initialized = false;
     dynamo_heap_initialized = false;
     options_detach();
+#if defined(STANDALONE_UNIT_TEST) && defined(LINUX) && defined(X86) && defined(X64)
+    os_runtime_identity_finish(true);
+#endif
+    standalone_library = false;
 }
 
 /* Perform exit tasks that require full thread data structs, which we have
@@ -1132,13 +1157,13 @@ dynamo_shared_exit(thread_record_t *toexit /* must ==cur thread for Linux */
         KSTOP_REWIND_DC(get_thread_private_dcontext(), thread_measured);
         KSTART_DC(get_thread_private_dcontext(), thread_measured);
 #endif
-        ASSERT(toexit->id == d_r_get_thread_id());
+        ASSERT(toexit->runtime_id == get_runtime_thread_id());
         dynamo_thread_exit();
     }
 
     if (IF_WINDOWS_ELSE(!detach_stacked_callbacks, true)) {
         /* We don't fully free cur thread until after client exit event (PR 536058) */
-        if (thread_lookup(d_r_get_thread_id()) == NULL) {
+        if (thread_lookup_runtime(get_runtime_thread_id()) == NULL) {
             LOG(GLOBAL, LOG_TOP | LOG_THREADS, 1,
                 "Current thread never under DynamoRIO control, not exiting it\n");
         } else {
@@ -1535,7 +1560,7 @@ dynamo_process_exit(void)
             if (!INTERNAL_OPTION(nullcalls) && !DYNAMO_OPTION(skip_thread_exit_at_exit)) {
                 instrument_thread_exit_event(threads[i]->dcontext);
                 /* i#1617: ensure we do all cleanup of priv libs */
-                if (threads[i]->id != d_r_get_thread_id()) /* i#1617: must delay this */
+                if (threads[i]->runtime_id != get_runtime_thread_id())
                     loader_thread_exit(threads[i]->dcontext);
             }
         }
@@ -1722,6 +1747,8 @@ create_new_dynamo_context(bool initial, byte *dstack_in, priv_mcontext_t *mc)
 
     DODEBUG({ dcontext->logfile = INVALID_FILE; });
     dcontext->owning_thread = d_r_get_thread_id();
+    dcontext->owning_runtime_id = get_runtime_thread_id();
+    dcontext->owning_runtime_group = get_runtime_thread_group();
 #ifdef UNIX
     dcontext->owning_process = get_process_id();
 #endif
@@ -1881,6 +1908,8 @@ create_callback_dcontext(dcontext_t *old_dcontext)
     new_dcontext->valid = false;
     /* all of these fields are shared among all dcontexts of a thread: */
     new_dcontext->owning_thread = old_dcontext->owning_thread;
+    new_dcontext->owning_runtime_id = old_dcontext->owning_runtime_id;
+    new_dcontext->owning_runtime_group = old_dcontext->owning_runtime_group;
 #    ifdef UNIX
     new_dcontext->owning_process = old_dcontext->owning_process;
 #    endif
@@ -2098,32 +2127,42 @@ get_list_of_threads_ex(thread_record_t ***list, int *num, bool include_execve)
  * avoid races
  */
 thread_record_t *
+thread_lookup_runtime(runtime_thread_id_t id)
+{
+    ASSERT(mutex_testlock(&thread_initexit_lock) || id == get_runtime_thread_id());
+    if (id == INVALID_RUNTIME_THREAD_ID)
+        return NULL;
+    uint hindex = HASH_FUNC_BITS(id, ALL_THREADS_HASH_BITS);
+    d_r_mutex_lock(&all_threads_lock);
+    thread_record_t *tr = all_threads == NULL ? NULL : all_threads[hindex];
+    while (tr != NULL && tr->runtime_id != id)
+        tr = tr->next;
+    d_r_mutex_unlock(&all_threads_lock);
+    return tr;
+}
+
+/* Kernel IDs are only meaningful inside a runtime thread group. Core code with
+ * a thread record uses its runtime_id instead of resolving namespace-local IDs.
+ */
+thread_record_t *
 thread_lookup(thread_id_t tid)
 {
-    thread_record_t *tr;
-    uint hindex;
-
-    /* check that caller is self or has initexit_lock
-     * XXX: no way to tell who has initexit_lock
-     */
     ASSERT(mutex_testlock(&thread_initexit_lock) || tid == d_r_get_thread_id());
-
-    hindex = HASH_FUNC_BITS(tid, ALL_THREADS_HASH_BITS);
+    runtime_thread_id_t group = get_runtime_thread_group();
+    thread_record_t *match = NULL;
     d_r_mutex_lock(&all_threads_lock);
-    if (all_threads == NULL) {
-        tr = NULL;
-    } else {
-        tr = all_threads[hindex];
-    }
-    while (tr != NULL) {
-        if (tr->id == tid) {
-            d_r_mutex_unlock(&all_threads_lock);
-            return tr;
+    if (all_threads != NULL) {
+        for (uint i = 0; i < HASHTABLE_SIZE(ALL_THREADS_HASH_BITS); ++i) {
+            for (thread_record_t *tr = all_threads[i]; tr != NULL; tr = tr->next) {
+                if (tr->id == tid && tr->runtime_group == group) {
+                    ASSERT(match == NULL);
+                    match = tr;
+                }
+            }
         }
-        tr = tr->next;
     }
     d_r_mutex_unlock(&all_threads_lock);
-    return NULL;
+    return match;
 }
 
 /* assumes caller can ensure that thread is either suspended or self to
@@ -2139,8 +2178,16 @@ get_thread_num(thread_id_t tid)
         return 0; /* yes can't distinguish from 1st thread, who cares */
 }
 
+uint
+get_thread_num_runtime(runtime_thread_id_t id)
+{
+    thread_record_t *tr = thread_lookup_runtime(id);
+    return tr == NULL ? 0 : tr->num;
+}
+
 void
 add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid,
+           runtime_thread_id_t runtime_id, runtime_thread_id_t runtime_group,
            bool under_dynamo_control, dcontext_t *dcontext)
 {
     thread_record_t *tr;
@@ -2179,6 +2226,10 @@ add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid
     tr->execve = false;
 #endif
     tr->id = tid;
+    ASSERT(runtime_id != INVALID_RUNTIME_THREAD_ID &&
+           runtime_group != INVALID_RUNTIME_THREAD_ID);
+    tr->runtime_id = runtime_id;
+    tr->runtime_group = runtime_group;
     ASSERT(tid != INVALID_THREAD_ID); /* ensure os never assigns invalid id to a thread */
     tr->under_dynamo_control = under_dynamo_control;
     tr->dcontext = dcontext;
@@ -2187,7 +2238,7 @@ add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid
 
     d_r_mutex_lock(&all_threads_lock);
     tr->num = threads_ever_count++;
-    hindex = HASH_FUNC_BITS(tr->id, ALL_THREADS_HASH_BITS);
+    hindex = HASH_FUNC_BITS(tr->runtime_id, ALL_THREADS_HASH_BITS);
     tr->next = all_threads[hindex];
     all_threads[hindex] = tr;
     /* must be inside all_threads_lock to avoid race w/ get_list_of_threads */
@@ -2199,16 +2250,16 @@ add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid
 
 /* return false if couldn't find the thread */
 bool
-remove_thread(IF_WINDOWS_(HANDLE hthread) thread_id_t tid)
+remove_thread_runtime(IF_WINDOWS_(HANDLE hthread) runtime_thread_id_t id)
 {
     thread_record_t *tr = NULL, *prevtr;
-    uint hindex = HASH_FUNC_BITS(tid, ALL_THREADS_HASH_BITS);
+    uint hindex = HASH_FUNC_BITS(id, ALL_THREADS_HASH_BITS);
 
     ASSERT(all_threads != NULL);
 
     d_r_mutex_lock(&all_threads_lock);
     for (tr = all_threads[hindex], prevtr = NULL; tr; prevtr = tr, tr = tr->next) {
-        if (tr->id == tid) {
+        if (tr->runtime_id == id) {
             if (prevtr)
                 prevtr->next = tr->next;
             else
@@ -2231,6 +2282,13 @@ remove_thread(IF_WINDOWS_(HANDLE hthread) thread_id_t tid)
     }
     d_r_mutex_unlock(&all_threads_lock);
     return (tr != NULL);
+}
+
+bool
+remove_thread(IF_WINDOWS_(HANDLE hthread) thread_id_t tid)
+{
+    thread_record_t *tr = thread_lookup(tid);
+    return tr != NULL && remove_thread_runtime(IF_WINDOWS_(hthread) tr->runtime_id);
 }
 
 /* this bool is protected by reset_pending_lock */
@@ -2355,7 +2413,8 @@ dynamo_thread_init(byte *dstack_in, priv_mcontext_t *mc, void *os_data,
      * to try and enforce but cannot tell who has the lock.
      */
     add_thread(IF_WINDOWS_ELSE(NT_CURRENT_THREAD, get_process_id()), d_r_get_thread_id(),
-               under_dynamo_control, dcontext);
+               get_runtime_thread_id(), get_runtime_thread_group(), under_dynamo_control,
+               dcontext);
 #ifdef UNIX /* i#2600: Not easy on Windows: we rely on init_apc_go_native there. */
     if (dstack_in != NULL) { /* Else not a thread creation we observed */
         ASSERT(uninit_thread_count > 0);
@@ -2515,6 +2574,7 @@ dynamo_thread_exit_common(dcontext_t *dcontext, thread_id_t id,
     bool client_thread = IS_CLIENT_THREAD(dcontext);
     /* cache this now for use after freeing dcontext */
     local_state_t *local_state = dcontext->local_state;
+    runtime_thread_id_t runtime_id = dcontext->owning_runtime_id;
 
     /* make sure don't get into deadlock w/ flusher */
     enter_threadexit(dcontext);
@@ -2562,7 +2622,7 @@ dynamo_thread_exit_common(dcontext_t *dcontext, thread_id_t id,
 
     LOG(GLOBAL, LOG_TOP | LOG_THREADS, 1,
         "\ndynamo_thread_exit (thread #%d id=" TIDFMT "): %d thread(s) now\n\n",
-        get_thread_num(id), id, GLOBAL_STAT(num_threads) - 1);
+        get_thread_num_runtime(runtime_id), id, GLOBAL_STAT(num_threads) - 1);
 
     DOLOG(1, LOG_STATS, { dump_global_stats(false); });
 
@@ -2627,7 +2687,7 @@ dynamo_thread_exit_common(dcontext_t *dcontext, thread_id_t id,
     if (!dynamo_exited ||
         (other_thread &&
          (IF_WINDOWS_ELSE(!doing_detach, true) ||
-          dcontext->owning_thread != d_r_get_thread_id()))) /* else already did this */
+          dcontext->owning_runtime_id != get_runtime_thread_id())))
         loader_thread_exit(dcontext);
 
     /* set tls dc to NULL prior to cleanup, to avoid problems handling
@@ -2644,8 +2704,16 @@ dynamo_thread_exit_common(dcontext_t *dcontext, thread_id_t id,
     /* This must be called after instrument_thread_exit, which uses
      * get_thread_private_dcontext for app/dr state checks.
      */
-    if (id == d_r_get_thread_id())
+    if (runtime_id == get_runtime_thread_id()) {
+#if defined(LINUX) && defined(X86) && defined(X64)
+        /* Keep the calling context valid while unregistering its signal route. */
+        if (!os_thread_suspend_release(dcontext, false) && doing_detach) {
+            REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                        get_application_name(), get_application_pid());
+        }
+#endif
         set_thread_private_dcontext(NULL);
+    }
 
     fcache_thread_exit(dcontext);
     link_thread_exit(dcontext);
@@ -2666,14 +2734,21 @@ dynamo_thread_exit_common(dcontext_t *dcontext, thread_id_t id,
 #endif
 
 #ifdef DEBUG
-    if (dcontext->logfile != INVALID_FILE && dcontext->logfile != STDERR) {
+    bool logfile_in_current_table = true;
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    uint64 logfile_table = os_file_table_identity(dcontext);
+    logfile_in_current_table =
+        logfile_table != 0 && logfile_table == os_file_table_identity(NULL);
+#    endif
+    if (logfile_in_current_table && dcontext->logfile != INVALID_FILE &&
+        dcontext->logfile != STDERR) {
         os_flush(dcontext->logfile);
         close_log_file(dcontext->logfile);
     }
 #endif
 
     /* remove thread from threads hashtable */
-    remove_thread(IF_WINDOWS_(NT_CURRENT_THREAD) id);
+    remove_thread_runtime(IF_WINDOWS_(NT_CURRENT_THREAD) runtime_id);
 
     dcontext_tmp = dcontext;
 #ifdef WINDOWS
@@ -2711,6 +2786,10 @@ dynamo_thread_exit_common(dcontext_t *dcontext, thread_id_t id,
          */
         if (!on_dstack) {
             EXITING_DR();
+#if defined(LINUX) && defined(X86) && defined(X64)
+            if (!dynamo_exited)
+                os_runtime_identity_finish(false);
+#endif
             /* else, caller will clean up stack and then call EXITING_DR(),
              * probably via dynamo_thread_stack_free_and_exit(), as the stack free
              * must be done before the exit
@@ -2739,8 +2818,8 @@ dynamo_thread_exit_dcontext(dcontext_t *dcontext)
      * we want to preserve the i#3535 solution to avoid races during detach
      * causing problems with x86's safe_read TLS scheme on non-client threads.
      */
-    if (!IS_CLIENT_THREAD(dcontext) && detacher_tid != INVALID_THREAD_ID &&
-        detacher_tid != get_sys_thread_id()) {
+    if (!IS_CLIENT_THREAD(dcontext) && detacher_runtime_id != INVALID_RUNTIME_THREAD_ID &&
+        detacher_runtime_id != get_runtime_thread_id()) {
         /* Keep the get_thread_private_dcontext()==NULL behavior of exiting,
          * letting detach clean us up.
          */
@@ -2776,6 +2855,10 @@ dynamo_thread_stack_free_and_exit(byte *stack)
          * (fixes case 6967)
          */
         EXITING_DR();
+#if defined(LINUX) && defined(X86) && defined(X64)
+        if (!dynamo_exited)
+            os_runtime_identity_finish(false);
+#endif
     }
 }
 
@@ -2784,6 +2867,9 @@ dynamo_thread_stack_free_and_exit(byte *stack)
 DR_APP_API int
 dr_app_setup(void)
 {
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    os_runtime_identity_init();
+#    endif
     /* XXX: we either have to disallow the client calling this with
      * more than one thread running, or we have to suspend all the threads.
      * We should share the suspend-and-takeover loop (and for dr_app_setup_and_start
@@ -2830,7 +2916,7 @@ dr_app_cleanup(void)
      * effect without addressing the XXX comments in
      * dynamo_thread_not_under_dynamo() about updating tr->under_dynamo_control.
      */
-    tr = thread_lookup(d_r_get_thread_id());
+    tr = thread_lookup_runtime(get_runtime_thread_id());
     if (tr != NULL && tr->dcontext != NULL) {
         os_process_under_dynamorio_initiate(tr->dcontext);
         os_process_under_dynamorio_complete(tr->dcontext);
@@ -2980,6 +3066,7 @@ dynamorio_take_over_threads(dcontext_t *dcontext)
     dr_started_and_attached = false;
     /* Similarly, with our signal handler back in place, we remove the TLS limit. */
     detacher_tid = INVALID_THREAD_ID;
+    detacher_runtime_id = INVALID_RUNTIME_THREAD_ID;
     SELF_PROTECT_DATASEC(DATASEC_RARELY_PROT);
     /* TODO i#7805: Add support for all Linux platforms. */
 #ifdef PTRACE_TAKEOVER_SUPPORTED

@@ -187,6 +187,12 @@ synch_with_thread(thread_id_t id, bool block, bool hold_initexit_lock,
                   thread_synch_permission_t cur_state, thread_synch_state_t desired_state,
                   uint flags);
 
+/* Internal identity version: safe across tasks with equal namespace-local IDs. */
+thread_synch_result_t
+synch_with_thread_runtime(runtime_thread_id_t id, bool block, bool hold_initexit_lock,
+                          thread_synch_permission_t cur_state,
+                          thread_synch_state_t desired_state, uint flags);
+
 /* held on return from synch_with_all_threads together with thread_initexit_lock*/
 extern mutex_t all_threads_synch_lock;
 

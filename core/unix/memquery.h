@@ -66,6 +66,8 @@ typedef struct _memquery_iter_t {
      * very early during DR init, the heap is not set up yet.
      */
     bool may_alloc;
+    /* Distinguish a failed query from a successful end of the address space. */
+    bool error;
     /* For internal use by the iterator w/o requiring dynamic allocation and
      * without using static data and limiting to one iterator (and having
      * to unprotect and reprotect if in .data).
@@ -86,6 +88,8 @@ memquery_exit(void);
  *
  * Pass true for may_alloc, unless the caller is in a fragile situation (e.g.,
  * a signal handler) where we shouldn't allocate heap.
+ * Failure leaves no iterator resources held; do not call stop in that case.
+ * next returns false on end or failure, distinguished by the error field.
  */
 bool
 memquery_iterator_start(memquery_iter_t *iter, app_pc start, bool may_alloc);

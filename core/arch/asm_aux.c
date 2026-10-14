@@ -275,6 +275,7 @@ new_thread_setup(priv_mcontext_t *mc)
 {
     dcontext_t *dcontext;
     void *crec;
+    initialize_clone_runtime(mc->xsp);
     /* this is where a new thread first touches other than the dstack,
      * so we "enter" DR here
      */

@@ -434,6 +434,8 @@ event_thread_init(void *drcontext)
                     ASSERT(false, "failed to resume threads");
                 }
             } else {
+                /* False still returns a partial list and synchronization locks. */
+                dr_resume_all_other_threads(drcontexts, num_threads);
                 ASSERT(false, "failed to suspend threads");
             }
         }
