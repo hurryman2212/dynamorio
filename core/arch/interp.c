@@ -42,6 +42,7 @@
 #include "../globals.h"
 #include "../link.h"
 #include "../fragment.h"
+#include "../fragment_shared.h"
 #include "../emit.h"
 #include "../dispatch.h"
 #include "../fcache.h"
@@ -5460,6 +5461,8 @@ recreate_fragment_ilist(dcontext_t *dcontext, byte *pc,
         ASSERT(ilist != NULL);
         if (ilist == NULL) /* a race */
             goto recreate_fragment_done;
+        if (!TESTANY(FRAG_COARSE_GRAIN, f->flags) && f->shared_entry_size != 0)
+            fragment_shared_add_entry(dcontext, ilist);
         if (PAD_FRAGMENT_JMPS(f->flags))
             nop_pad_ilist(dcontext, f, ilist, false /* set translation */);
         goto recreate_fragment_done;

@@ -802,9 +802,23 @@ insert_meta_call_vargs(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
     /* If we need an indirect call, we use r11 as the last of the scratch regs.
      * We document this to clients using dr_insert_call_ex() or DR_CLEANCALL_INDIRECT.
      */
-    direct = insert_reachable_cti(dcontext, ilist, instr, encode_pc, (byte *)callee,
-                                  false /*call*/, TESTANY(META_CALL_RETURNS, flags),
-                                  false /*!precise*/, CALL_SCRATCH_REG, NULL);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    app_pc *cell = TESTANY(META_CALL_TARGET_CELL, flags)
+        ? clean_call_target_cell((app_pc)callee)
+        : NULL;
+    if (cell != NULL) {
+        /* A six-byte transfer with no scratch register. Explicit rel_addr avoids
+         * alternate absolute encodings when the cell happens to be below 4 GB.
+         */
+        PRE(ilist, instr,
+            INSTR_CREATE_call_ind(dcontext,
+                                  opnd_create_rel_addr((app_pc)cell, OPSZ_PTR)));
+        direct = false;
+    } else
+#endif
+        direct = insert_reachable_cti(dcontext, ilist, instr, encode_pc, (byte *)callee,
+                                      false /*call*/, TESTANY(META_CALL_RETURNS, flags),
+                                      false /*!precise*/, CALL_SCRATCH_REG, NULL);
     if (stack_for_params > 0) {
         /* XXX PR 245936: let user decide whether to clean up?
          * i.e., support calling a stdcall routine?

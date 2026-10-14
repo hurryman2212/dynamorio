@@ -42,6 +42,7 @@
 #include "globals.h"
 #include "link.h"
 #include "fragment.h"
+#include "fragment_shared.h"
 #include "fcache.h"
 #include "emit.h"
 #include "monitor.h"
@@ -53,6 +54,9 @@
 #ifdef UNIX
 #    include "nudge.h"
 #endif
+
+/* A busy peer keeps its prepared body; retry at natural dispatch boundaries. */
+static const uint shared_promotion_retry_delay = 256;
 
 /* XXX: make these runtime parameters */
 #define INIT_HTABLE_SIZE_SHARED_BB (DYNAMO_OPTION(coarse_units) ? 5 : 10)
@@ -1527,13 +1531,15 @@ hashtable_fragment_reset(dcontext_t *dcontext, fragment_table_t *table)
     /* We need to walk the table if either we need to notify clients, or we
      * need to free stubs that are not in the regular heap or cache units.
      */
-    if (!dr_fragment_deleted_hook_exists() && !DYNAMO_OPTION(separate_private_stubs))
+    if (!dr_fragment_deleted_hook_exists() && !DYNAMO_OPTION(separate_private_stubs) &&
+        !fragment_shared_provider_enabled())
         return;
     /* i#4226: Avoid the slow deletion code and just invoke the event. */
     for (i = 0; i < (int)table->capacity; i++) {
         f = table->table[i];
         if (!REAL_FRAGMENT(f))
             continue;
+        fragment_shared_free(dcontext, f);
         /* This is a full delete (i.e., it is neither FRAGDEL_NO_HEAP nor
          * FRAGDEL_NO_FCACHE: see the fragment_delete() call in the debug path
          * below) so we call the event for every (real) fragment.
@@ -2713,6 +2719,9 @@ fragment_init_heap(fragment_t *f, app_pc tag, int direct_exits, int indirect_exi
 #endif
 
     f->in_xlate.incoming_stubs = NULL;
+    f->shared_view = NULL;
+    f->shared_anchor = NULL;
+    f->shared_entry_size = 0;
     f->client_prepare_size = 0;
     f->client_prepare_cookie = 0;
 #ifdef CUSTOM_TRACES_RET_REMOVAL
@@ -2959,6 +2968,7 @@ fragment_recreate_with_linkstubs(dcontext_t *dcontext, fragment_t *f_src)
 void
 fragment_free(dcontext_t *dcontext, fragment_t *f)
 {
+    fragment_shared_free(dcontext, f);
     dcontext_t *alloc_dc = FRAGMENT_ALLOC_DC(dcontext, f->flags);
     uint heapsz;
     int direct_exits = 0;
@@ -3181,6 +3191,47 @@ fragment_t *
 fragment_lookup_shared_bb(dcontext_t *dcontext, app_pc tag)
 {
     return fragment_lookup_type(dcontext, tag, LOOKUP_BB | LOOKUP_SHARED);
+}
+
+DR_API
+bool
+dr_shared_fragment_scan(size_t *cursor, dr_shared_fragment_snapshot_t *snapshots,
+                        size_t capacity, size_t *count)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (count == NULL)
+        return false;
+    *count = 0;
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    if (cursor == NULL || snapshots == NULL || capacity == 0 || capacity > 64 ||
+        dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
+        !fragment_shared_provider_enabled() || !DYNAMO_OPTION(shared_bbs) ||
+        shared_bb == NULL || !try_recursive_lock(&change_linking_lock))
+        return false;
+    /* A try-write lock makes the bounded read independent of table resizing
+     * without ever waiting while provider safe service holds other resources. */
+    if (!d_r_write_trylock(&shared_bb->rwlock)) {
+        release_recursive_lock(&change_linking_lock);
+        return false;
+    }
+    size_t position = *cursor < shared_bb->capacity ? *cursor : 0;
+    uint visited = 0;
+    while (position < shared_bb->capacity && *count < capacity && visited < 1024) {
+        fragment_t *fragment = shared_bb->table[position++];
+        ++visited;
+        if (REAL_FRAGMENT(fragment) &&
+            fragment_shared_snapshot(dcontext, fragment, &snapshots[*count]))
+            ++*count;
+    }
+    *cursor = position == shared_bb->capacity ? 0 : position;
+    d_r_write_unlock(&shared_bb->rwlock);
+    release_recursive_lock(&change_linking_lock);
+    return true;
+#else
+    if (count != NULL)
+        *count = 0;
+    return false;
+#endif
 }
 
 /* lookup a fragment tag, but only look in tables that are the same shared-ness
@@ -6065,8 +6116,15 @@ process_client_flush_requests(dcontext_t *dcontext, dcontext_t *alloc_dcontext,
                               client_flush_req_t *req, bool flush)
 {
     client_flush_req_t *iter = req;
+    client_flush_req_t *promotions = NULL;
     while (iter != NULL) {
         client_flush_req_t *next = iter->next;
+        if (flush && iter->size == 0) {
+            iter->next = promotions;
+            promotions = iter;
+            iter = next;
+            continue;
+        }
         if (flush) {
             /* Note that we don't free futures from potentially linked-to region b/c we
              * don't have lazy linking (xref case 2236) */
@@ -6093,6 +6151,117 @@ process_client_flush_requests(dcontext_t *dcontext, dcontext_t *alloc_dcontext,
         HEAP_TYPE_FREE(alloc_dcontext, iter, client_flush_req_t, ACCT_CLIENT,
                        UNPROTECTED);
         iter = next;
+    }
+    if (promotions != NULL) {
+        client_flush_req_t *retry = NULL;
+        client_flush_req_t *ready = NULL;
+        while (promotions != NULL) {
+            client_flush_req_t *next = promotions->next;
+            if (promotions->promotion_delay != 0) {
+                --promotions->promotion_delay;
+                promotions->next = retry;
+                retry = promotions;
+            } else {
+                promotions->next = ready;
+                ready = promotions;
+            }
+            promotions = next;
+        }
+        if (ready != NULL) {
+            thread_record_t **threads = NULL;
+            int thread_count = 0;
+            bool stopped = synch_with_all_threads(
+                THREAD_SYNCH_SUSPENDED_VALID_MCONTEXT_OR_NO_XFER, &threads, &thread_count,
+                THREAD_SYNCH_NO_LOCKS_NO_XFER,
+                THREAD_SYNCH_SUSPEND_FAILURE_IGNORE | THREAD_SYNCH_SMALL_LOOP_MAX);
+            while (ready != NULL) {
+                acquire_recursive_lock(&change_linking_lock);
+                client_flush_req_t *next = ready->next;
+                fragment_t *f = fragment_lookup_shared_bb(dcontext, ready->start);
+                bool current = f != NULL &&
+                    !TESTANY(FRAG_FAKE | FRAG_IS_FUTURE | FRAG_IS_TRACE |
+                                 FRAG_COARSE_GRAIN | FRAG_WAS_DELETED |
+                                 FRAG_CANNOT_DELETE,
+                             f->flags) &&
+                    f->shared_view == NULL &&
+                    fragment_shared_recipe_id(dcontext, ready->start) == ready->flush_id;
+                release_recursive_lock(&change_linking_lock);
+                bool safe = stopped && current &&
+                    IF_UNIX_ELSE(dcontext->signals_pending == 0, true);
+                for (int i = 0; i < thread_count && safe; ++i) {
+                    dcontext_t *peer = threads[i]->dcontext;
+                    if (peer == dcontext)
+                        continue;
+                    priv_mcontext_t context;
+                    if (peer == NULL || IS_CLIENT_THREAD(peer) ||
+                        IF_UNIX_ELSE(peer->signals_pending != 0, false) ||
+                        !thread_synch_successful(threads[i]) ||
+                        thread_synch_state_no_xfer(peer) ||
+                        !thread_get_mcontext(threads[i], &context)) {
+                        safe = false;
+                        break;
+                    }
+                    /* A client clean call can retain a return PC into the old
+                     * body even when its current PC is outside that body. Only
+                     * positively recognized application/cache/syscall states
+                     * qualify. Never translate/re-execute an observation. */
+                    bool cache_pc = in_fcache(context.pc);
+                    bool native_app = is_thread_currently_native(threads[i]) &&
+                        !is_dynamo_address(context.pc) && !is_in_client_lib(context.pc);
+                    /* Linux can rewind a blocked syscall before delivering our
+                     * suspension signal. Its restart PC is also outside the
+                     * retiring body and resumes through the syscall handler. */
+                    bool kernel = get_at_syscall(peer) &&
+                        IF_UNIX_ELSE(is_after_or_restarted_do_syscall(
+                                         peer, context.pc, false /* !vsyscall */),
+                                     is_after_syscall_address(peer, context.pc));
+                    if ((context.pc >= f->start_pc &&
+                         context.pc < f->start_pc + f->size) ||
+                        (!cache_pc && !native_app && !kernel))
+                        safe = false;
+                }
+                bool retry_promotion = true;
+                bool adopted = safe &&
+                    fragment_shared_rebind(dcontext, f, ready->flush_id,
+                                           &retry_promotion);
+                if (current && !adopted && retry_promotion &&
+                    fragment_shared_recipe_id(dcontext, ready->start) ==
+                        ready->flush_id) {
+                    ready->promotion_delay = shared_promotion_retry_delay;
+                    ready->next = retry;
+                    retry = ready;
+                } else {
+                    HEAP_TYPE_FREE(alloc_dcontext, ready, client_flush_req_t, ACCT_CLIENT,
+                                   UNPROTECTED);
+                }
+                ready = next;
+            }
+            /* Includes partial suspension failure: no peer stays stopped. */
+            end_synch_with_all_threads(threads, thread_count, true);
+        }
+        /* A newer same-tag request wins over this stop's older serial. */
+        d_r_mutex_lock(&client_flush_request_lock);
+        /* The detached batch had unique promotion tags, and each request enters
+         * retry at most once. Only requests arriving while it was processed can
+         * conflict: do not rescan the retries already prepended below. */
+        client_flush_req_t *new_requests = client_flush_requests;
+        while (retry != NULL) {
+            client_flush_req_t *next = retry->next;
+            client_flush_req_t *known;
+            for (known = new_requests; known != NULL; known = known->next) {
+                if (known->size == 0 && known->start == retry->start)
+                    break;
+            }
+            if (known == NULL) {
+                retry->next = client_flush_requests;
+                client_flush_requests = retry;
+            } else {
+                HEAP_TYPE_FREE(alloc_dcontext, retry, client_flush_req_t, ACCT_CLIENT,
+                               UNPROTECTED);
+            }
+            retry = next;
+        }
+        d_r_mutex_unlock(&client_flush_request_lock);
     }
 }
 
@@ -6195,13 +6364,14 @@ enter_nolinking(dcontext_t *dcontext, fragment_t *was_I_flushed, bool cache_tran
         req = client_flush_requests;
         client_flush_requests = NULL;
         d_r_mutex_unlock(&client_flush_request_lock);
-        /* NOTE - we must release the lock before doing the flush. */
+        bool ordinary_flush = false;
+        for (client_flush_req_t *iter = req; iter != NULL; iter = iter->next)
+            ordinary_flush |= iter->size != 0;
+        /* Release the queue lock before synchronization. In-place promotion
+         * preserves this fragment and entry; a busy retry must not prevent
+         * application progress by repeatedly forcing redispatch. */
         process_client_flush_requests(dcontext, GLOBAL_DCONTEXT, req, true /*flush*/);
-        /* XXX - this is an ugly, yet effective, hack.  The problem is there is no
-         * good way to tell currently if we flushed was_I_flushed.  Since it could be
-         * gone by now we pretend that it was flushed if we did any flushing at all.
-         * Dispatch should refind the fragment if it wasn't flushed. */
-        if (req != NULL)
+        if (ordinary_flush)
             not_flushed = false;
     }
 

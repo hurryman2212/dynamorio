@@ -286,6 +286,12 @@ void
 detach_externally_on_new_stack(void);
 #endif
 
+#ifdef UNIX
+/* A suspension signal may rewind an interrupted syscall to its instruction. */
+bool
+is_after_or_restarted_do_syscall(dcontext_t *dcontext, app_pc pc, bool check_vsyscall);
+#endif
+
 /*** exported for detach only ***/
 
 bool

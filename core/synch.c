@@ -244,7 +244,7 @@ thread_synch_successful(thread_record_t *tr)
 /* i#2659: the kernel is now doing auto-restart so we have to check for the
  * pc being at the syscall.
  */
-static bool
+bool
 is_after_or_restarted_do_syscall(dcontext_t *dcontext, app_pc pc, bool check_vsyscall)
 {
     if (is_after_do_syscall_addr(dcontext, pc))

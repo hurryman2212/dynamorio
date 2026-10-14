@@ -273,8 +273,15 @@ struct _fragment_t {
     cache_pc start_pc; /* very top of fragment's code, equals
                         * entry point when indirect branch target */
 
+    /* Inter-process immutable body; FRAG_SHARED remains thread sharing. */
+    struct _fragment_shared_view_t *shared_view;
+    /* Emission-lifetime proof; its optional lowering cache remains bounded. */
+    struct _fragment_shared_anchor_t *shared_anchor;
+    byte shared_entry_size;
     ushort client_prepare_size;
-    /* Nonzero only after actual client-requested cache preparation. */
+    /* Nonzero only after actual client-requested cache preparation. On x64
+     * this occupies existing padding before in_xlate, without growing the frame.
+     */
     uint client_prepare_cookie;
 
     union {

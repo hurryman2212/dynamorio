@@ -832,6 +832,24 @@ dr_unregister_restore_state_ex_event(bool (*func)(void *drcontext, bool restore_
 
 DR_API
 /**
+ * Decodes an instruction in a restore callback's original fragment coordinates.
+ * Pass the fragment's original cache_start_pc (before selecting an individual
+ * duplicated case) and a pc in that fragment. For an immutable shared fragment,
+ * the operation is read from its shared body or private island and the returned
+ * next pc uses the original instruction length. This avoids reading a physical
+ * restoration shadow. For ordinary fragments this behaves like decode().
+ *
+ * Only call during a restore_state_ex callback while the owning fragment is
+ * retained by DynamoRIO. A NULL result denotes an invalid coordinate or decode
+ * failure. The returned instruction's raw bytes are not a contiguous original
+ * code-cache image and must not be used as such.
+ */
+byte *
+dr_decode_fragment_instruction(void *drcontext, byte *cache_start_pc, byte *pc,
+                               instr_t *instruction);
+
+DR_API
+/**
  * Registers a callback function for the thread initialization event.
  * DR calls \p func whenever the application creates a new thread.
  */
@@ -2075,5 +2093,428 @@ DR_API
  */
 bool
 dr_is_detaching(void);
+
+/** Result of a process-local provider's immutable fragment lookup. */
+typedef enum {
+    DR_SHARED_FRAGMENT_DECLINED,
+    DR_SHARED_FRAGMENT_READY,
+    DR_SHARED_FRAGMENT_DEFER,
+} dr_shared_fragment_status_t;
+
+/** Maximum extent of each RX or private region in a compact binding bundle. */
+#define DR_SHARED_FRAGMENT_BUNDLE_LIMIT 65536
+/** Maximum opaque local source proof retained for a prepared-fragment rebind. */
+#define DR_SHARED_FRAGMENT_PROOF_SIZE 64
+/** Opaque canonical-body identity captured by the registered provider. */
+#define DR_SHARED_FRAGMENT_BODY_IDENTITY_SIZE 32
+
+/** Pure output from canonical identity capture, independent of offer admission.
+ * A provider fills this before taking locks or applying staging/observation budgets.
+ * The proof remains private to this emission and must bind its source generation.
+ */
+typedef struct _dr_shared_fragment_capture_t {
+    byte proof[DR_SHARED_FRAGMENT_PROOF_SIZE];
+    byte body_identity[DR_SHARED_FRAGMENT_BODY_IDENTITY_SIZE];
+    bool valid;
+} dr_shared_fragment_capture_t;
+
+/** Availability of an exact prepared emission. RESTORABLE has a durable proof
+ * but no cached lowering layout: sealed-member validation is still required.
+ */
+typedef enum {
+    DR_SHARED_FRAGMENT_REBIND_ABSENT,
+    DR_SHARED_FRAGMENT_REBIND_AVAILABLE,
+    DR_SHARED_FRAGMENT_REBIND_BUSY,
+    DR_SHARED_FRAGMENT_REBIND_RESTORABLE,
+} dr_shared_fragment_rebind_status_t;
+
+/** Core-owned scratch for a provider's sealed member copy. The provider must
+ * copy while its existing READY offer is pinned, under a trylock. No pointer
+ * into provider storage escapes. Core independently validates every layout
+ * coordinate and local instruction before accepting the recovered layout.
+ */
+typedef struct _dr_shared_fragment_restore_t {
+    size_t struct_size;
+    byte *buffer;
+    size_t capacity;
+    size_t content_size;
+    /** Final private base relative to this member's first byte. */
+    size_t private_base;
+} dr_shared_fragment_restore_t;
+
+/** Non-owning snapshot of one currently published prepared emission. */
+typedef struct _dr_shared_fragment_snapshot_t {
+    app_pc tag;
+    uint emission_id;
+    uint original_size;
+    size_t retained_private_size;
+    size_t retained_code_size;
+    byte proof[DR_SHARED_FRAGMENT_PROOF_SIZE];
+    byte body_identity[DR_SHARED_FRAGMENT_BODY_IDENTITY_SIZE];
+} dr_shared_fragment_snapshot_t;
+
+enum {
+    DR_SHARED_FRAGMENT_U32_PRIVATE = 1,
+    DR_SHARED_FRAGMENT_REL32_PRIVATE = 2,
+};
+
+/** Core-derived, pointer-free relocation within a normalized fragment template.
+ * The field is four bytes; target_offset is relative to its private islands.
+ * Records are sorted, nonoverlapping, and reserved must be zero.
+ */
+typedef struct _dr_shared_fragment_relocation_t {
+    uint field_offset;
+    uint kind;
+    uint target_offset;
+    uint reserved;
+} dr_shared_fragment_relocation_t;
+
+/** Caller-owned workspace for nonexecuting reconstruction of an original
+ * prepared emission. Set struct_size, buffer and capacity before calling export.
+ * A 2 * DR_SHARED_FRAGMENT_BUNDLE_LIMIT buffer holds canonical code followed by
+ * its bounded relocation records. Code starts at buffer; relocation_offset is
+ * relative to that buffer. No original private-island instructions are exported.
+ * All other fields are output; no core-owned pointer escapes.
+ */
+typedef struct _dr_shared_fragment_export_t {
+    size_t struct_size;
+    byte *buffer;
+    size_t capacity;
+    dr_shared_fragment_snapshot_t snapshot;
+    uint isa_mode;
+    uint fragment_flags;
+    size_t code_size;
+    size_t content_size;
+    size_t identity_size;
+    size_t relocation_offset;
+    size_t relocation_count;
+    size_t private_island_size;
+    size_t private_slot_size;
+    size_t prototype_private_offset;
+} dr_shared_fragment_export_t;
+
+/**
+ * Description of a completed canonical fragment layout. identity is a
+ * pointer-free encoding of the layout and generation inputs; private binding
+ * values are deliberately excluded. tag belongs to the current process and is
+ * supplied for the client's original-code identity/policy lookup, never as a
+ * cross-process identity by itself. All buffers are borrowed for the callback.
+ *
+ * A NULL code requests an existing object only. With non-NULL code the provider
+ * may also publish these exact immutable bytes. code_size is page-aligned and
+ * includes deterministic padding, but excludes private bindings and islands.
+ */
+typedef struct _dr_shared_fragment_request_t {
+    size_t struct_size;
+    void *tag;
+    uint isa_mode;
+    uint fragment_flags;
+    const byte *identity;
+    size_t identity_size;
+    const byte *code;
+    size_t code_size;
+    /** Useful immutable bytes; packed providers can place this prefix in a slab. */
+    size_t content_size;
+    /** Original private executable allocation, before any compaction. */
+    size_t original_private_size;
+    /** Upper bound on retained private frame and per-view metadata, excluding
+     * islands, vmvector capacity, allocator rounding and page tables. Accounting
+     * only: never include placement-dependent allocation sizes in identity.
+     */
+    size_t retained_private_size;
+    /** Binding instructions requiring private storage; packed members share
+     * one private page with the other members of the same sealed RX page.
+     */
+    size_t private_island_size;
+    /** Reserved private bytes per member after slot alignment. Account for
+     * partially occupied pages and arena overhead separately; this is not a
+     * claim that physical RSS decreases by this amount on retirement.
+     */
+    size_t private_slot_size;
+    /** Private allocation charge for profitability estimates. Nonpacked views
+     * can each require a separate arena's private page to retain a stable cell
+     * coordinate. Packed views report their slot span; the provider must account
+     * for slab occupancy and page rounding. This is not part of code identity.
+     */
+    size_t private_allocation_size;
+    /** The exact emission's instruction list, borrowed read-only for this
+     * callback. A provider may read its client's reserved-note meta labels to
+     * recover copied provenance. Never retain this pointer or put it in an
+     * equivalence key. Other clients' notes and instructions are opaque.
+     */
+    instrlist_t *ilist;
+    /** Present only for compact_private_bindings providers. All records and
+     * template bytes are borrowed for this callback. The provider may rebase
+     * these fields to its bundle coordinates, never other template bytes.
+     */
+    const dr_shared_fragment_relocation_t *relocations;
+    size_t relocation_count;
+    /** Normalized private base, relative to the template start. */
+    size_t prototype_private_offset;
+    /** The original durable source proof (capture output when provided). When non-NULL,
+     * ilist is NULL: the already instrumented fragment is being rebound without invoking
+     * client BB callbacks. Never serialize local proof or generation state.
+     */
+    const byte *rebind_proof;
+    /** Pending durable anchor plus optional cache slot, freed on adoption or
+     * fragment destruction. recipe_storage_size reports the bounded layout-cache
+     * arena reservation; recipe_live_size includes all durable anchors, rounded
+     * record/layout slots and occupancy metadata. These exclude allocator pages
+     * and are not a claim that freeing one slot immediately returns physical pages.
+     */
+    size_t retained_recipe_size;
+    size_t recipe_storage_size;
+    size_t recipe_live_size;
+    /** Nonzero, nonrecycled identity of this original prepared emission. */
+    uint emission_id;
+    /** Borrowed output, initially zero. Fill after canonical identity validation
+     * even when this request will be declined or deferred by a bounded budget.
+     */
+    dr_shared_fragment_capture_t *capture;
+    /** Private executable frame and local exit stubs after compaction, including
+     * their actual alignment padding. Excludes view metadata and private islands.
+     */
+    size_t retained_code_size;
+} dr_shared_fragment_request_t;
+
+/**
+ * A borrowed, sealed executable file range returned by the provider. The
+ * provider retains fd until file_finished. The complete mapped range must have
+ * immutable-content seals. Its member prefix must equal request.content_size
+ * bytes from request.code. token is process-local ownership state and must not
+ * appear in the shared file or emitted instructions.
+ */
+typedef struct _dr_shared_fragment_file_t {
+    file_t fd;
+    uint64 offset;
+    size_t size;
+    void *token;
+    /** Offset within the mapped range; zero for an unpacked object. */
+    size_t member_offset;
+    /** For compact_private_bindings only: member binding offset within the
+     * anonymous region following the size-byte RX bundle, and that region's
+     * complete page-aligned extent. Both regions are bounded by
+     * DR_SHARED_FRAGMENT_BUNDLE_LIMIT. Legacy providers leave these zero.
+     */
+    size_t private_offset;
+    size_t private_extent;
+    /** Nonzero address-space-local reservation identity for compact bindings.
+     * The provider chooses monotonically increasing, nonrecycled identities.
+     * CLONE_VM participants use the same namespace; ordinary fork inherits it
+     * and then evolves independently. Never serialize this value into a shared
+     * object or equivalence key. A conflicting occupied interval or changed
+     * backing/layout for a live identity is rejected, not silently remapped.
+     */
+    size_t private_instance;
+} dr_shared_fragment_file_t;
+
+/**
+ * Process-local adapter to an immutable object catalog. Requests can occur
+ * while a basic block is being prepared: the provider must never wait for a
+ * different producer, acquire an application lock, or suspend other threads.
+ * Return DEFER when an object is still being produced. No registration means
+ * DynamoRIO retains its ordinary private allocation and linking behavior.
+ * Unsupported layouts, including satisfy_w_xor_x dual mappings, retain the
+ * ordinary instrumented path without requesting a shared view.
+ * Replay request and file_finished callbacks run with application peers stopped:
+ * they must not wait, perform IPC, or use a potentially contended client
+ * allocator. Reserve client-owned bookkeeping during normal safe service.
+ *
+ * file_finished is called once for each READY result and ends fd borrowing.
+ * If adopted is false it also ends token ownership. After adopted=true,
+ * retired is called exactly once when local execution, restoration, and flush
+ * references have ended. The provider must preserve catalog references across
+ * fork and must not release a parent's reference from a vfork/CLONE_VM child.
+ */
+typedef struct _dr_shared_fragment_provider_t {
+    size_t struct_size;
+    dr_shared_fragment_status_t (*request)(void *drcontext,
+                                           const dr_shared_fragment_request_t *request,
+                                           dr_shared_fragment_file_t *file);
+    void (*file_finished)(void *drcontext, void *token, bool adopted);
+    void (*retired)(void *drcontext, void *token);
+    /** Accept sealed subpage batches for eligible fragments. The provider must
+     * bound pending storage and publish or cancel sparse batches. Until READY,
+     * ordinary private fragments run at the requested instrumentation level.
+     * With capture_proof, earlier DEFER results may be promoted in place without
+     * rebuilding instrumentation; otherwise the prepared private body remains.
+     */
+    bool pack_small_fragments;
+    /** Opt into early rejection when the private slot alone is at least as
+     * large as the original private fragment. This is only a necessary saving
+     * condition; the provider must still account for all retained storage.
+     * False preserves providers that accept such layouts for other purposes.
+     */
+    bool require_private_saving;
+    /** Optional pure eligibility check before reserving the shared entry bytes.
+     * The ilist is borrowed and must not be modified or retained. This callback
+     * runs under BB-building locks: it must not acquire locks, allocate, perform
+     * IPC, wait, or access application state. Returning true permits both new
+     * producers and existing READY consumers; it must not depend on READY
+     * availability. NULL preserves the ordinary candidate policy.
+     */
+    bool (*candidate)(void *drcontext, instrlist_t *ilist);
+    /** Opt into independently packed RX members and compact private islands.
+     * Returned size may differ from request.code_size. A member's final private
+     * base is size + private_offset - member_offset; rebase only the exported
+     * U32/REL32 fields from prototype_private_offset. Core validates the exact
+     * transformed member before execution and keeps all local bindings private.
+     * False preserves the legacy layout and byte-equality contract.
+     */
+    bool compact_private_bindings;
+    /** Optional fixed-size local source-proof capture after initial symbolic
+     * reference validation. Must only read ilist and fill proof: no allocation,
+     * locks, IPC, waiting or application-state access. True permits a durable
+     * anchor to rebind this same prepared fragment without BB reinstrumentation.
+     * False or NULL preserves ordinary prepared execution when deferred sharing
+     * cannot be completed; it never authorizes a flush/reinstrument fallback.
+     */
+    bool (*capture_proof)(void *drcontext, const instrlist_t *ilist,
+                          byte proof[DR_SHARED_FRAGMENT_PROOF_SIZE]);
+    /** Copies an already validated, sealed compact member from an exact READY
+     * offer. No IPC, waiting, allocation or instrumentation is permitted. Return
+     * BUSY when its trylock fails, ABSENT when no exact offer is retained, or
+     * AVAILABLE after copying. The latter does not certify local recoverability:
+     * core still validates the layout, captured local bytes and exact emission.
+     */
+    dr_shared_fragment_rebind_status_t (*restore_layout)(
+        void *drcontext, app_pc tag, uint emission_id,
+        const byte proof[DR_SHARED_FRAGMENT_PROOF_SIZE],
+        const byte body_identity[DR_SHARED_FRAGMENT_BODY_IDENTITY_SIZE],
+        dr_shared_fragment_restore_t *restore);
+} dr_shared_fragment_provider_t;
+
+DR_API
+/**
+ * Registers an immutable DR fragment provider during dr_client_main(). Only
+ * one provider may be registered in an image. Registration copies the callback
+ * table; the client library and any callback state must outlive its fragments.
+ * Currently supported on Linux x86-64. Unsupported fragment layouts retain the
+ * ordinary DR path at their requested instrumentation level.
+ */
+bool
+dr_register_shared_fragment_provider(const dr_shared_fragment_provider_t *provider);
+
+DR_API
+/** Looks up the currently published shared basic block at this exact original tag
+ * and copies its retained emission proof, body identity, nonrecycled serial and
+ * size estimates. No previous serial is required. AVAILABLE means a private
+ * prepared emission with a durable anchor was found; adopted shared views and
+ * absent or ineligible emissions return ABSENT. BUSY means the lifetime trylock
+ * was unavailable. A non-NULL output is zeroed unless AVAILABLE is returned.
+ * This nonexecuting snapshot pins no fragment and grants no admission credit:
+ * source generation, serial, proof, local bytes and canonical body must still
+ * be checked before later export, admission or adoption. No BB callbacks or
+ * code generation occur. Call during serialized safe service outside client
+ * locks and replay callbacks, never from execution-interest collection itself.
+ */
+dr_shared_fragment_rebind_status_t
+dr_shared_fragment_snapshot(app_pc tag, dr_shared_fragment_snapshot_t *snapshot);
+
+DR_API
+/**
+ * Checks the published shared basic block for a matching retained proof.
+ * Uses a trylock and the existing local table lookup; no allocation or IPC occurs.
+ * Call outside client locks during safe service, not from a replay callback.
+ * AVAILABLE includes the cached layout's local-byte digest check. RESTORABLE
+ * requires candidate-layout validation before granting original-byte credit.
+ * BUSY leaves availability unknown. This snapshot does not pin the emission or
+ * reserve a later promotion; generation, serial and byte checks still apply.
+ */
+dr_shared_fragment_rebind_status_t
+dr_shared_fragment_rebind_available(app_pc tag,
+                                    const byte proof[DR_SHARED_FRAGMENT_PROOF_SIZE],
+                                    uint emission_id);
+
+DR_API
+/** Discards recovery metadata only when the published private emission matches
+ * tag, emission_id and proof exactly. Call only after the provider has proved
+ * that this source generation is permanently stale; a missing READY offer or
+ * an ABSENT lookup is not such proof. The fragment's executable code, identity,
+ * translations and callbacks are unchanged. An adopted shared view is untouched.
+ * Queued requests for the discarded emission fail their normal serial checks.
+ * AVAILABLE means the exact anchor and optional layout were discarded; ABSENT
+ * means no eligible exact match and makes no change; BUSY means the lifetime
+ * trylock was unavailable and the caller must retain its pending stale cleanup.
+ * Concurrent exports may finish from an earlier snapshot, so providers must
+ * still validate source generation before publishing or accepting their output.
+ * Call during serialized safe service outside client locks and replay callbacks.
+ */
+dr_shared_fragment_rebind_status_t
+dr_shared_fragment_discard(app_pc tag, uint emission_id,
+                           const byte proof[DR_SHARED_FRAGMENT_PROOF_SIZE]);
+
+DR_API
+/** Validates candidate layout bytes against the exact local emission. The borrowed
+ * buffer may hold an original canonical prototype retained by the provider or
+ * a pinned sealed member. It must remain stable throughout this call and is never
+ * modified. Success grants nonexecuting admission credit only: it performs no
+ * promotion and pins no fragment. Actual execution always requires a sealed READY
+ * file, repeated identity and local-byte checks at the final stop, and exact
+ * canonical-byte comparison. Call outside client locks.
+ */
+dr_shared_fragment_rebind_status_t
+dr_shared_fragment_rebind_validate(
+    app_pc tag, uint emission_id, const byte proof[DR_SHARED_FRAGMENT_PROOF_SIZE],
+    const byte body_identity[DR_SHARED_FRAGMENT_BODY_IDENTITY_SIZE],
+    const dr_shared_fragment_restore_t *restore);
+
+DR_API
+/** Reconstructs canonical code after both optional layout and provider template
+ * eviction, without BB callbacks or source analysis. Core copies bounded original
+ * bytes and exit metadata under a lifetime trylock, then decodes and encodes the
+ * private copy outside that lock and verifies the original local-byte digest.
+ * AVAILABLE is nonexecuting data only: the provider must compare its freshly
+ * computed canonical body identity with snapshot.body_identity before staging,
+ * and revalidate the exact emission before admission credit or later adoption.
+ * The caller owns and must keep the workspace stable; snapshots pin no fragment.
+ * BUSY leaves the emission unknown; ABSENT includes unsupported or oversized
+ * layouts. Call during serialized safe service, outside client locks.
+ */
+dr_shared_fragment_rebind_status_t
+dr_shared_fragment_export(app_pc tag, uint emission_id,
+                          dr_shared_fragment_export_t *result);
+
+DR_API
+/** Visits at most 1024 slots in the existing shared-BB table and returns at most
+ * capacity snapshots (capacity must be 1..64). Start with cursor=0. A resulting
+ * cursor=0 ends this sweep; repeat sweeps to discover entries moved by concurrent
+ * table changes. No snapshot pins a fragment. False means busy/unsupported and
+ * leaves cursor unchanged; count is zero. Call outside client locks during safe
+ * service. The cursor is an opaque table position, never a fragment pointer.
+ */
+bool
+dr_shared_fragment_scan(size_t *cursor, dr_shared_fragment_snapshot_t *snapshots,
+                        size_t capacity, size_t *count);
+
+DR_API
+/** Number of live durable anchors, including captures not yet in the published
+ * table. SIZE_MAX means the linking trylock was busy. Call during safe service.
+ * Zero permits retiring discovery polling until another capture requests work.
+ */
+size_t
+dr_shared_fragment_pending_count(void);
+
+DR_API
+/**
+ * Requests in-place rebinding of the prepared shared basic block at \p tag
+ * to newly available immutable backing. At a bounded all-thread stop, core
+ * checks the captured emission identity and excludes every old execution or
+ * restoration continuation. Busy peers retain the existing prepared body;
+ * adoption is retried at later natural dispatch boundaries.
+ *
+ * Fragment identity, entry address, preparation cookie and observations are
+ * preserved. This operation never flushes or invokes BB/deletion callbacks.
+ * A replay request has ilist=NULL and the captured proof; providers must only
+ * consume immediately READY offers, without waiting or IPC.
+ *
+ * Returns false if the configuration is unsupported or the exact durable
+ * emission is absent (including an already adopted or destroyed fragment). This requires
+ * Linux x86-64, a registered capture_proof provider, shared basic blocks,
+ * disabled traces and fine-grained code caches. The caller must verify its
+ * source generation before requesting promotion.
+ */
+bool
+dr_delay_shared_fragment_promotion(app_pc tag, uint emission_id);
 
 #endif /* _DR_EVENTS_H_ */
