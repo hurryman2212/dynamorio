@@ -169,6 +169,11 @@ typedef struct _os_thread_data_t {
     thread_record_t **fork_threads;
     int fork_num_threads;
 
+    /* Saved execveat arguments and pinned target, owned by os.c. */
+    void *execveat_state;
+    /* Client data belongs to this exec attempt, not another thread's exec. */
+    uint64 client_exec_data;
+
     /* We would use event_t's here except we can't use mutexes in
      * our signal handler
      */

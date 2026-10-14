@@ -139,6 +139,9 @@ typedef struct rlimit64 rlimit64_t;
 
 #include "module.h" /* elf */
 #include "tls.h"
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    include "exec_resources.h"
+#endif
 
 #if defined(X86) && defined(DEBUG)
 #    include "os_asm_defines.asm" /* for TLS_SELF_OFFSET_ASM */
@@ -250,6 +253,7 @@ DECLARE_CXTSWPROT_VAR(static mutex_t set_thread_area_lock,
 
 static bool first_thread_tls_initialized;
 static bool last_thread_tls_exited;
+static uint64 inherited_client_exec_data;
 
 tls_type_t tls_global_type;
 
@@ -400,6 +404,7 @@ typedef struct _file_table_domain_t {
     recursive_lock_t transaction;
     uint64 identity;
     uint references;
+    file_t application_file;
     file_t global_log;
 #ifdef LINUX
     /* Pin the mount, not a task file: fork children query their own mm. */
@@ -418,10 +423,12 @@ typedef struct _file_table_snapshot_t {
 
 #ifdef LINUX
 DECLARE_NEVERPROT_VAR(static file_table_domain_t initial_file_table,
-                      { .global_log = INVALID_FILE, .proc_mount = INVALID_FILE });
+                      { .application_file = INVALID_FILE,
+                        .global_log = INVALID_FILE,
+                        .proc_mount = INVALID_FILE });
 #else
 DECLARE_NEVERPROT_VAR(static file_table_domain_t initial_file_table,
-                      { .global_log = INVALID_FILE });
+                      { .application_file = INVALID_FILE, .global_log = INVALID_FILE });
 #endif
 static file_table_domain_t *file_table_domains;
 DECLARE_NEVERPROT_VAR(static file_table_domain_t *retired_file_tables, NULL);
@@ -436,6 +443,7 @@ file_tables_exit(void);
 
 /* All existing descriptor consumers use the current kernel file-table domain. */
 #define fd_table (current_file_table()->table)
+#define executable_file (current_file_table()->application_file)
 #ifdef LINUX
 #    define procfs_root (current_file_table()->proc_mount)
 #endif
@@ -1036,6 +1044,14 @@ open_procfs_root(file_t *inherited_out)
     if (value == NULL || sscanf(value, "%d%c", &inherited, &trailing) != 1 ||
         inherited < 3)
         inherited = INVALID_FILE;
+    bool service_root = false;
+#    if defined(X86) && defined(X64)
+    file_t captured = os_exec_resource_file(DR_EXEC_RESOURCE_PROCFS);
+    if (captured != INVALID_FILE) {
+        inherited = captured;
+        service_root = true;
+    }
+#    endif
     for (uint attempt = 0; attempt < 2; ++attempt) {
         struct statfs stat;
         file_t root, maps;
@@ -1064,7 +1080,7 @@ open_procfs_root(file_t *inherited_out)
             continue;
         }
         os_close(maps);
-        if (attempt == 0 && inherited_out != NULL)
+        if (attempt == 0 && inherited_out != NULL && !service_root)
             *inherited_out = inherited;
         return root;
     }
@@ -1229,7 +1245,34 @@ d_r_os_init(void)
     if (inherited_procfs_root != INVALID_FILE)
         os_close(inherited_procfs_root);
     disable_env(DYNAMORIO_VAR_PROCFS_FD);
-
+    {
+        const char *value = getenv(DYNAMORIO_VAR_EXE_FD);
+        int inherited;
+        char trailing;
+        if (executable_file == INVALID_FILE && value != NULL &&
+            sscanf(value, "%d%c", &inherited, &trailing) == 1 && inherited >= 0 &&
+            fcntl_syscall(inherited, F_GETFD, 0) >= 0) {
+            executable_file = inherited;
+        }
+        if (executable_file != INVALID_FILE) {
+            file_t private_file = fd_priv_dup(executable_file);
+            if (private_file >= 0) {
+                os_close(executable_file);
+                executable_file = private_file;
+            }
+            fd_table_add(executable_file, 0);
+            fd_mark_close_on_exec(executable_file);
+        }
+        disable_env(DYNAMORIO_VAR_EXE_FD);
+        value = getenv(DYNAMORIO_VAR_CLIENT_EXEC_DATA);
+        if (value != NULL) {
+            uint64 data;
+            if (sscanf(value, UINT64_FORMAT_STRING "%c", &data, &trailing) == 1)
+                inherited_client_exec_data = data;
+        }
+        disable_env(DYNAMORIO_VAR_CLIENT_EXEC_DATA);
+        disable_env(DYNAMORIO_VAR_EXEC_SERVICE);
+    }
 #endif
 
     /* Ensure initialization */
@@ -1677,6 +1720,10 @@ os_slow_exit(void)
     memquery_exit();
     ksynch_exit();
 
+    if (executable_file != INVALID_FILE) {
+        os_close_protected(executable_file);
+        executable_file = INVALID_FILE;
+    }
 #ifdef LINUX
     if (procfs_root != INVALID_FILE) {
         os_close_protected(procfs_root);
@@ -2250,6 +2297,7 @@ file_table_copy(file_table_domain_t *source)
     if (copy->identity == 0)
         runtime_identity_failed();
     copy->references = 1;
+    copy->application_file = source->application_file;
     copy->global_log = source->global_log;
     copy->proc_mount = source->proc_mount;
     copy->table = generic_hash_create(GLOBAL_DCONTEXT, INIT_HTABLE_SIZE_FD, 80,
@@ -5712,6 +5760,37 @@ os_thread_suspend_open_resources(file_t sockets[2], file_t *pidfd, file_t *ackfd
 #endif
 }
 
+file_t
+os_get_executable_file(void)
+{
+    return executable_file;
+}
+
+/* The early ELF loader transfers the readable descriptor it actually mapped,
+ * before fd_table exists. Final os_init moves it into the protected range. */
+void
+os_record_executable_file(file_t fd)
+{
+    ASSERT(executable_file == INVALID_FILE || executable_file == fd);
+    executable_file = fd;
+}
+
+bool
+os_set_exec_client_data(dcontext_t *dcontext, uint64 data)
+{
+    os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+    if (ostd == NULL)
+        return false;
+    ostd->client_exec_data = data;
+    return true;
+}
+
+uint64
+os_get_exec_client_data(void)
+{
+    return inherited_client_exec_data;
+}
+
 bool
 os_adopt_file_descriptor(file_t fd, bool inherit_exec, bool close_on_fork)
 {
@@ -7223,13 +7302,41 @@ handle_self_signal(dcontext_t *dcontext, uint sig)
  * EXECVE
  */
 
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+typedef struct {
+    reg_t parameters[5];
+    file_t file;
+    uint64 owner;
+    bool script;
+    bool resource_handoff;
+    char path[80];
+    char script_name[MAXIMUM_PATH + 80];
+    script_interpreter_t *interpreter;
+    char **argv;
+    size_t argv_size;
+} execveat_state_t;
+#endif
+
+static reg_t *
+execve_param_addr(dcontext_t *dcontext, int index)
+{
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    if (((os_thread_data_t *)dcontext->os_field)->execveat_state != NULL)
+        ++index;
+#endif
+    return sys_param_addr(dcontext, index);
+}
+
 /* when adding here, also add to the switch in handle_execve if necessary */
 enum {
     ENV_PROP_RUNUNDER,
     ENV_PROP_OPTIONS,
     ENV_PROP_EXECVE_LOGDIR,
     ENV_PROP_EXE_PATH,
+    ENV_PROP_EXE_FD,
+    ENV_PROP_CLIENT_EXEC_DATA,
     ENV_PROP_PROCFS_FD,
+    ENV_PROP_EXEC_SERVICE,
     ENV_PROP_CONFIGDIR,
 };
 
@@ -7245,7 +7352,10 @@ static const char *const env_to_propagate[] = {
     DYNAMORIO_VAR_EXECVE_LOGDIR,
     /* i#909: needed for early injection */
     DYNAMORIO_VAR_EXE_PATH,
+    DYNAMORIO_VAR_EXE_FD,
+    DYNAMORIO_VAR_CLIENT_EXEC_DATA,
     DYNAMORIO_VAR_PROCFS_FD,
+    DYNAMORIO_VAR_EXEC_SERVICE,
     /* These will only be propagated if they exist: */
     DYNAMORIO_VAR_CONFIGDIR,
     DYNAMORIO_VAR_AUTOINJECT,
@@ -7263,15 +7373,19 @@ static const char *const env_to_propagate[] = {
  * config dir takes precedence (if the child clears the HOME env var, e.g.).
  */
 static void
-add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app_path)
+add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app_path,
+                bool resource_handoff)
 {
-    char **envp = (char **)sys_param(dcontext, 2);
+    char **envp = (char **)*execve_param_addr(dcontext, 2);
     int idx, j, preload = -1, ldpath = -1;
     int num_old, num_new, sz;
     bool need_var[NUM_ENV_TO_PROPAGATE];
     int prop_idx[NUM_ENV_TO_PROPAGATE];
     bool ldpath_us = false, preload_us = false;
+    char descriptor[32];
+    char client_data[32];
     char procfs_descriptor[32];
+    char exec_service[64];
     char **new_envp, *var, *old;
 
     /* check if any var needs to be propagated */
@@ -7292,9 +7406,20 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
 
     if (DYNAMO_OPTION(early_inject))
         need_var[ENV_PROP_EXE_PATH] = true;
+    need_var[ENV_PROP_EXE_FD] = false;
     need_var[ENV_PROP_PROCFS_FD] = false;
+    need_var[ENV_PROP_EXEC_SERVICE] = false;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (resource_handoff) {
+        snprintf(exec_service, sizeof(exec_service), "%d:" UINT64_FORMAT_STRING,
+                 os_exec_resources_service(),
+                 ((os_thread_data_t *)dcontext->os_field)->client_exec_data);
+        need_var[ENV_PROP_EXEC_SERVICE] = true;
+    }
+#endif
 #ifdef LINUX
-    if (procfs_root != INVALID_FILE && DYNAMO_OPTION(follow_children)) {
+    if (!resource_handoff && procfs_root != INVALID_FILE &&
+        DYNAMO_OPTION(follow_children)) {
         os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
         /* Do not toggle CLOEXEC on the shared root: concurrent exec attempts
          * and uninstrumented exec must not inherit each other's capabilities.
@@ -7312,6 +7437,22 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
         ostd->exec_procfs_owner = os_file_table_identity(NULL);
         snprintf(procfs_descriptor, sizeof(procfs_descriptor), "%d", duplicate);
         need_var[ENV_PROP_PROCFS_FD] = true;
+    }
+#endif
+    snprintf(client_data, sizeof(client_data), UINT64_FORMAT_STRING,
+             ((os_thread_data_t *)dcontext->os_field)->client_exec_data);
+    need_var[ENV_PROP_CLIENT_EXEC_DATA] = true;
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    {
+        execveat_state_t *state =
+            ((os_thread_data_t *)dcontext->os_field)->execveat_state;
+        if (!resource_handoff && state != NULL && !state->script) {
+            /* Legacy reinjection has no broker. Keep this descriptor only for
+             * that path; the resource service never opens an inheritable window. */
+            fcntl_syscall(state->file, F_SETFD, 0);
+            snprintf(descriptor, sizeof(descriptor), "%d", state->file);
+            need_var[ENV_PROP_EXE_FD] = true;
+        }
     }
 #endif
 
@@ -7449,7 +7590,10 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
             ASSERT(strcmp(env_to_propagate[j], DYNAMORIO_VAR_EXE_PATH) == 0);
             val = app_path;
             break;
+        case ENV_PROP_EXE_FD: val = descriptor; break;
+        case ENV_PROP_CLIENT_EXEC_DATA: val = client_data; break;
         case ENV_PROP_PROCFS_FD: val = procfs_descriptor; break;
+        case ENV_PROP_EXEC_SERVICE: val = exec_service; break;
         default:
             val = getenv(env_to_propagate[j]);
             if (val == NULL)
@@ -7502,7 +7646,7 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
     ASSERT((num_new + num_old) == idx);
 
     /* update syscall param */
-    *sys_param_addr(dcontext, 2) = (reg_t)new_envp; /* OUT */
+    *execve_param_addr(dcontext, 2) = (reg_t)new_envp; /* OUT */
     /* store for reset in case execve fails, and for cleanup if
      * this is a vfork thread
      */
@@ -7513,6 +7657,14 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
 static ssize_t
 script_file_reader(const char *pathname, void *buf, size_t count)
 {
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    execveat_state_t *state = dcontext == NULL
+        ? NULL
+        : ((os_thread_data_t *)dcontext->os_field)->execveat_state;
+    if (state != NULL && strcmp(pathname, state->path) == 0)
+        return dynamorio_syscall(SYS_pread64, 4, state->file, buf, count, 0);
+#endif
     /* XXX i#2090: Check file is executable. */
     file_t file = os_open(pathname, OS_OPEN_READ);
     size_t len;
@@ -7554,8 +7706,8 @@ script_file_reader(const char *pathname, void *buf, size_t count)
 static int
 handle_execve_script(dcontext_t *dcontext)
 {
-    char *fname = (char *)sys_param(dcontext, 0);
-    char **orig_argv = (char **)sys_param(dcontext, 1);
+    char *fname = (char *)*execve_param_addr(dcontext, 0);
+    char **orig_argv = (char **)*execve_param_addr(dcontext, 1);
     script_interpreter_t *script;
     int ret = 0;
 
@@ -7594,13 +7746,25 @@ handle_execve_script(dcontext_t *dcontext)
         for (i = 0; i < script->argc; i++)
             new_argv[i] = script->argv[i];
         new_argv[script->argc] = fname; /* replaces orig_argv[0] */
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+        {
+            execveat_state_t *state =
+                ((os_thread_data_t *)dcontext->os_field)->execveat_state;
+            if (state != NULL) {
+                new_argv[script->argc] = state->script_name;
+                state->interpreter = script;
+                state->argv = new_argv;
+                state->argv_size = (script->argc + orig_argc + 1) * sizeof(char *);
+            }
+        }
+#endif
         for (i = 1; i < orig_argc; i++)
             new_argv[script->argc + i] = orig_argv[i];
         new_argv[script->argc + orig_argc] = NULL;
 
         /* Modify syscall parameters. */
-        *sys_param_addr(dcontext, 0) = (reg_t)new_argv[0];
-        *sys_param_addr(dcontext, 1) = (reg_t)new_argv;
+        *execve_param_addr(dcontext, 0) = (reg_t)new_argv[0];
+        *execve_param_addr(dcontext, 1) = (reg_t)new_argv;
     }
     return 0;
 
@@ -7641,6 +7805,12 @@ handle_execve(dcontext_t *dcontext)
     bool x64 = IF_X64_ELSE(true, false);
     bool expect_to_fail UNUSED = false;
     bool should_inject;
+    bool resource_handoff = false;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    reg_t original_parameters[5];
+    for (uint i = 0; i < 5; ++i)
+        original_parameters[i] = sys_param(dcontext, i);
+#endif
     file_t file;
     char *inject_library_path;
     char rununder_buf[16]; /* just an integer printed in ascii */
@@ -7655,9 +7825,9 @@ handle_execve(dcontext_t *dcontext)
             return ret;
     }
 
-    fname = (char *)sys_param(dcontext, 0);
+    fname = (char *)*execve_param_addr(dcontext, 0);
 #if defined(LINUX) || defined(DEBUG)
-    argv = (const char **)sys_param(dcontext, 1);
+    argv = (const char **)*execve_param_addr(dcontext, 1);
 #endif
 
 #ifdef LINUX
@@ -7727,12 +7897,25 @@ handle_execve(dcontext_t *dcontext)
 #endif
 
     /* Issue 20: handle cross-architecture execve */
+    file = INVALID_FILE;
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    execveat_state_t *descriptor_exec =
+        ((os_thread_data_t *)dcontext->os_field)->execveat_state;
+    if (descriptor_exec != NULL && !descriptor_exec->script)
+        file = descriptor_exec->file;
+    else
+#endif
+#ifdef LINUX
+        file = open_syscall(fname, O_RDONLY | O_CLOEXEC, 0);
+#else
     file = os_open(fname, OS_OPEN_READ);
+#endif
+    if (file < 0)
+        file = INVALID_FILE;
     if (file != INVALID_FILE) {
         if (!module_file_is_module64(file, &x64,
                                      NULL /*only care about primary==execve*/))
             expect_to_fail = true;
-        os_close(file);
     } else
         expect_to_fail = true;
     inject_library_path =
@@ -7749,13 +7932,71 @@ handle_execve(dcontext_t *dcontext)
             should_inject = rununder_on;
     }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (should_inject && DYNAMO_OPTION(early_inject) && !expect_to_fail && x64 &&
+        os_exec_resources_service() != INVALID_FILE &&
+        ((os_thread_data_t *)dcontext->os_field)->client_exec_data != 0 &&
+        (descriptor_exec == NULL || !descriptor_exec->script)) {
+        resource_handoff = os_exec_resources_register(
+            ((os_thread_data_t *)dcontext->os_field)->client_exec_data, file, fname,
+            procfs_root);
+        if (!resource_handoff) {
+            if (descriptor_exec == NULL)
+                os_close(file);
+            dcontext->sys_param0 = dcontext->sys_param1 = 0;
+            dcontext->sys_param3 = dcontext->sys_param4 = 0;
+            mark_thread_execve(dcontext->thread_record, false);
+            return EIO;
+        }
+        if (descriptor_exec != NULL) {
+            /* REGISTER now owns its target reference, and the kernel executes
+             * the runtime descriptor. Do not retain this temporary target fd
+             * across exec: a CLONE_FILES peer would otherwise keep it open in
+             * the old shared table after the execing task unshares its table. */
+            os_close_protected(descriptor_exec->file);
+            descriptor_exec->file = INVALID_FILE;
+        }
+    }
+#endif
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    if (descriptor_exec == NULL || descriptor_exec->script)
+#endif
+        if (file != INVALID_FILE)
+            os_close(file);
+
     if (should_inject)
-        add_dr_env_vars(dcontext, inject_library_path, fname);
+        add_dr_env_vars(dcontext, inject_library_path, fname, resource_handoff);
     else {
         dcontext->sys_param0 = 0;
         dcontext->sys_param1 = 0;
     }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (resource_handoff) {
+        const reg_t arguments = *execve_param_addr(dcontext, 1);
+        const reg_t environment = *execve_param_addr(dcontext, 2);
+        execveat_state_t *state = descriptor_exec;
+        if (state == NULL) {
+            state = global_heap_alloc(sizeof(*state) HEAPACCT(ACCT_OTHER));
+            memset(state, 0, sizeof(*state));
+            for (uint i = 0; i < 5; ++i)
+                state->parameters[i] = original_parameters[i];
+            state->file = INVALID_FILE;
+            state->owner = os_file_table_identity(NULL);
+            ((os_thread_data_t *)dcontext->os_field)->execveat_state = state;
+        }
+        state->resource_handoff = true;
+        *sys_param_addr(dcontext, 0) = os_exec_resource_file(DR_EXEC_RESOURCE_RUNTIME);
+        *sys_param_addr(dcontext, 1) = (reg_t) "";
+        *sys_param_addr(dcontext, 2) = arguments;
+        *sys_param_addr(dcontext, 3) = environment;
+        *sys_param_addr(dcontext, 4) = AT_EMPTY_PATH;
+        MCXT_SYSNUM_REG(get_mcontext(dcontext)) = SYS_execveat;
+        dcontext->sys_param3 = dcontext->sys_param4 = 0;
+        d_r_config_exit();
+        return 0;
+    }
+#endif
 #ifdef LINUX
     /* We have to be accurate with expect_to_fail as we cannot come back
      * and fail the syscall once the kernel execs DR!
@@ -7775,9 +8016,9 @@ handle_execve(dcontext_t *dcontext)
                 } else
                     dcontext->sys_param3 = 0;        /* no restore in post */
                 dcontext->sys_param4 = (reg_t)fname; /* store for restore in post */
-                *sys_param_addr(dcontext, 0) = (reg_t)drpath;
+                *execve_param_addr(dcontext, 0) = (reg_t)drpath;
                 LOG(THREAD, LOG_SYSCALLS, 2, "actual execve on: %s\n",
-                    (char *)sys_param(dcontext, 0));
+                    (char *)*execve_param_addr(dcontext, 0));
             },
             /* except */
             {
@@ -7798,6 +8039,33 @@ handle_execve(dcontext_t *dcontext)
     d_r_config_exit();
     return 0;
 }
+
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+static void
+release_execveat(dcontext_t *dcontext)
+{
+    os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+    execveat_state_t *state = ostd->execveat_state;
+    int index;
+    if (state == NULL)
+        return;
+    for (index = 0; index < 5; ++index)
+        *sys_param_addr(dcontext, index) = state->parameters[index];
+    if (state->file != INVALID_FILE) {
+        if (state->owner == os_file_table_identity(NULL))
+            os_close_protected(state->file);
+        /* A departed child owned a different kernel table. Its ledger is
+         * reclaimed with that domain, never by removing this caller's entry. */
+    }
+    if (state->argv != NULL)
+        global_heap_free(state->argv, state->argv_size HEAPACCT(ACCT_OTHER));
+    if (state->interpreter != NULL)
+        global_heap_free(state->interpreter,
+                         sizeof(*state->interpreter) HEAPACCT(ACCT_OTHER));
+    global_heap_free(state, sizeof(*state) HEAPACCT(ACCT_OTHER));
+    ostd->execveat_state = NULL;
+}
+#endif
 
 static void
 handle_execve_post(dcontext_t *dcontext)
@@ -7830,7 +8098,7 @@ handle_execve_post(dcontext_t *dcontext)
     }
     if (dcontext->sys_param4 != 0) {
         /* restore original /proc/.../exe */
-        *sys_param_addr(dcontext, 0) = dcontext->sys_param4;
+        *execve_param_addr(dcontext, 0) = dcontext->sys_param4;
         if (dcontext->sys_param3 != 0) {
             /* restore original argv[0] */
             const char **argv = (const char **)dcontext->sys_param3;
@@ -7854,9 +8122,154 @@ handle_execve_post(dcontext_t *dcontext)
         heap_free(dcontext, new_envp, sizeof(char *) * i HEAPACCT(ACCT_OTHER));
         /* restore prev envp if we're post-syscall */
         if (!dcontext->thread_record->execve)
-            *sys_param_addr(dcontext, 2) = (reg_t)old_envp;
+            *execve_param_addr(dcontext, 2) = (reg_t)old_envp;
     }
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    release_execveat(dcontext);
+#endif
 }
+
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+static int
+handle_execveat(dcontext_t *dcontext)
+{
+    os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+    const int directory = (int)sys_param(dcontext, 0);
+    const char *pathname = (const char *)sys_param(dcontext, 1);
+    const uint flags = (uint)sys_param(dcontext, 4);
+    char name[MAXIMUM_PATH];
+    struct stat status;
+    execveat_state_t *state;
+    file_t opened = INVALID_FILE, duplicate;
+    byte prefix[4];
+    ptr_int_t result;
+    size_t length;
+    int index, original_flags = 0, error = 0;
+    bool descriptor_path;
+    if (TESTANY(~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW), flags))
+        return EINVAL;
+    for (length = 0; length < sizeof(name); ++length) {
+        if (!safe_read_ex(pathname + length, 1, &name[length], NULL))
+            return EFAULT;
+        if (name[length] == '\0')
+            break;
+    }
+    if (length == sizeof(name))
+        return ENAMETOOLONG;
+    if (length == 0 && !TESTANY(AT_EMPTY_PATH, flags))
+        return ENOENT;
+    descriptor_path = length == 0 || (name[0] != '/' && directory != AT_FDCWD);
+    if (descriptor_path) {
+        original_flags = fcntl_syscall(directory, F_GETFD, 0);
+        if (original_flags < 0)
+            return -original_flags;
+    }
+    if (length == 0)
+        duplicate = fcntl_syscall(directory, F_DUPFD_CLOEXEC, 3);
+    else {
+        result = dynamorio_syscall(
+            SYS_openat, 4, directory, name,
+            O_PATH | O_CLOEXEC | (TESTANY(AT_SYMLINK_NOFOLLOW, flags) ? O_NOFOLLOW : 0),
+            0);
+        if (result < 0)
+            return (int)-result;
+        opened = (file_t)result;
+        duplicate = fcntl_syscall(opened, F_DUPFD_CLOEXEC, 3);
+        os_close(opened);
+    }
+    if (duplicate < 0)
+        return EMFILE;
+    fd_table_add(duplicate, 0);
+    state = global_heap_alloc(sizeof(*state) HEAPACCT(ACCT_OTHER));
+    memset(state, 0, sizeof(*state));
+    state->file = duplicate;
+    state->owner = os_file_table_identity(NULL);
+    for (index = 0; index < 5; ++index)
+        state->parameters[index] = sys_param(dcontext, index);
+    ostd->execveat_state = state;
+    snprintf(state->path, sizeof(state->path), "/proc/self/fd/%d", duplicate);
+    result = dynamorio_syscall(SYS_newfstatat, 4, duplicate, "", &status, AT_EMPTY_PATH);
+    if (result < 0)
+        error = (int)-result;
+    else if (S_ISLNK(status.st_mode) && TESTANY(AT_SYMLINK_NOFOLLOW, flags))
+        error = ELOOP;
+    else if (!S_ISREG(status.st_mode))
+        error = EACCES;
+#    ifdef SYS_faccessat2
+    if (error == 0) {
+        result = dynamorio_syscall(SYS_faccessat2, 4, duplicate, "", X_OK,
+                                   AT_EMPTY_PATH | AT_EACCESS);
+        if (result == -ENOSYS)
+            result = dynamorio_syscall(SYS_faccessat, 3, AT_FDCWD, state->path, X_OK);
+        if (result < 0)
+            error = (int)-result;
+    }
+#    endif
+    if (error == 0) {
+        char relative[80];
+        snprintf(relative, sizeof(relative), "self/fd/%d", duplicate);
+        file_t readable = os_open_procfs(relative, false);
+        if (readable == INVALID_FILE) {
+            /* As for an execute-only pathname, the private loader cannot read
+             * this image. Preserve the kernel's original execveat semantics. */
+            release_execveat(dcontext);
+            dcontext->sys_param0 = dcontext->sys_param1 = 0;
+            dcontext->sys_param3 = dcontext->sys_param4 = 0;
+            mark_thread_execve(dcontext->thread_record, true);
+            return 0;
+        }
+        file_t private_file = fcntl_syscall(readable, F_DUPFD_CLOEXEC, 3);
+        if (private_file >= 0) {
+            os_close(readable);
+            readable = private_file;
+        }
+        fd_table_add(readable, 0);
+        os_close_protected(state->file);
+        state->file = readable;
+        snprintf(state->path, sizeof(state->path), "/proc/self/fd/%d", readable);
+        duplicate = readable;
+        result = script_file_reader(state->path, prefix, sizeof(prefix));
+        state->script = result >= 2 && prefix[0] == '#' && prefix[1] == '!';
+        if (state->script && descriptor_path && TESTANY(FD_CLOEXEC, original_flags))
+            error = ENOENT;
+    }
+    if (error != 0) {
+        release_execveat(dcontext);
+        return error;
+    }
+    if (descriptor_path)
+        snprintf(state->script_name, sizeof(state->script_name),
+                 length ? "/dev/fd/%d/%s" : "/dev/fd/%d", directory, name);
+    else
+        snprintf(state->script_name, sizeof(state->script_name), "%s", name);
+    if (fcntl_syscall(duplicate, F_SETFD, state->script ? 0 : FD_CLOEXEC) < 0) {
+        release_execveat(dcontext);
+        return EIO;
+    }
+    *execve_param_addr(dcontext, 0) = (reg_t)state->path;
+    dcontext->sys_param0 = dcontext->sys_param1 = 0;
+    dcontext->sys_param3 = dcontext->sys_param4 = 0;
+    error = handle_execve(dcontext);
+    if (error != 0) {
+        handle_execve_post(dcontext);
+        return error;
+    }
+    if (state->resource_handoff)
+        return 0;
+    /* An uninjected ELF still executes from its descriptor: reopening the
+     * synthetic /proc path would fail when the application hid that mount. */
+    if (!state->script && *execve_param_addr(dcontext, 0) == (reg_t)state->path) {
+        *sys_param_addr(dcontext, 0) = state->file;
+        *execve_param_addr(dcontext, 0) = (reg_t) "";
+        *sys_param_addr(dcontext, 4) = AT_EMPTY_PATH;
+    } else {
+        /* An injected DR/interpreter path is absolute. */
+        *sys_param_addr(dcontext, 0) = AT_FDCWD;
+        *sys_param_addr(dcontext, 4) = 0;
+    }
+    return 0;
+}
+#endif
 
 /* i#237/PR 498284: to avoid accumulation of thread state we clean up a vfork
  * child who invoked execve here so we have at most one outstanding thread.  we
@@ -9069,6 +9482,17 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_fork: {
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: fork\n");
         os_fork_pre(dcontext);
+        break;
+    }
+#endif
+
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    case SYS_execveat: {
+        int ret = handle_execveat(dcontext);
+        if (ret != 0) {
+            execute_syscall = false;
+            set_failure_return_val(dcontext, ret);
+        }
         break;
     }
 #endif
@@ -10886,6 +11310,9 @@ post_system_call(dcontext_t *dcontext)
     }
 #endif
 
+#if defined(LINUX) && defined(X64) && defined(SYS_execveat)
+    case SYS_execveat:
+#endif
     case SYS_execve: {
         /* if we get here it means execve failed (doesn't return on success) */
         success = false;

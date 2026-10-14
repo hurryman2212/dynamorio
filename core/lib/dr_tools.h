@@ -1399,6 +1399,28 @@ dr_open_file(const char *fname, uint mode_flags);
 #ifdef UNIX
 DR_API
 /**
+ * Returns the readable descriptor of the main ELF image captured by the early
+ * loader, or INVALID_FILE when unavailable. This descriptor is borrowed and
+ * protected from application close operations. Do not close it or change its
+ * file offset; use mapping or positional reads. It remains valid until exit.
+ */
+file_t
+dr_get_application_file(void);
+
+DR_API
+/**
+ * Registers a borrowed, protected, inherited SOCK_SEQPACKET endpoint implementing
+ * dr_exec_resources.h. The early loader obtains original runtime/private ELF
+ * descriptors from this service after exec, without reopening installation paths.
+ * Call once during dr_client_main(), with CLOEXEC clear on this endpoint.
+ * The caller keeps it alive and supplies a nonzero client exec nonce.
+ * Currently supported by the Linux x86-64 early loader only.
+ */
+bool
+dr_set_exec_resource_service(file_t broker_fd);
+
+DR_API
+/**
  * Configures Linux x86-64 internal thread suspension through a service that
  * implements dr_thread_suspend.h. Call during dr_client_main() with a borrowed,
  * protected, inherited SOCK_SEQPACKET descriptor. The caller keeps this control
@@ -1442,6 +1464,38 @@ DR_API
 bool
 dr_adopt_file_descriptor_ex(file_t fd, bool inherit_exec, bool close_on_fork);
 
+DR_API
+/**
+ * Returns a borrowed protected descriptor for the executable supplied through
+ * execveat/fexecve, or INVALID_FILE for a normal pathname exec. Do not close or
+ * change this descriptor. It pins an unlinked/memfd image for metadata readers
+ * and is closed when DR exits or the application executes another image.
+ */
+file_t
+dr_get_executable_file(void);
+
+DR_API
+/**
+ * Sets an opaque client value for this thread's next exec attempt. Call from a
+ * pre-syscall callback before execve/execveat, and clear with zero in the post
+ * callback if the exec fails. Concurrent threads keep independent values.
+ * DR transports the value with its private reinjection environment even if
+ * the application's exec environment is empty. Returns false outside a syscall
+ * callback or if the context is not the calling thread's context.
+ */
+bool
+dr_set_exec_client_data(void *drcontext, uint64 data);
+
+DR_API
+/**
+ * Returns the client value transported by the exec that created this image,
+ * or zero if no value was provided. The private transport entry is disabled
+ * before client initialization. This value remains constant for the image's
+ * lifetime and is inherited by fork: clients must not treat a fork child as a
+ * new exec of the image.
+ */
+uint64
+dr_get_exec_client_data(void);
 #endif
 
 DR_API

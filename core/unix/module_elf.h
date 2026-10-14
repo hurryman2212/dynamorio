@@ -90,6 +90,7 @@ module_segment_prot_to_osprot(ELF_PROGRAM_HEADER_TYPE *prog_hdr);
 typedef struct elf_loader_t {
     const char *filename;
     file_t fd;
+    bool borrowed_fd;
     ELF_HEADER_TYPE *ehdr;          /* Points into buf. */
     ELF_PROGRAM_HEADER_TYPE *phdrs; /* Points into buf or file_map. */
     app_pc load_base;               /* Load base. */
@@ -145,6 +146,12 @@ elf_loader_read_phdrs(elf_loader_t *elf);
 /* Shorthand to initialize the loader and read the ELF and program headers. */
 bool
 elf_loader_read_headers(elf_loader_t *elf, const char *filename);
+
+/* Read a pinned image without reopening its logical filename or changing the
+ * descriptor's shared file offset. The caller retains ownership of fd until
+ * elf_loader_destroy(), which releases only the temporary mapping. */
+bool
+elf_loader_read_headers_fd(elf_loader_t *elf, const char *filename, file_t fd);
 
 /* Maps in the entire ELF file, including unmapped portions such as section
  * headers and debug info.  Does not re-map the same file if called twice.
