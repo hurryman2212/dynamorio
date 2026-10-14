@@ -51,6 +51,14 @@
  */
 #include "../ir/opnd.h"
 
+#ifdef LINUX
+/* Discard only caller-proven dead pages of private anonymous storage. Mapping,
+ * protection, and reservation remain unchanged; subsequent faults read zero.
+ * Never use for file-backed or aliased code/data, or still-live instructions. */
+bool
+os_heap_discard_unused(void *base, size_t size);
+#endif
+
 #ifndef NOT_DYNAMORIO_CORE_PROPER
 #    define getpid getpid_forbidden_use_get_process_id
 #endif
