@@ -6109,6 +6109,9 @@ main_signal_handler_C(byte *xsp)
             }
             if (!syscall_signal) {
                 if (check_in_last_thread_vm_area(dcontext, target)) {
+                    dr_jmp_buf_t *prepare_abort = is_dynamo_address(pc)
+                        ? interp_cache_prepare_fault(dcontext, target)
+                        : NULL;
                     /* See comments in callback.c as well.
                      * XXX: try to share code
                      */
@@ -6127,6 +6130,19 @@ main_signal_handler_C(byte *xsp)
                     if (dcontext->bb_build_info != NULL) {
                         /* must have been building a bb at the time */
                         bb_build_abort(dcontext, true /*clean vm area*/, true /*unlock*/);
+                    }
+                    if (prepare_abort != NULL) {
+                        /* Match TRY's signal entry/mask restoration only after
+                         * normal source-decode abort cleanup. Client callbacks
+                         * never enable this recovery context.
+                         */
+                        EXITING_DR();
+                        ASSERT(memcmp(&prepare_abort->sigmask, &ucxt->uc_sigmask,
+                                      sizeof(ucxt->uc_sigmask)) == 0);
+                        sigprocmask_syscall(SIG_SETMASK, SIGMASK_FROM_UCXT(ucxt), NULL,
+                                            sizeof(ucxt->uc_sigmask));
+                        DR_LONGJMP(prepare_abort, LONGJMP_EXCEPTION);
+                        ASSERT_NOT_REACHED();
                     }
                     /* Since we have no sigreturn we have to restore the mask manually */
                     unblock_all_signals(NULL);

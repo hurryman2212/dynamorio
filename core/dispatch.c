@@ -172,6 +172,8 @@ d_r_dispatch(dcontext_t *dcontext)
      * cache due to flushing before we get there.
      */
     do {
+        if (fragment_cache_preparation_pending())
+            fragment_cache_prepare(dcontext);
 #if defined(LINUX) && defined(X86) && defined(X64)
         if (dcontext->client_userspace_target != NULL) {
             app_pc target = dcontext->client_userspace_target;
@@ -280,6 +282,14 @@ d_r_dispatch(dcontext_t *dcontext)
             /* loop around and re-do monitor check */
         } while (true);
 
+        /* A module callback during decoding may have submitted preparation.
+         * Drain before executing this new fragment, then look it up again:
+         * preparation can retire precisely this tag.
+         */
+        if (fragment_cache_preparation_pending() && fragment_cache_prepare(dcontext)) {
+            targetf = NULL;
+            continue;
+        }
         if (targetf != NULL) {
             if (dispatch_enter_fcache(dcontext, targetf)) {
                 /* won't reach here: will re-enter d_r_dispatch() with a clean stack */
