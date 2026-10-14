@@ -5659,6 +5659,25 @@ fragment_self_write(dcontext_t *dcontext)
             return;
         }
     }
+    if (dr_code_change_hook_exists()) {
+        fragment_t *fragment = dcontext->last_fragment;
+        const size_t source_size = FRAGMENT_SELFMOD_COPY_CODE_SIZE(fragment);
+        const byte *saved = FRAGMENT_SELFMOD_COPY_PC(fragment);
+        bool changed = false;
+        for (size_t offset = 0; offset < source_size;) {
+            byte current[256];
+            const size_t amount = MIN(sizeof(current), source_size - offset);
+            if (!d_r_safe_read(fragment->tag + offset, amount, current))
+                break;
+            if (memcmp(current, saved + offset, amount) != 0) {
+                changed = true;
+                break;
+            }
+            offset += amount;
+        }
+        if (changed)
+            instrument_code_changed(dcontext, fragment->tag, source_size);
+    }
     LOG(THREAD, LOG_ALL, 1, "WARNING: fragment " PFX " @" PFX " overwrote its own code\n",
         dcontext->last_fragment->tag,
         EXIT_CTI_PC(dcontext->last_fragment, dcontext->last_exit));

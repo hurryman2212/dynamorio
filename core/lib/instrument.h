@@ -114,6 +114,8 @@ dr_custom_trace_action_t
 instrument_end_trace(dcontext_t *dcontext, app_pc trace_tag, app_pc next_tag);
 void
 instrument_fragment_deleted(dcontext_t *dcontext, app_pc tag, uint flags);
+void
+instrument_code_changed(dcontext_t *dcontext, app_pc start, size_t size);
 bool
 instrument_restore_state(dcontext_t *dcontext, bool restore_memory,
                          dr_restore_state_info_t *info);
@@ -203,6 +205,8 @@ bool
 dr_trace_hook_exists(void);
 bool
 dr_fragment_deleted_hook_exists(void);
+bool
+dr_code_change_hook_exists(void);
 bool
 dr_end_trace_hook_exists(void);
 bool

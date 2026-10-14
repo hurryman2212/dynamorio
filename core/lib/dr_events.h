@@ -566,6 +566,29 @@ bool dr_unregister_end_trace_event(dr_custom_trace_action_t (*func)(void *drcont
                                                                     void *tag,
                                                                     void *next_tag));
 
+DR_API
+/**
+ * Registers a callback for original application instruction bytes that the
+ * self-modifying-code sandbox detects have changed.  The range is the original
+ * application start address and source-copy length, not a code-cache address.
+ *
+ * The event occurs after exiting the stale fragment and before its deletion or
+ * replacement basic-block instrumentation.  Counter-only sandbox-to-read-only
+ * transitions do not raise this event.  It is not a replacement for mapping or
+ * module lifecycle events.
+ *
+ * No linking or virtual-memory-area lock is held while the callback runs.
+ * Clients may invalidate their own metadata, but must not flush or unlink code,
+ * redirect execution, or suspend other threads from this callback.
+ */
+void
+dr_register_code_change_event(void (*func)(void *drcontext, app_pc start, size_t size));
+
+DR_API
+/** Unregisters a code-change callback. Returns whether it was registered. */
+bool
+dr_unregister_code_change_event(void (*func)(void *drcontext, app_pc start, size_t size));
+
 /* For the new-bb-before-deletion-event problem (PR 495787, and
  * described in the comment below):
  * Note that we do not want a new "unreachable event" b/c clients need

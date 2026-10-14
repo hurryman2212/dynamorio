@@ -326,6 +326,8 @@ memquery_iterator_next(memquery_iter_t *iter)
     iter->prot = permstr_to_memprot(perm);
     iter->is_shared = len >= 3 && perm[0] != '\0' && perm[1] != '\0' && perm[2] != '\0' &&
         perm[3] == 's';
+    if (iter->is_shared)
+        iter->prot |= MEMPROT_SHARED;
 #ifdef ANDROID
     /* i#1861: the Android kernel supports custom comments which can't merge */
     if (iter->comment[0] != '\0')
@@ -394,7 +396,8 @@ memquery_from_os_ioctl(const byte *pc, DR_PARAM_OUT dr_mem_info_t *info)
             info->prot =
                 ((query.vma_flags & PROCMAP_QUERY_VMA_READABLE) ? MEMPROT_READ : 0) |
                 ((query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) ? MEMPROT_WRITE : 0) |
-                ((query.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) ? MEMPROT_EXEC : 0);
+                ((query.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) ? MEMPROT_EXEC : 0) |
+                ((query.vma_flags & PROCMAP_QUERY_VMA_SHARED) ? MEMPROT_SHARED : 0);
             if (vdso_page_start != NULL && pc >= vdso_page_start &&
                 pc < vdso_page_start + vdso_size) {
                 info->prot = MEMPROT_READ | MEMPROT_EXEC | MEMPROT_VDSO;

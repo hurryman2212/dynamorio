@@ -65,6 +65,9 @@
 #ifndef MAP_FIXED_NOREPLACE
 #    define MAP_FIXED_NOREPLACE 0x100000
 #endif
+#ifndef MREMAP_DONTUNMAP
+#    define MREMAP_DONTUNMAP 4
+#endif
 /* for open */
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -309,7 +312,7 @@ os_set_dr_tls_base(dcontext_t *dcontext, os_local_state_t *tls, byte *base);
 #ifdef LINUX
 static bool
 handle_app_mremap(dcontext_t *dcontext, byte *base, size_t size, byte *old_base,
-                  size_t old_size, uint old_prot, uint old_type);
+                  size_t old_size, uint old_prot, uint old_type, uint flags);
 static void
 handle_app_brk(dcontext_t *dcontext, byte *lowest_brk /*if known*/, byte *old_brk,
                byte *new_brk);
@@ -4510,7 +4513,7 @@ dr_raw_mremap(void *old_address, size_t old_size, size_t new_size, int flags,
     res = (byte *)dynamorio_syscall(SYS_mremap, 5, old_address, old_size, new_size, flags,
                                     new_address);
     handle_app_mremap(dcontext, res, new_size, old_address, old_size, info.prot,
-                      info.size);
+                      info.type, flags);
     return res;
 }
 
@@ -6626,8 +6629,26 @@ set_protection(byte *pc, size_t length, uint prot /*MEMPROT_*/)
     else {
         app_pc start_page = (app_pc)PAGE_START(pc);
         uint num_bytes = ALIGN_FORWARD(length + (pc - start_page), PAGE_SIZE);
-        memcache_update_locked(start_page, start_page + num_bytes, prot,
-                               -1 /*type unchanged*/, true /*exists*/);
+        /* Permission changes retain each mapping's source metadata, including
+         * shared mappings in an otherwise private range.
+         */
+        for (app_pc cursor = start_page; cursor < start_page + num_bytes;) {
+            dr_mem_info_t info;
+            if (!query_memory_ex_from_os(cursor, &info) || info.type == DR_MEMTYPE_FREE ||
+                info.base_pc > cursor ||
+                POINTER_OVERFLOW_ON_ADD(info.base_pc, info.size) ||
+                info.base_pc + info.size <= cursor) {
+                ASSERT_NOT_REACHED();
+                break;
+            }
+            const size_t amount = MIN((size_t)(start_page + num_bytes - cursor),
+                                      (size_t)(info.base_pc + info.size - cursor));
+            const uint new_prot =
+                (prot & ~MEMPROT_META_FLAGS) | (info.prot & MEMPROT_META_FLAGS);
+            memcache_update_locked(cursor, cursor + amount, new_prot,
+                                   -1 /*type unchanged*/, true /*exists*/);
+            cursor += amount;
+        }
     }
 #endif
     return true;
@@ -6651,7 +6672,7 @@ make_writable(byte *pc, size_t size)
     long res;
     app_pc start_page = (app_pc)PAGE_START(pc);
     size_t prot_size = (size == 0) ? PAGE_SIZE : size;
-    uint prot = PROT_EXEC | PROT_READ | PROT_WRITE;
+    uint prot = MEMPROT_EXEC | MEMPROT_READ | MEMPROT_WRITE;
     /* if can get current protection then keep old read/exec flags.
      * this is crucial on modern linux kernels which refuse to mark stack +x.
      */
@@ -6664,10 +6685,10 @@ make_writable(byte *pc, size_t size)
         IF_NO_MEMQUERY(memcache_initialized() &&)
 #endif
             get_memory_info(pc, NULL, NULL, &prot))
-        prot |= PROT_WRITE;
+        prot |= MEMPROT_WRITE;
 
     ASSERT(start_page == pc && ALIGN_FORWARD(size, PAGE_SIZE) == size);
-    res = mprotect_syscall((void *)start_page, prot_size, prot);
+    res = mprotect_syscall((void *)start_page, prot_size, memprot_to_osprot(prot));
     LOG(THREAD_GET, LOG_VMAREAS, 3, "make_writable: pc " PFX " -> " PFX "-" PFX " %d\n",
         pc, start_page, start_page + prot_size, res);
     ASSERT(res == 0);
@@ -6679,9 +6700,8 @@ make_writable(byte *pc, size_t size)
 #ifndef HAVE_MEMINFO_QUERY
     /* update all_memory_areas list with the protection change */
     if (memcache_initialized()) {
-        memcache_update_locked(start_page, start_page + prot_size,
-                               osprot_to_memprot(prot), -1 /*type unchanged*/,
-                               true /*exists*/);
+        memcache_update_locked(start_page, start_page + prot_size, prot,
+                               -1 /*type unchanged*/, true /*exists*/);
     }
 #endif
     return true;
@@ -6701,7 +6721,7 @@ make_unwritable(byte *pc, size_t size)
 {
     app_pc start_page = (app_pc)PAGE_START(pc);
     size_t prot_size = (size == 0) ? PAGE_SIZE : size;
-    uint prot = PROT_EXEC | PROT_READ;
+    uint prot = MEMPROT_EXEC | MEMPROT_READ;
     /* if can get current protection then keep old read/exec flags.
      * this is crucial on modern linux kernels which refuse to mark stack +x.
      */
@@ -6714,15 +6734,15 @@ make_unwritable(byte *pc, size_t size)
         IF_NO_MEMQUERY(memcache_initialized() &&)
 #endif
             get_memory_info(pc, NULL, NULL, &prot)) {
-        prot &= ~PROT_WRITE;
+        prot &= ~MEMPROT_WRITE;
 #if defined(LINUX) && defined(AARCH64)
         /* Linux internally maps -wx permissions to rwx. Older kernels do this for --x as
          * well but recent kernels (>= 5.13) running on hardware that supports FEAT_EPAN
          * do not, so we need to explicitly add PROT_READ to preserve DR's ability to
          * decode instructions from this page.
          */
-        if (TESTANY(PROT_EXEC, prot)) {
-            prot |= PROT_READ;
+        if (TESTANY(MEMPROT_EXEC, prot)) {
+            prot |= MEMPROT_READ;
         }
 #endif
     }
@@ -6731,7 +6751,8 @@ make_unwritable(byte *pc, size_t size)
     /* inc stats before making unwritable, in case messing w/ data segment */
     STATS_INC(protection_change_calls);
     STATS_ADD(protection_change_pages, size / PAGE_SIZE);
-    DEBUG_DECLARE(long res =) mprotect_syscall((void *)start_page, prot_size, prot);
+    DEBUG_DECLARE(long res =)
+    mprotect_syscall((void *)start_page, prot_size, memprot_to_osprot(prot));
     LOG(THREAD_GET, LOG_VMAREAS, 3, "make_unwritable: pc " PFX " -> " PFX "-" PFX "\n",
         pc, start_page, start_page + prot_size);
     ASSERT(res == 0);
@@ -6739,9 +6760,8 @@ make_unwritable(byte *pc, size_t size)
 #ifndef HAVE_MEMINFO_QUERY
     /* update all_memory_areas list with the protection change */
     if (memcache_initialized()) {
-        memcache_update_locked(start_page, start_page + prot_size,
-                               osprot_to_memprot(prot), -1 /*type unchanged*/,
-                               false /*!exists*/);
+        memcache_update_locked(start_page, start_page + prot_size, prot,
+                               -1 /*type unchanged*/, false /*!exists*/);
     }
 #endif
 }
@@ -9477,6 +9497,8 @@ pre_system_call(dcontext_t *dcontext)
         DEBUG_DECLARE(ok =)
         query_memory_ex(addr, &info);
         ASSERT(ok);
+        if (is_pretend_or_executable_writable(addr))
+            info.prot |= MEMPROT_WRITE;
         dcontext->sys_param3 = info.prot;
         dcontext->sys_param4 = info.type;
         DOCHECK(1, {
@@ -9493,13 +9515,9 @@ pre_system_call(dcontext_t *dcontext)
            asmlinkage long sys_mprotect(unsigned long start, uint len,
            unsigned long prot)
         */
-        uint res;
-        DEBUG_DECLARE(size_t size;)
         app_pc addr = (app_pc)STRIP_MEMORY_TAG(sys_param(dcontext, 0));
         size_t len = (size_t)sys_param(dcontext, 1);
         uint prot = (uint)sys_param(dcontext, 2);
-        uint old_memprot = MEMPROT_NONE, new_memprot;
-        bool exists UNUSED = true;
         /* save params in case an undo is needed in post_system_call */
         dcontext->sys_param0 = (reg_t)addr;
         dcontext->sys_param1 = len;
@@ -9512,45 +9530,50 @@ pre_system_call(dcontext_t *dcontext)
         if (!ALIGNED(addr, PAGE_SIZE) || len == 0)
             break;
 #endif
+        if (POINTER_OVERFLOW_ON_ADD(addr, len))
+            break;
         LOG(THREAD, LOG_SYSCALLS, 2,
             "syscall: mprotect addr=" PFX " size=" PFX " prot=%s\n", addr, len,
             memprot_string(osprot_to_memprot(prot)));
 
-        if (!get_memory_info(addr, NULL, IF_DEBUG_ELSE(&size, NULL), &old_memprot)) {
-            exists = false;
-            /* Xref PR 413109, PR 410921: if the start, or any page, is not mapped,
-             * this should fail with ENOMEM.  We used to force-fail it to avoid
-             * asserts in our own allmem update code, but there are cases where a
-             * seemingly unmapped page succeeds (i#1912: next page of grows-down
-             * initial stack).  Thus we let it go through.
-             */
-            LOG(THREAD, LOG_SYSCALLS, 2,
-                "\t" PFX " isn't mapped: probably mprotect will fail\n", addr);
-        } else {
-            /* If mprotect region spans beyond the end of the vmarea then it
-             * spans 2 or more vmareas with dissimilar protection (xref
-             * PR 410921) or has unallocated regions in between (PR 413109).
-             */
-            DOCHECK(1, dcontext->mprot_multi_areas = len > size ? true : false;);
-        }
-
-        new_memprot = osprot_to_memprot(prot) |
-            /* mprotect won't change meta flags */
-            (old_memprot & MEMPROT_META_FLAGS);
-        res = app_memory_protection_change(dcontext, addr, len, new_memprot, &new_memprot,
-                                           NULL, false /*!image*/);
-        if (res != DO_APP_MEM_PROT_CHANGE) {
-            if (res == FAIL_APP_MEM_PROT_CHANGE) {
-                ASSERT_NOT_IMPLEMENTED(false); /* return code? */
-            } else {
-                ASSERT_NOT_IMPLEMENTED(res != SUBSET_APP_MEM_PROT_CHANGE);
-                ASSERT_NOT_REACHED();
+        /* One kernel operation can span private and shared mappings.  Keep
+         * each original VMA's metadata while applying consistency bookkeeping;
+         * do not spread the first mapping's attributes across the whole span.
+         */
+        for (app_pc cursor = addr; cursor < addr + len;) {
+            dr_mem_info_t info;
+            if (!query_memory_ex(cursor, &info) || info.type == DR_MEMTYPE_FREE ||
+                info.base_pc > cursor ||
+                POINTER_OVERFLOW_ON_ADD(info.base_pc, info.size) ||
+                info.base_pc + info.size <= cursor) {
+                /* Let the kernel decide ENOMEM or a grows-down expansion.
+                 * Post-syscall queries reconcile the extent it actually changed.
+                 */
+                break;
             }
-            execute_syscall = false;
-        } else {
-            /* XXX Store state for undo if the syscall fails. */
-            IF_NO_MEMQUERY(memcache_update_locked(addr, addr + len, new_memprot,
-                                                  -1 /*type unchanged*/, exists));
+            const size_t amount = MIN((size_t)(addr + len - cursor),
+                                      (size_t)(info.base_pc + info.size - cursor));
+            DOCHECK(1, {
+                if (cursor == addr)
+                    dcontext->mprot_multi_areas = amount < len;
+            });
+            uint new_memprot = osprot_to_memprot(prot) | (info.prot & MEMPROT_META_FLAGS);
+            uint res = app_memory_protection_change(dcontext, cursor, amount, new_memprot,
+                                                    &new_memprot, NULL, false /*!image*/);
+            if (res != DO_APP_MEM_PROT_CHANGE) {
+                if (res == FAIL_APP_MEM_PROT_CHANGE) {
+                    ASSERT_NOT_IMPLEMENTED(false); /* return code? */
+                } else {
+                    ASSERT_NOT_IMPLEMENTED(res != SUBSET_APP_MEM_PROT_CHANGE);
+                    ASSERT_NOT_REACHED();
+                }
+                execute_syscall = false;
+                break;
+            } else {
+                IF_NO_MEMQUERY(memcache_update_locked(cursor, cursor + amount,
+                                                      new_memprot, -1, true));
+            }
+            cursor += amount;
         }
         break;
     }
@@ -10931,6 +10954,10 @@ process_mmap(dcontext_t *dcontext, app_pc base, size_t size, uint prot,
         return;
     bool image = false;
     uint memprot = osprot_to_memprot(prot);
+#ifdef LINUX
+    if (TESTANY(MAP_SHARED, flags))
+        memprot |= MEMPROT_SHARED;
+#endif
 #ifdef ANDROID
     /* i#1861: avoid merging file-backed w/ anon regions */
     if (!TESTANY(MAP_ANONYMOUS, flags))
@@ -11010,7 +11037,18 @@ process_mmap(dcontext_t *dcontext, app_pc base, size_t size, uint prot,
     }
 
     LOG(THREAD, LOG_SYSCALLS, 4, "\t try app_mem_alloc\n");
-    IF_NO_MEMQUERY(memcache_handle_mmap(dcontext, base, size, memprot, image));
+    if (TESTANY(MAP_FIXED, flags)) {
+        /* Publish the new source attributes before flushing releases peers.
+         * Protection-change overlap handling cannot retire a replaced RX
+         * mapping with unchanged permissions.
+         */
+        IF_NO_MEMQUERY(memcache_update_locked(base, base + size, memprot,
+                                              image ? DR_MEMTYPE_IMAGE : DR_MEMTYPE_DATA,
+                                              false /*replacement*/));
+        app_memory_replacement(dcontext, base, size);
+    } else {
+        IF_NO_MEMQUERY(memcache_handle_mmap(dcontext, base, size, memprot, image));
+    }
     if (app_memory_allocation(dcontext, base, size, memprot, image _IF_DEBUG(map_type)))
         STATS_INC(num_app_code_modules);
     LOG(THREAD, LOG_SYSCALLS, 4, "\t app_mem_alloc -- DONE\n");
@@ -11022,26 +11060,50 @@ process_mmap(dcontext_t *dcontext, app_pc base, size_t size, uint prot,
  */
 static bool
 handle_app_mremap(dcontext_t *dcontext, byte *base, size_t size, byte *old_base,
-                  size_t old_size, uint old_prot, uint old_type)
+                  size_t old_size, uint old_prot, uint old_type, uint flags)
 {
     if (!mmap_syscall_succeeded(base))
         return false;
-    if (base != old_base || size < old_size) { /* take action only if
-                                                * there was a change */
+    if (base != old_base || size != old_size) { /* take action only if
+                                                 * there was a change */
         DEBUG_DECLARE(bool ok;)
+        /* mremap copies the kernel permissions, including read-only protection
+         * DR imposed on writable original code.  Preserve the source's logical
+         * writability at its new address, never the replaced destination's.
+         */
+        if (TESTANY(MEMPROT_WRITE, old_prot)) {
+            dr_mem_info_t info;
+            if (query_memory_ex_from_os(base, &info) &&
+                !TESTANY(MEMPROT_WRITE, info.prot)) {
+                DEBUG_DECLARE(bool restored =)
+                os_set_protection(base, size, old_prot);
+                ASSERT(restored);
+            }
+            if (TESTANY(MREMAP_DONTUNMAP, flags)) {
+                /* This flag guarantees the old VMA remains.  An ordinary move
+                 * must never change permissions at an address another thread
+                 * could already have reused.
+                 */
+                DEBUG_DECLARE(bool restored =)
+                os_set_protection(old_base, old_size, old_prot);
+                ASSERT(restored);
+            }
+        }
         /* fragments were shifted...don't try to fix them, just flush */
-        app_memory_deallocation(dcontext, (app_pc)old_base, old_size,
-                                false /* don't own thread_initexit_lock */,
-                                false /* not image, XXX: somewhat arbitrary */);
+        IF_NO_MEMQUERY(memcache_handle_mremap(dcontext, base, size, old_base, old_size,
+                                              old_prot, old_type));
+        if (TESTANY(MREMAP_DONTUNMAP, flags)) {
+            IF_NO_MEMQUERY(memcache_update_locked(old_base, old_base + old_size, old_prot,
+                                                  old_type, false));
+        }
+        app_memory_replacement(dcontext, old_base, old_size);
         if (base != old_base) {
             /* MREMAP_FIXED can replace existing executable pages while keeping
              * the same permissions. Allocation/protection tracking alone would
              * retain their old fragments. Flush the destination after success,
              * before publishing its new allocation or resuming the application.
              */
-            app_memory_deallocation(dcontext, base, size,
-                                    false /* don't own thread_initexit_lock */,
-                                    false /* destination may replace part of an image */);
+            app_memory_replacement(dcontext, base, size);
         }
         /* Verify that the current prot on the new region (according to
          * the os) is the same as what the prot used to be for the old
@@ -11058,8 +11120,11 @@ handle_app_mremap(dcontext_t *dcontext, byte *base, size_t size, byte *old_base,
         });
         app_memory_allocation(dcontext, base, size, old_prot,
                               old_type == DR_MEMTYPE_IMAGE _IF_DEBUG("mremap"));
-        IF_NO_MEMQUERY(memcache_handle_mremap(dcontext, base, size, old_base, old_size,
-                                              old_prot, old_type));
+        if (TESTANY(MREMAP_DONTUNMAP, flags)) {
+            app_memory_allocation(
+                dcontext, old_base, old_size, old_prot,
+                old_type == DR_MEMTYPE_IMAGE _IF_DEBUG("mremap retained source"));
+        }
     }
     return true;
 }
@@ -11110,7 +11175,6 @@ post_system_call(dcontext_t *dcontext)
     size_t size;
     uint prot;
     dr_where_am_i_t old_whereami;
-    DEBUG_DECLARE(bool ok;)
 
     RSTATS_INC(post_syscall);
 
@@ -11273,19 +11337,29 @@ post_system_call(dcontext_t *dcontext)
          *
          * See case 7559 for a better approach.
          */
-        if (!success && len != 0) {
-            dr_mem_info_t info;
-            /* must go to os to get real memory since we already removed */
-            DEBUG_DECLARE(ok =)
-            query_memory_ex_from_os(addr, &info);
-            ASSERT(ok);
-            app_memory_allocation(dcontext, addr, len, info.prot,
-                                  info.type ==
-                                      DR_MEMTYPE_IMAGE _IF_DEBUG("failed munmap"));
-            IF_NO_MEMQUERY(
-                memcache_update_locked((app_pc)ALIGN_BACKWARD(addr, PAGE_SIZE),
-                                       (app_pc)ALIGN_FORWARD(addr + len, PAGE_SIZE),
-                                       info.prot, info.type, false /*add back*/));
+        if (!success && len != 0 && !POINTER_OVERFLOW_ON_ADD(addr, len) &&
+            !POINTER_OVERFLOW_ON_ADD(addr + len, PAGE_SIZE - 1)) {
+            app_pc end = (app_pc)ALIGN_FORWARD(addr + len, PAGE_SIZE);
+            /* Query each actual mapping after failure: a private first VMA
+             * cannot describe a later shared executable source or a hole.
+             */
+            for (app_pc cursor = (app_pc)PAGE_START(addr); cursor < end;) {
+                dr_mem_info_t info;
+                if (!query_memory_ex_from_os(cursor, &info) || info.base_pc > cursor ||
+                    POINTER_OVERFLOW_ON_ADD(info.base_pc, info.size) ||
+                    info.base_pc + info.size <= cursor)
+                    break;
+                const size_t amount = MIN((size_t)(end - cursor),
+                                          (size_t)(info.base_pc + info.size - cursor));
+                if (info.type != DR_MEMTYPE_FREE) {
+                    app_memory_allocation(
+                        dcontext, cursor, amount, info.prot,
+                        info.type == DR_MEMTYPE_IMAGE _IF_DEBUG("failed munmap"));
+                    IF_NO_MEMQUERY(memcache_update_locked(cursor, cursor + amount,
+                                                          info.prot, info.type, false));
+                }
+                cursor += amount;
+            }
         }
         break;
     }
@@ -11303,7 +11377,8 @@ post_system_call(dcontext_t *dcontext)
                               /* i#173: use memory prot and type
                                * obtained from pre_system_call
                                */
-                              (uint)dcontext->sys_param3, (uint)dcontext->sys_param4);
+                              (uint)dcontext->sys_param3, (uint)dcontext->sys_param4,
+                              (uint)sys_param(dcontext, 3));
         /* The syscall either failed OR the retcode is less than the
          * largest uint value of any errno and the addr returned is
          * is page-aligned.
@@ -11325,6 +11400,8 @@ post_system_call(dcontext_t *dcontext)
         if (!ALIGNED(base, PAGE_SIZE) || size == 0)
             break;
 #endif
+        if (POINTER_OVERFLOW_ON_ADD(base, size))
+            break;
 #ifdef VMX86_SERVER
         /* PR 475111: workaround for PR 107872 */
         if (os_in_vmkernel_userworld() && result == -EBUSY && prot == PROT_NONE) {
@@ -11341,43 +11418,36 @@ post_system_call(dcontext_t *dcontext)
         /* XXX i#143: we need to tweak the returned oldprot for
          * writable areas we've made read-only
          */
-        if (!success) {
-            uint memprot = 0;
-            /* Revert the prot bits if needed. */
-            if (!get_memory_info_from_os(base, NULL, NULL, &memprot))
-                memprot = PROT_NONE;
-            LOG(THREAD, LOG_SYSCALLS, 3,
-                "syscall: mprotect failed: " PFX "-" PFX " prot->%d\n", base, base + size,
-                osprot_to_memprot(prot));
-            LOG(THREAD, LOG_SYSCALLS, 3, "\told prot->%d\n", memprot);
-            if (prot != memprot_to_osprot(memprot)) {
-                /* We're trying to reverse the prot change, assuming that
-                 * this action doesn't have any unexpected side effects
-                 * when doing so (such as not reversing some bit of internal
-                 * state).
-                 */
+        /* Failure need not roll back a preceding VMA: Linux can apply a prefix
+         * and then fail at a hole.  Reconcile actual extents and stop at the
+         * first unmapped part instead of inventing a uniform whole-span state.
+         * Also handle a successful grows-down expansion missed by the pre pass.
+         */
+        for (app_pc cursor = base; cursor < base + size;) {
+            dr_mem_info_t info;
+            if (!query_memory_ex_from_os(cursor, &info) || info.type == DR_MEMTYPE_FREE ||
+                info.base_pc > cursor ||
+                POINTER_OVERFLOW_ON_ADD(info.base_pc, info.size) ||
+                info.base_pc + info.size <= cursor)
+                break;
+            const size_t amount = MIN((size_t)(base + size - cursor),
+                                      (size_t)(info.base_pc + info.size - cursor));
+            if (!success && prot != memprot_to_osprot(info.prot)) {
                 uint new_memprot;
                 DEBUG_DECLARE(uint res =)
-                app_memory_protection_change(dcontext, base, size,
-                                             osprot_to_memprot(prot), &new_memprot, NULL,
-                                             false /*!image*/);
+                app_memory_protection_change(dcontext, cursor, amount, info.prot,
+                                             &new_memprot, NULL, false /*!image*/);
                 ASSERT_NOT_IMPLEMENTED(res != SUBSET_APP_MEM_PROT_CHANGE);
                 ASSERT(res == DO_APP_MEM_PROT_CHANGE ||
                        res == PRETEND_APP_MEM_PROT_CHANGE);
-
-                /* PR 410921 - Revert the changes to all-mems list.
-                 * XXX: This fix assumes the whole region had the prot &
-                 * type, which is true in the cases we have seen so far, but
-                 * theoretically may not be true.  If it isn't true, multiple
-                 * memory areas with different types/protections might have
-                 * been changed in pre_system_call(), so will have to keep a
-                 * list of all vmareas changed.  This might be expensive for
-                 * each mprotect syscall to guard against a rare theoretical bug.
-                 */
-                ASSERT_CURIOSITY(!dcontext->mprot_multi_areas);
-                IF_NO_MEMQUERY(memcache_update_locked(
-                    base, base + size, memprot, -1 /*type unchanged*/, true /*exists*/));
             }
+            /* A protection change does not change image/data identity.  OS
+             * queries recognize an ELF header, not every image segment.  A
+             * grown stack extent may also be newly absent from the cache.
+             */
+            IF_NO_MEMQUERY(memcache_update_locked(cursor, cursor + amount, info.prot,
+                                                  -1 /*type unchanged*/, false));
+            cursor += amount;
         }
         break;
     }
