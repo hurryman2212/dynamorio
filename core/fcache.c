@@ -422,7 +422,8 @@ typedef struct _fcache_unit_t {
 #if defined(SIDELINE) || defined(WINDOWS_PC_SAMPLE)
     dcontext_t *dcontext;
 #endif
-    bool writable; /* remember state of cache memory protection */
+    bool writable;          /* remember state of cache memory protection */
+    bool anonymous_storage; /* allocated here, not an imported or dual-mapped unit */
 #ifdef WINDOWS_PC_SAMPLE
     /* We cache these values for units_to_{flush,free} units whose cache
      * field has been invalidated
@@ -1380,6 +1381,10 @@ fcache_create_unit(dcontext_t *dcontext, fcache_t *cache, cache_pc pc, size_t si
         u = (fcache_unit_t *)nonpersistent_heap_alloc(
             GLOBAL_DCONTEXT, sizeof(fcache_unit_t) HEAPACCT(ACCT_MEM_MGT));
         u->per_thread = false;
+        /* Ordinary units use os_heap_reserve's private anonymous backing.
+         * Imported frozen units and satisfy_w_xor_x's file-backed aliases do
+         * not satisfy that contract. Preserve this origin on dead-list reuse. */
+        u->anonymous_storage = pc == NULL && !DYNAMO_OPTION(satisfy_w_xor_x);
         if (pc != NULL) {
             u->start_pc = pc;
             commit_size = size;
@@ -2990,6 +2995,32 @@ remove_from_free_list(fcache_t *cache, uint bucket,
     });
 }
 
+#ifdef LINUX
+/* The caller owns the allocator interval, after normal fragment retirement or
+ * while emitting an unpublished fragment. Do not infer liveness from unlinking
+ * a fragment or publishing its shared replacement. */
+static void
+discard_unused_cache_pages(fcache_unit_t *unit, cache_pc begin, cache_pc end)
+{
+    ASSERT(CACHE_PROTECTED(unit->cache));
+    ASSERT(begin >= unit->start_pc && end <= unit->end_pc && begin <= end);
+    if (!unit->anonymous_storage || unit->pending_free || unit->cache->is_coarse ||
+        DYNAMO_OPTION(satisfy_w_xor_x) || begin < unit->start_pc || end > unit->end_pc ||
+        begin >= end)
+        return;
+    cache_pc first = (cache_pc)ALIGN_FORWARD(begin, PAGE_SIZE);
+    cache_pc last = (cache_pc)ALIGN_BACKWARD(end, PAGE_SIZE);
+    if (first >= last || vmcode_get_writable_addr(first) != first ||
+        vmcode_get_writable_addr(last - 1) != last - 1)
+        return;
+    /* Keep the reservation, permissions and allocation/commit accounting.
+     * Only dead bytes lose their physical pages; reuse faults zeroed pages. */
+    if (os_heap_discard_unused(first, last - first))
+        LOG(GLOBAL, LOG_CACHE, 4, "discarded unused cache pages " PFX "-" PFX "\n", first,
+            last);
+}
+#endif
+
 /* If freeing a fragment, must pass that as f; else, pass NULL as f */
 static void
 add_to_free_list(dcontext_t *dcontext, fcache_t *cache, fcache_unit_t *unit,
@@ -3114,6 +3145,9 @@ add_to_free_list(dcontext_t *dcontext, fcache_t *cache, fcache_unit_t *unit,
         STATS_FCACHE_ADD(cache, return_last, 1);
         STATS_FCACHE_SUB(cache, claimed, size);
         STATS_SUB(fcache_combined_claimed, size);
+#ifdef LINUX
+        discard_unused_cache_pages(unit, start_pc, start_pc + size);
+#endif
         return;
     }
 
@@ -3141,6 +3175,12 @@ add_to_free_list(dcontext_t *dcontext, fcache_t *cache, fcache_unit_t *unit,
     }
     cache->free_list[bucket] = header;
     /* XXX: case 7318 we should keep sorted */
+#ifdef LINUX
+    /* Coalescing is complete. The list header and footer remain resident and
+     * readable by every allocator walk, even when the interior is discarded. */
+    discard_unused_cache_pages(unit, (cache_pc)(header + 1),
+                               (cache_pc)header + size - sizeof(free_list_footer_t));
+#endif
 
     DOSTATS({
         /* XXX: we could split freed into pure-freed, split-freed, and coalesce-freed */
@@ -3569,6 +3609,15 @@ fcache_return_extra_space(dcontext_t *dcontext, fragment_t *f, size_t space_in)
             STATS_ADD(pad_jmps_excess_wasted_bytes, returnable_space);
         }
     });
+
+#ifdef LINUX
+    /* Commit the compact frame's size before discarding its reclaimed tail.
+     * Interior free entries were handled by add_to_free_list with their own
+     * metadata excluded. FIFO holes are deliberately outside this operation. */
+    if (released && returnable_space > 0 && unit->cur_pc == returnable_start)
+        discard_unused_cache_pages(unit, returnable_start,
+                                   returnable_start + returnable_space);
+#endif
 
     DOLOG(3, LOG_CACHE, {
         if (USE_FIFO_FOR_CACHE(cache))

@@ -4764,6 +4764,22 @@ os_heap_commit(void *p, size_t size, uint prot, heap_error_code_t *error_code)
     return true;
 }
 
+#ifdef LINUX
+/* The caller holds allocator exclusion and proves private anonymous, nonaliased
+ * storage containing no live bytes. VA and protection are unchanged, so no
+ * dynamo vm-area update is needed. A failed discard leaves storage usable. */
+bool
+os_heap_discard_unused(void *base, size_t size)
+{
+    ASSERT(base != NULL && size > 0 && ALIGNED(base, PAGE_SIZE) &&
+           ALIGNED(size, PAGE_SIZE));
+    if (base == NULL || size == 0 || !ALIGNED(base, PAGE_SIZE) ||
+        !ALIGNED(size, PAGE_SIZE) || POINTER_OVERFLOW_ON_ADD(base, size))
+        return false;
+    return dynamorio_syscall(SYS_madvise, 3, base, size, MADV_DONTNEED) == 0;
+}
+#endif
+
 /* caller is required to handle thread synchronization and to update dynamo vm areas */
 void
 os_heap_decommit(void *p, size_t size, heap_error_code_t *error_code)
