@@ -148,6 +148,10 @@ synch_thread_exit(dcontext_t *dcontext);
 bool
 thread_synch_state_no_xfer(dcontext_t *dcontext);
 
+/* Lock-free signal-handler check for a wait whose stack still owns cleanup. */
+bool
+thread_synch_waiting_at_safe_spot(dcontext_t *dcontext);
+
 /* We support calling this from a signal handler that might have interrupted DR
  * holding arbitrary locks.
  */
