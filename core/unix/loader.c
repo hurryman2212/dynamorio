@@ -56,6 +56,7 @@
 #include "tls.h"
 #if defined(LINUX) && defined(X86) && defined(X64)
 #    include "exec_resources.h"
+#    include "stdio_roles.h"
 #    include <fcntl.h>
 #endif
 
@@ -351,6 +352,9 @@ os_loader_exit(void)
     /* Private fini callbacks have consumed the old domain's mangled pointers. */
     privload_tls_reset_pointer_guard();
 #endif
+    /* The private images have already been unloaded. Reattach must not bind
+     * new descriptor aliases through these former FILE object addresses. */
+    privmod_stdin = privmod_stdout = privmod_stderr = NULL;
     if (libdr_opd != NULL) {
         HEAP_ARRAY_FREE(GLOBAL_DCONTEXT, libdr_opd->os_data.segments, module_segment_t,
                         libdr_opd->os_data.alloc_segments, ACCT_OTHER, PROTECTED);
@@ -798,6 +802,9 @@ privload_os_finalize(privmod_t *privmod)
                                                            LIBC_STDIN_NAME, NULL);
     privmod_stderr = (FILE **)get_proc_address_from_os_data(
         &opd->os_data, opd->load_delta, LIBC_STDERR_NAME, NULL);
+#    if defined(X86) && defined(X64)
+    os_stdio_private_loaded();
+#    endif
     /* i#5133: glibc 2.32+ has ld.so call a hardcoded initializer before calling the
      * regular ELF constructors.
      */
