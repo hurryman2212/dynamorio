@@ -67,6 +67,7 @@
 #endif
 
 #if defined(LINUX) && defined(X86) && defined(X64)
+#    include "../unix/exec_resources.h"
 #    include "../unix/thread_suspend.h"
 #endif
 
@@ -4103,7 +4104,7 @@ dr_map_executable_file(const char *filename, dr_map_executable_flags_t flags,
         mflags |= MODLOAD_SKIP_WRITABLE;
     if (filename == NULL)
         return NULL;
-    return privload_map_and_relocate(filename, size, mflags);
+    return privload_map_and_relocate(filename, size, mflags, NULL);
 #endif
 }
 
@@ -4196,6 +4197,24 @@ dr_open_file(const char *fname, uint mode_flags)
 
 #ifdef UNIX
 DR_API
+file_t
+dr_get_application_file(void)
+{
+    return os_get_executable_file();
+}
+
+DR_API
+bool
+dr_set_exec_resource_service(file_t broker_fd)
+{
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    return os_exec_resources_set_service(broker_fd);
+#    else
+    return false;
+#    endif
+}
+
+DR_API
 bool
 dr_set_thread_suspend_service(file_t broker_fd)
 {
@@ -4220,6 +4239,31 @@ dr_adopt_file_descriptor_ex(file_t fd, bool inherit_exec, bool close_on_fork)
     return os_adopt_file_descriptor(fd, inherit_exec, close_on_fork);
 }
 
+DR_API
+file_t
+dr_get_executable_file(void)
+{
+    return os_get_executable_file();
+}
+
+DR_API
+bool
+dr_set_exec_client_data(void *drcontext, uint64 data)
+{
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
+    if (dcontext == NULL || dcontext != get_thread_private_dcontext() ||
+        !(dcontext->client_data->in_pre_syscall ||
+          dcontext->client_data->in_post_syscall))
+        return false;
+    return os_set_exec_client_data(dcontext, data);
+}
+
+DR_API
+uint64
+dr_get_exec_client_data(void)
+{
+    return os_get_exec_client_data();
+}
 #endif
 
 DR_API

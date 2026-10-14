@@ -54,6 +54,10 @@
 #    include <sys/syscall.h>
 #endif
 #include "tls.h"
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    include "exec_resources.h"
+#    include <fcntl.h>
+#endif
 
 #include <dlfcn.h> /* dlsym */
 #ifdef LINUX
@@ -281,13 +285,28 @@ os_loader_init_prologue(void)
         }
     });
     mod->externally_loaded = true;
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    if (DYNAMO_OPTION(early_inject)) {
+        mod->backing_file = os_exec_resource_take(DR_EXEC_RESOURCE_RUNTIME);
+        if (mod->backing_file != INVALID_FILE &&
+            !os_adopt_file_descriptor(mod->backing_file, false, false))
+            ASSERT_NOT_REACHED();
+    }
+#    endif
 #    ifdef LINUX /*i#1285*/
     if (DYNAMO_OPTION(early_inject)) {
         /* libdynamorio isn't visible to gdb so add to the cmd list */
         byte *dr_base = get_dynamorio_dll_start(), *pref_base;
         elf_loader_t dr_ld;
         IF_DEBUG(bool success =)
+#        if defined(X86) && defined(X64)
+        mod->backing_file != INVALID_FILE
+            ? elf_loader_read_headers_fd(&dr_ld, get_dynamorio_library_path(),
+                                         mod->backing_file)
+            : elf_loader_read_headers(&dr_ld, get_dynamorio_library_path());
+#        else
         elf_loader_read_headers(&dr_ld, get_dynamorio_library_path());
+#        endif
         ASSERT(success);
         module_walk_program_headers(dr_base, get_dynamorio_dll_end() - dr_base, false,
                                     false, (byte **)&pref_base, NULL, NULL, NULL, NULL);
@@ -312,6 +331,9 @@ os_loader_init_epilogue(void)
      */
     ASSERT(!printed_gdb_commands);
     printed_gdb_commands = true;
+#    if defined(X86) && defined(X64)
+    os_exec_resources_release_bootstrap();
+#    endif
     if (gdb_priv_cmds_sofar > 0) {
         SYSLOG_INTERNAL_INFO("Paste into GDB to debug DynamoRIO clients:\n"
                              /* Need to turn off confirm for paste to work. */
@@ -521,7 +543,7 @@ overlap_map_file_func(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc
  */
 app_pc
 privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
-                          modload_flags_t flags)
+                          modload_flags_t flags, file_t *backing_file DR_PARAM_OUT)
 {
 #ifdef LINUX
     map_fn_t map_func;
@@ -531,6 +553,8 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
     app_pc base = NULL;
     elf_loader_t loader;
 
+    if (backing_file != NULL)
+        *backing_file = INVALID_FILE;
     ASSERT_OWN_RECURSIVE_LOCK(!TESTANY(MODLOAD_NOT_PRIVLIB, flags), &privload_lock);
     /* get appropriate function */
     /* NOTE: all but the client lib will be added to DR areas list b/c using
@@ -553,7 +577,18 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
         prot_func = os_set_protection;
     }
 
-    if (!elf_loader_read_headers(&loader, filename)) {
+    bool headers;
+#    if defined(X86) && defined(X64)
+    file_t inherited = TESTANY(MODLOAD_NOT_PRIVLIB, flags)
+        ? INVALID_FILE
+        : os_exec_resource_lookup(filename, NULL);
+    headers = inherited == INVALID_FILE
+        ? elf_loader_read_headers(&loader, filename)
+        : elf_loader_read_headers_fd(&loader, filename, inherited);
+#    else
+    headers = elf_loader_read_headers(&loader, filename);
+#    endif
+    if (!headers) {
         /* We may want to move the bitwidth check out if is_elf_so_header_common()
          * but for now we keep that there and do another check here.
          * If loader.buf was not read into it will be all zeroes.
@@ -582,6 +617,26 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
 
         if (!TESTANY(MODLOAD_NOT_PRIVLIB, flags))
             privload_add_gdb_cmd(&loader, filename, TESTANY(MODLOAD_REACHABLE, flags));
+        if (backing_file != NULL) {
+            if (loader.borrowed_fd
+#    if defined(X86) && defined(X64)
+                || loader.fd <= 2
+#    endif
+            ) {
+#    if defined(X86) && defined(X64)
+                /* Retained private ELF backing must not occupy an originally
+                 * closed application standard descriptor. An owned low fd is
+                 * still closed by elf_loader_destroy after this duplication. */
+                *backing_file =
+                    dynamorio_syscall(SYS_fcntl, 3, loader.fd, F_DUPFD_CLOEXEC, 3);
+                if (*backing_file < 0)
+                    *backing_file = INVALID_FILE;
+#    endif
+            } else {
+                *backing_file = loader.fd;
+                loader.borrowed_fd = true;
+            }
+        }
     }
     elf_loader_destroy(&loader);
 
@@ -1033,6 +1088,15 @@ privload_locate(const char *name, privmod_t *dep,
     uint i;
     char *lib_paths;
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    const char *captured_path;
+    if (os_exec_resource_lookup(name, &captured_path) != INVALID_FILE) {
+        snprintf(filename, MAXIMUM_PATH, "%s", captured_path);
+        filename[MAXIMUM_PATH - 1] = 0;
+        *reachable = true;
+        return true;
+    }
+#endif
     /* We may be passed a full path. */
     if (name[0] == '/' && os_file_exists(name, false /*!is_dir*/)) {
         snprintf(filename, MAXIMUM_PATH, "%s", name);
@@ -2102,7 +2166,12 @@ reload_dynamorio(void **init_sp, app_pc conflict_start, app_pc conflict_end)
     byte *cur_dr_end = get_dynamorio_dll_end();
     size_t dr_size = cur_dr_end - cur_dr_map;
     IF_DEBUG(bool success =)
+#        if defined(X86) && defined(X64)
+    elf_loader_read_headers_fd(&dr_ld, get_dynamorio_library_path(),
+                               os_exec_resource_file(DR_EXEC_RESOURCE_RUNTIME));
+#        else
     elf_loader_read_headers(&dr_ld, get_dynamorio_library_path());
+#        endif
     ASSERT(success);
 
     /* XXX: have better strategy for picking base: currently we rely on
@@ -2173,6 +2242,9 @@ reload_dynamorio(void **init_sp, app_pc conflict_start, app_pc conflict_end)
      * first restoring init_sp.  We pass along the current (old) DR's bounds
      * for removal.
      */
+#        if defined(X86) && defined(X64)
+    os_exec_resources_release_bootstrap();
+#        endif
     xfer_to_new_libdr(entry, init_sp, cur_dr_map, dr_size);
 
     ASSERT_NOT_REACHED();
@@ -2214,6 +2286,10 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
     }
 
     kernel_init_sp = (void *)sp;
+    dynamorio_set_envp(envp);
+#        if defined(X86) && defined(X64)
+    apicheck(os_exec_resources_bootstrap(), "Invalid early-exec resource handoff");
+#        endif
 
     /* XXX i#47: for Linux, we can't easily have this option on by default as
      * code like get_application_short_name() called from drpreload before
@@ -2244,8 +2320,6 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
         }
     }
 
-    dynamorio_set_envp(envp);
-
     /* argv[0] doesn't actually have to be the path to the exe, so we put the
      * real exe path in an environment variable.
      */
@@ -2269,7 +2343,22 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
      */
     set_app_args((int *)argc, argv);
 
-    success = elf_loader_read_headers(&exe_ld, exe_path);
+    {
+        const char *descriptor = getenv(DYNAMORIO_VAR_EXE_FD);
+        int file;
+        char trailing;
+#        if defined(X86) && defined(X64)
+        file_t captured = os_exec_resource_file(DR_EXEC_RESOURCE_TARGET);
+        if (captured != INVALID_FILE)
+            success = elf_loader_read_headers_fd(&exe_ld, exe_path, captured);
+        else
+#        endif
+            if (descriptor != NULL && sscanf(descriptor, "%d%c", &file, &trailing) == 1 &&
+                file >= 3)
+            success = elf_loader_read_headers_fd(&exe_ld, exe_path, file);
+        else
+            success = elf_loader_read_headers(&exe_ld, exe_path);
+    }
     apicheck(success,
              "Failed to read app ELF headers.  Check path and "
              "architecture.");
@@ -2390,6 +2479,14 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
 
     privload_setup_auxv(envp, exe_map, exe_ld.load_delta, interp_map, exe_path);
 
+    /* Keep the exact image that was mapped. A later client must not reopen a
+     * replaced pathname or require /proc/self/fd after a namespace change. */
+#        if defined(X86) && defined(X64)
+    if (os_exec_resource_file(DR_EXEC_RESOURCE_TARGET) == exe_ld.fd)
+        os_exec_resource_take(DR_EXEC_RESOURCE_TARGET);
+#        endif
+    os_record_executable_file(exe_ld.fd);
+    exe_ld.borrowed_fd = true;
     elf_loader_destroy(&exe_ld);
 
     /* Initialize the rest of DR *after* we map the app and interp images.  This is

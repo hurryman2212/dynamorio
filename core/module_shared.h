@@ -421,6 +421,8 @@ typedef struct _privmod_t {
     struct _privmod_t *next;
     struct _privmod_t *prev;
     void *os_privmod_data;
+    /* Original readable ELF backing, retained across namespace/path changes. */
+    file_t backing_file;
 } privmod_t;
 
 /* more os independent name */
@@ -474,7 +476,7 @@ typedef enum {
 /* This function is used for loading non-private libs as well as private. */
 app_pc
 privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
-                          modload_flags_t flags);
+                          modload_flags_t flags, file_t *backing_file DR_PARAM_OUT);
 
 /* returns whether they all fit */
 bool

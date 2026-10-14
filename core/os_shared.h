@@ -775,6 +775,14 @@ os_open_protected(const char *fname, int os_open_flags);
 #ifdef UNIX
 bool
 os_adopt_file_descriptor(file_t fd, bool inherit_exec, bool close_on_fork);
+file_t
+os_get_executable_file(void);
+void
+os_record_executable_file(file_t fd);
+bool
+os_set_exec_client_data(dcontext_t *dcontext, uint64 data);
+uint64
+os_get_exec_client_data(void);
 #endif
 file_t
 os_open_directory(const char *fname, int os_open_flags);

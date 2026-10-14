@@ -178,6 +178,13 @@ loader_init_prologue(void)
         privmod_t *mod =
             privload_insert(NULL, privmod_static[i].base, privmod_static[i].size,
                             privmod_static[i].name, privmod_static[i].path);
+        mod->backing_file = privmod_static[i].backing_file;
+        privmod_static[i].backing_file = INVALID_FILE;
+#ifdef UNIX
+        if (mod->backing_file != INVALID_FILE &&
+            !os_adopt_file_descriptor(mod->backing_file, false, false))
+            ASSERT_NOT_REACHED();
+#endif
         mod->is_top_level_client = true;
         mod->is_client = true;
     }
@@ -507,6 +514,7 @@ privload_insert(privmod_t *after, app_pc base, size_t size, const char *name,
     mod->name = name;
     strncpy(mod->path, path, BUFFER_SIZE_ELEMENTS(mod->path));
     mod->os_privmod_data = NULL; /* filled in later */
+    mod->backing_file = INVALID_FILE;
     NULL_TERMINATE_BUFFER(mod->path);
     /* i#489 DT_SONAME is optional and name passed in could be NULL.
      * If so, we get libname from path instead.
@@ -644,7 +652,9 @@ privload_load(const char *filename, privmod_t *dependent, bool client)
     LOG(GLOBAL, LOG_LOADER, 2, "%s: loading %s (depth %d)\n", __FUNCTION__, filename,
         privload_recurse_cnt);
 
-    map = privload_map_and_relocate(filename, &size, client ? MODLOAD_REACHABLE : 0);
+    file_t backing_file = INVALID_FILE;
+    map = privload_map_and_relocate(filename, &size, client ? MODLOAD_REACHABLE : 0,
+                                    &backing_file);
     if (map == NULL) {
         LOG(GLOBAL, LOG_LOADER, 1, "%s: failed to map %s\n", __FUNCTION__, filename);
         return NULL;
@@ -677,6 +687,15 @@ privload_load(const char *filename, privmod_t *dependent, bool client)
      */
     /* Add after its dependent to preserve forward-can-unload order */
     privmod = privload_insert(dependent, map, size, get_shared_lib_name(map), filename);
+    if (privmod != NULL) {
+        privmod->backing_file = backing_file;
+#ifdef UNIX
+        if (dynamo_heap_initialized && backing_file != INVALID_FILE &&
+            !os_adopt_file_descriptor(backing_file, false, false))
+            ASSERT_NOT_REACHED();
+#endif
+    } else if (backing_file != INVALID_FILE)
+        os_close(backing_file);
 
     /* If no heap yet, we'll call finalize later in loader_init() */
     dcontext_t *dcontext = get_thread_private_dcontext();
@@ -737,6 +756,8 @@ privload_unload(privmod_t *privmod)
              */
             privload_unmap_file(privmod);
         }
+        if (privmod->backing_file != INVALID_FILE)
+            IF_UNIX_ELSE(os_close_protected, os_close)(privmod->backing_file);
         HEAP_TYPE_FREE(GLOBAL_DCONTEXT, privmod, privmod_t, ACCT_OTHER, PROTECTED);
         return true;
     }

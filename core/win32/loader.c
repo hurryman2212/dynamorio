@@ -991,13 +991,15 @@ privload_unload_imports(privmod_t *mod)
 /* if anything fails, undoes the mapping and returns NULL */
 app_pc
 privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
-                          modload_flags_t flags)
+                          modload_flags_t flags, file_t *backing_file DR_PARAM_OUT)
 {
     file_t fd;
     app_pc map;
     app_pc pref;
     byte *(*map_func)(file_t, size_t *, uint64, app_pc, uint, map_flags_t);
     bool (*unmap_func)(file_t, size_t);
+    if (backing_file != NULL)
+        *backing_file = INVALID_FILE;
     ASSERT(size != NULL);
     ASSERT_OWN_RECURSIVE_LOCK(!TESTANY(MODLOAD_NOT_PRIVLIB, flags), &privload_lock);
 

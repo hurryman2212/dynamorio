@@ -410,7 +410,7 @@ if(UNIX)
       unix/loader.c)
   if(LINUX)
     if(X86 AND X64)
-      set(OS_SRCS ${OS_SRCS} unix/thread_suspend.c)
+      set(OS_SRCS ${OS_SRCS} unix/exec_resources.c unix/thread_suspend.c)
     endif()
     if(ANDROID)
       set(OS_SRCS ${OS_SRCS} unix/loader_android.c)
@@ -1346,6 +1346,8 @@ dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/aarch64/instr_create_api.h
                  dr_ir_macros_aarch64.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_ir_utils.h dr_ir_utils.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_tools.h dr_tools.h)
+dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_exec_resources.h
+                 dr_exec_resources.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_thread_suspend.h
                  dr_thread_suspend.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/annotations_api.h dr_annotation.h)

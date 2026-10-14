@@ -42,6 +42,9 @@
 #include "instrument.h"
 #include <stddef.h> /* offsetof */
 #include <link.h>   /* Elf_Symndx */
+#ifdef LINUX
+#    include <fcntl.h>
+#endif
 
 typedef union _elf_generic_header_t {
     Elf64_Ehdr elf64;
@@ -290,14 +293,20 @@ elf_loader_init(elf_loader_t *elf, const char *filename)
 {
     memset(elf, 0, sizeof(*elf));
     elf->filename = filename;
+#ifdef LINUX
+    elf->fd = open_syscall(filename, O_RDONLY | O_CLOEXEC, 0);
+    if (elf->fd < 0)
+        elf->fd = INVALID_FILE;
+#else
     elf->fd = os_open(filename, OS_OPEN_READ);
+#endif
     return elf->fd != INVALID_FILE;
 }
 
 void
 elf_loader_destroy(elf_loader_t *elf)
 {
-    if (elf->fd != INVALID_FILE) {
+    if (elf->fd != INVALID_FILE && !elf->borrowed_fd) {
         os_close(elf->fd);
     }
     if (elf->file_map != NULL) {
@@ -381,6 +390,29 @@ elf_loader_read_headers(elf_loader_t *elf, const char *filename)
     if (elf_loader_read_phdrs(elf) == NULL)
         return false;
     return true;
+}
+
+bool
+elf_loader_read_headers_fd(elf_loader_t *elf, const char *filename, file_t fd)
+{
+    memset(elf, 0, sizeof(*elf));
+    elf->filename = filename;
+    elf->fd = fd;
+    elf->borrowed_fd = true;
+    /* A duplicate descriptor shares its open-file offset, including after
+     * fork. Mapping headers avoids competing read/lseek operations and also
+     * works before the runtime heap is initialized. Unfaulted file pages do
+     * not create a second copy of the image. */
+    if (fd == INVALID_FILE || elf_loader_map_file(elf, false) == NULL ||
+        !is_elf_so_header(elf->file_map, elf->file_size))
+        return false;
+    elf->ehdr = elf->file_map;
+    if (elf->ehdr->e_phentsize != sizeof(ELF_PROGRAM_HEADER_TYPE) ||
+        elf->ehdr->e_phoff > elf->file_size ||
+        elf->ehdr->e_phnum >
+            (elf->file_size - elf->ehdr->e_phoff) / sizeof(ELF_PROGRAM_HEADER_TYPE))
+        return false;
+    return elf_loader_read_phdrs(elf) != NULL;
 }
 
 app_pc
