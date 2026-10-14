@@ -273,6 +273,10 @@ struct _fragment_t {
     cache_pc start_pc; /* very top of fragment's code, equals
                         * entry point when indirect branch target */
 
+    ushort client_prepare_size;
+    /* Nonzero only after actual client-requested cache preparation. */
+    uint client_prepare_cookie;
+
     union {
         /* For a live fragment, we store a list of other fragments' exits that target
          * this fragment (outgoing exit stubs are all allocated with fragment_t struct,
@@ -518,6 +522,7 @@ typedef struct _per_thread_t {
     fragment_table_t future;
     mutex_t fragment_delete_mutex;
     file_t tracefile;
+    struct _cache_prepare_job_t *cache_prepare_wait_job;
 
     /* used for unlinking other threads' caches for flushing */
     bool could_be_linking;        /* accessing link data structs? */
@@ -1195,6 +1200,18 @@ extern uint flushtime_global;
 
 extern mutex_t client_flush_request_lock;
 extern client_flush_req_t *client_flush_requests;
+
+bool
+fragment_cache_preparation_pending(void);
+
+bool
+fragment_cache_prepare(dcontext_t *dcontext);
+
+void
+fragment_cache_prepare_cancel(dcontext_t *dcontext);
+
+void
+fragment_cache_prepare_thread_exit(dcontext_t *dcontext);
 
 #ifdef PROFILE_RDTSC
 void

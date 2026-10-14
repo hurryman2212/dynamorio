@@ -168,6 +168,36 @@ DECLARE_CXTSWPROT_VAR(mutex_t client_flush_request_lock,
                       INIT_LOCK_FREE(client_flush_request_lock));
 DECLARE_CXTSWPROT_VAR(client_flush_req_t *client_flush_requests, NULL);
 
+typedef struct _cache_prepare_notification_t {
+    event_t event;
+    struct _cache_prepare_notification_t *next;
+} cache_prepare_notification_t;
+
+typedef struct _cache_prepare_job_t {
+    struct _cache_prepare_job_t *next;
+    dr_cache_prepare_request_t request;
+    dcontext_t *submitter;
+    cache_prepare_notification_t first_notification;
+    cache_prepare_notification_t *notification;
+    uint references;
+    dr_cache_prepare_span_t spans[];
+} cache_prepare_job_t;
+
+/* The queue lock is never held during client callbacks, building or flushing.
+ * Peers wait in nolinking, so the owner can perform exact lazy retirement.
+ */
+DECLARE_CXTSWPROT_VAR(static cache_prepare_job_t *cache_prepare_head, NULL);
+DECLARE_CXTSWPROT_VAR(static cache_prepare_job_t *cache_prepare_tail, NULL);
+DECLARE_CXTSWPROT_VAR(static dcontext_t *cache_prepare_owner, NULL);
+DECLARE_CXTSWPROT_VAR(static int cache_prepare_pending, 0);
+static bool cache_prepare_initialized;
+static bool cache_prepare_closing;
+/* A fatal preparation keeps dispatch entrants parked until process exit.
+ * It is distinct from per-request completion, which still releases waiters'
+ * references after notifying the client and cannot authorize app execution.
+ */
+static event_t cache_prepare_failure_event;
+
 #if defined(RCT_IND_BRANCH) && defined(UNIX)
 /* On Win32 we use per-module tables; on Linux we use a single global table,
  * until we have a module list.
@@ -252,6 +282,359 @@ static void
 coarse_persisted_fill_ibl(dcontext_t *dcontext, coarse_info_t *info,
                           ibl_branch_type_t branch_type);
 #endif
+
+DR_API
+bool
+dr_request_cache_preparation(const dr_cache_prepare_request_t *request)
+{
+#if !defined(LINUX) || !defined(X86) || !defined(X64)
+    return false;
+#else
+    if (request == NULL || request->struct_size != sizeof(*request) ||
+        request->cookie == 0 || request->spans == NULL || request->count == 0 ||
+        request->complete == NULL || request->is_current == NULL ||
+        request->count >
+            (SIZE_MAX - sizeof(cache_prepare_job_t)) / sizeof(dr_cache_prepare_span_t) ||
+        !cache_prepare_initialized || get_thread_private_dcontext() == NULL ||
+        !DYNAMO_OPTION(shared_bbs) || !DYNAMO_OPTION(disable_traces) ||
+        DYNAMO_OPTION(coarse_units) || DYNAMO_OPTION(max_elide_jmp) != 0 ||
+        DYNAMO_OPTION(max_elide_call) != 0 || RUNNING_WITHOUT_CODE_CACHE())
+        return false;
+    for (size_t i = 0; i < request->count; ++i) {
+        if (request->spans[i].start == NULL ||
+            request->spans[i].end <= request->spans[i].start)
+            return false;
+    }
+    size_t size =
+        sizeof(cache_prepare_job_t) + request->count * sizeof(dr_cache_prepare_span_t);
+    cache_prepare_job_t *job = global_unprotected_heap_alloc(size HEAPACCT(ACCT_CLIENT));
+    memset(job, 0, sizeof(*job));
+    job->first_notification.event = create_broadcast_event();
+    job->notification = &job->first_notification;
+    job->references = 1;
+    job->request = *request;
+    job->submitter = get_thread_private_dcontext();
+    memcpy(job->spans, request->spans, request->count * sizeof(dr_cache_prepare_span_t));
+    job->request.spans = job->spans;
+    d_r_mutex_lock(&client_flush_request_lock);
+    if (cache_prepare_closing || cache_prepare_failure_event != NULL) {
+        d_r_mutex_unlock(&client_flush_request_lock);
+        destroy_event(job->notification->event);
+        global_unprotected_heap_free(job, size HEAPACCT(ACCT_CLIENT));
+        return false;
+    }
+    if (cache_prepare_tail != NULL)
+        cache_prepare_tail->next = job;
+    else
+        cache_prepare_head = job;
+    cache_prepare_tail = job;
+    atomic_exchange_int(&cache_prepare_pending, 1);
+    d_r_mutex_unlock(&client_flush_request_lock);
+    return true;
+#endif
+}
+
+bool
+fragment_cache_preparation_pending(void)
+{
+    return atomic_aligned_read_int(&cache_prepare_pending) != 0;
+}
+
+static void
+cache_prepare_release(cache_prepare_job_t *job)
+{
+    d_r_mutex_lock(&client_flush_request_lock);
+    ASSERT(job->references > 0);
+    bool last = --job->references == 0;
+    d_r_mutex_unlock(&client_flush_request_lock);
+    if (last) {
+        cache_prepare_notification_t *notification = job->notification;
+        while (notification != NULL) {
+            cache_prepare_notification_t *next = notification->next;
+            destroy_event(notification->event);
+            if (notification != &job->first_notification)
+                global_unprotected_heap_free(notification,
+                                             sizeof(*notification) HEAPACCT(ACCT_CLIENT));
+            notification = next;
+        }
+        global_unprotected_heap_free(job,
+                                     sizeof(*job) +
+                                         job->request.count *
+                                             sizeof(job->spans[0]) HEAPACCT(ACCT_CLIENT));
+    }
+}
+
+/* Exit callbacks still have live client state. At this point other threads have
+ * been stopped by normal exit synchronization, including a possible producer.
+ */
+void
+fragment_cache_prepare_cancel(dcontext_t *dcontext)
+{
+    if (!cache_prepare_initialized)
+        return;
+    d_r_mutex_lock(&client_flush_request_lock);
+    cache_prepare_closing = true;
+    cache_prepare_job_t *jobs = cache_prepare_head;
+    cache_prepare_head = NULL;
+    cache_prepare_tail = NULL;
+    cache_prepare_owner = NULL;
+    atomic_exchange_int(&cache_prepare_pending, cache_prepare_failure_event != NULL);
+    d_r_mutex_unlock(&client_flush_request_lock);
+    while (jobs != NULL) {
+        cache_prepare_job_t *job = jobs;
+        jobs = job->next;
+        dr_cache_prepare_result_t result = { DR_CACHE_PREPARE_CANCELLED,
+                                             job->request.cookie, 0, 0, NULL };
+        job->request.complete(dcontext, &result, job->request.user_data);
+        signal_event(job->notification->event);
+        cache_prepare_release(job);
+    }
+}
+
+bool
+fragment_cache_prepare(dcontext_t *dcontext)
+{
+    ASSERT(dcontext->bb_build_info == NULL);
+    ASSERT(is_couldbelinking(dcontext));
+    ASSERT_OWN_NO_LOCKS();
+    bool processed = false;
+    per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    for (;;) {
+        d_r_mutex_lock(&client_flush_request_lock);
+        if (cache_prepare_failure_event != NULL) {
+            event_t failure = cache_prepare_failure_event;
+            d_r_mutex_unlock(&client_flush_request_lock);
+            enter_nolinking(dcontext, NULL, false);
+            wait_for_event(failure, 0);
+            ASSERT_NOT_REACHED();
+            dr_abort_with_code(1);
+        }
+        ASSERT(cache_prepare_owner != dcontext);
+        cache_prepare_job_t *job = NULL;
+        cache_prepare_job_t *previous = NULL;
+        cache_prepare_job_t *wait_job = NULL;
+        for (cache_prepare_job_t *pending = cache_prepare_head; pending != NULL;
+             pending = pending->next) {
+            bool required = pending->request.requires_wait == NULL ||
+                pending->request.requires_wait(dcontext, dcontext->next_tag,
+                                               pending->request.user_data);
+            if (cache_prepare_owner == NULL &&
+                (pending->submitter == dcontext ||
+                 (pending->submitter == NULL && required))) {
+                job = pending;
+                break;
+            }
+            if (wait_job == NULL && required)
+                wait_job = pending;
+            previous = pending;
+        }
+        if (job == NULL) {
+            if (cache_prepare_head == NULL && cache_prepare_owner == NULL)
+                atomic_exchange_int(&cache_prepare_pending, 0);
+            if (wait_job != NULL) {
+                ++wait_job->references;
+                ASSERT(pt->cache_prepare_wait_job == NULL);
+                pt->cache_prepare_wait_job = wait_job;
+            }
+            event_t notification =
+                wait_job == NULL ? NULL : wait_job->notification->event;
+            d_r_mutex_unlock(&client_flush_request_lock);
+            if (wait_job == NULL)
+                return processed;
+            /* Waiting in couldbelinking would deadlock an owner's exact-tag
+             * flush. Unrelated threads retain their sufficient existing code.
+             */
+            enter_nolinking(dcontext, NULL, false);
+            wait_for_event(notification, 0);
+            pt->cache_prepare_wait_job = NULL;
+            cache_prepare_release(wait_job);
+            enter_couldbelinking(dcontext, NULL, true);
+            processed = true;
+            continue;
+        }
+        /* Work normally belongs to its submitting task. Move that task's
+         * request ahead of jobs whose submitters have not reached dispatch;
+         * never make a lower-only peer perform somebody else's preparation.
+         */
+        if (previous != NULL) {
+            previous->next = job->next;
+            if (cache_prepare_tail == job)
+                cache_prepare_tail = previous;
+            job->next = cache_prepare_head;
+            cache_prepare_head = job;
+        }
+        cache_prepare_owner = dcontext;
+        d_r_mutex_unlock(&client_flush_request_lock);
+        processed = true;
+
+        const dr_cache_prepare_request_t *request = &job->request;
+        dr_cache_prepare_result_t result = { DR_CACHE_PREPARE_READY, request->cookie, 0,
+                                             0, NULL };
+        if (!request->is_current(dcontext, request->user_data))
+            result.status = DR_CACHE_PREPARE_CANCELLED;
+        else if (request->begin != NULL)
+            request->begin(dcontext, request->cookie, request->user_data);
+        for (size_t i = 0; i < request->count && result.status == DR_CACHE_PREPARE_READY;
+             ++i) {
+            app_pc pc = request->spans[i].start;
+            app_pc validated_stop = pc;
+            while (pc < request->spans[i].end) {
+                if (!(request->is_range_current != NULL
+                          ? request->is_range_current(dcontext, pc, request->spans[i].end,
+                                                      request->user_data)
+                          : request->is_current(dcontext, request->user_data))) {
+                    result.status = DR_CACHE_PREPARE_CANCELLED;
+                    break;
+                }
+                /* Validate readable instruction boundaries without faulting in
+                 * the builder. Limit each bounded build to the compact stored
+                 * length; DR may split earlier for its normal BB limits.
+                 */
+                app_pc stop = validated_stop;
+                while (validated_stop <= pc && stop < request->spans[i].end) {
+                    byte bytes[MAX_INSTR_LENGTH] = { 0 };
+                    size_t size =
+                        MIN(sizeof(bytes), (size_t)(request->spans[i].end - stop));
+                    size_t original_length;
+                    const byte *original =
+                        userspace_gate_original(stop, &original_length);
+                    if (original == NULL) {
+                        if (!d_r_safe_read(stop, size, bytes))
+                            break;
+                        /* Gate publication may have replaced app bytes while
+                         * we copied. Use the same original provider as decode().
+                         */
+                        original = userspace_gate_original(stop, &original_length);
+                    }
+                    if (original != NULL) {
+                        if (original_length > size)
+                            break;
+                        size = original_length;
+                        memcpy(bytes, original, size);
+                    }
+                    instr_noalloc_t noalloc;
+                    instr_noalloc_init(dcontext, &noalloc);
+                    byte *next = decode_from_copy(dcontext, bytes, stop,
+                                                  instr_from_noalloc(&noalloc));
+                    if (next == NULL || next <= bytes || next > bytes + size ||
+                        (size_t)(stop - pc) + (next - bytes) > USHRT_MAX)
+                        break;
+                    stop += next - bytes;
+                }
+                validated_stop = stop;
+                if (stop == pc) {
+                    result.status = DR_CACHE_PREPARE_FAILED;
+                    result.failed_pc = pc;
+                    break;
+                }
+                SHARED_BB_LOCK();
+                fragment_t *f = fragment_lookup_shared_bb(dcontext, pc);
+                bool usable = f != NULL &&
+                    !TESTANY(FRAG_FAKE | FRAG_IS_FUTURE | FRAG_IS_TRACE |
+                                 FRAG_COARSE_GRAIN | FRAG_WAS_DELETED,
+                             f->flags) &&
+                    f->client_prepare_cookie != 0 && f->client_prepare_size != 0 &&
+                    f->client_prepare_size <= (size_t)(stop - pc) &&
+                    (request->reuse == NULL
+                         ? f->client_prepare_cookie == request->cookie
+                         : request->reuse(dcontext, pc, request->cookie,
+                                          f->client_prepare_cookie, request->user_data));
+                if (usable) {
+                    pc += f->client_prepare_size;
+                    ++result.reused;
+                    SHARED_BB_UNLOCK();
+                    continue;
+                }
+                if (f != NULL) {
+                    SHARED_BB_UNLOCK();
+                    enter_nolinking(dcontext, NULL, false);
+                    flush_fragments_synch_unlink_priv(
+                        dcontext, EMPTY_REGION_BASE, EMPTY_REGION_SIZE, false, false,
+                        false, THREAD_SYNCH_NO_LOCKS_NO_XFER _IF_DGCDIAG(NULL));
+                    f = fragment_lookup_shared_bb(dcontext, pc);
+                    fragment_t *list = NULL;
+                    if (f != NULL &&
+                        !TESTANY(FRAG_FAKE | FRAG_IS_FUTURE | FRAG_IS_TRACE |
+                                     FRAG_COARSE_GRAIN | FRAG_WAS_DELETED |
+                                     FRAG_CANNOT_DELETE,
+                                 f->flags)) {
+                        vm_area_remove_fragment(dcontext, f);
+                        f->next_vmarea = NULL;
+                        list = f;
+                    }
+                    flush_fragments_unlink_shared(dcontext, EMPTY_REGION_BASE,
+                                                  EMPTY_REGION_SIZE,
+                                                  list _IF_DGCDIAG(NULL));
+                    flush_fragments_end_synch(dcontext, false);
+                    enter_couldbelinking(dcontext, NULL, true);
+                    SHARED_BB_LOCK();
+                    f = fragment_lookup_shared_bb(dcontext, pc);
+                }
+                app_pc end = NULL;
+                app_pc failed_pc = NULL;
+                if (f == NULL) {
+                    SELF_PROTECT_LOCAL(dcontext, WRITABLE);
+                    f = build_basic_block_fragment_prepare(dcontext, pc, stop, &end,
+                                                           &failed_pc);
+                    SELF_PROTECT_LOCAL(dcontext, READONLY);
+                }
+                if (f == NULL || end == NULL || end <= pc || end > stop ||
+                    end - pc > USHRT_MAX || !TESTANY(FRAG_SHARED, f->flags) ||
+                    TESTANY(FRAG_FAKE | FRAG_IS_FUTURE | FRAG_IS_TRACE |
+                                FRAG_COARSE_GRAIN | FRAG_WAS_DELETED,
+                            f->flags)) {
+                    result.status = DR_CACHE_PREPARE_FAILED;
+                    result.failed_pc = failed_pc == NULL ? pc : failed_pc;
+                } else {
+                    f->client_prepare_size = (ushort)(end - pc);
+                    f->client_prepare_cookie = request->cookie;
+                    ++result.generated;
+                    pc = end;
+                }
+                SHARED_BB_UNLOCK();
+                if (result.status != DR_CACHE_PREPARE_READY)
+                    break;
+            }
+        }
+        if (result.status == DR_CACHE_PREPARE_READY &&
+            !request->is_current(dcontext, request->user_data))
+            result.status = DR_CACHE_PREPARE_CANCELLED;
+        if (result.status == DR_CACHE_PREPARE_CANCELLED && request->cancel != NULL) {
+#if defined(LINUX) && defined(X86) && defined(X64)
+            /* Dispatch may have arrived with a redirect chosen before this
+             * request was cancelled. The callback can retire that mapping.
+             * Keep the saved application state and resume from its original PC.
+             */
+            dcontext->client_userspace_target = NULL;
+            atomic_add_exchange_int64(&dcontext->client_userspace_generation, 1);
+#endif
+            enter_nolinking(dcontext, NULL, false);
+            request->cancel(dcontext, request->user_data);
+            enter_couldbelinking(dcontext, NULL, true);
+        }
+        d_r_mutex_lock(&client_flush_request_lock);
+        ASSERT(cache_prepare_owner == dcontext && cache_prepare_head == job);
+        if (result.status == DR_CACHE_PREPARE_FAILED)
+            cache_prepare_failure_event = create_broadcast_event();
+        cache_prepare_head = job->next;
+        if (cache_prepare_tail == job)
+            cache_prepare_tail = NULL;
+        d_r_mutex_unlock(&client_flush_request_lock);
+        /* complete may release user_data. Remove it from requires_wait readers
+         * first, but keep ownership until the callback has published readiness.
+         */
+        request->complete(dcontext, &result, request->user_data);
+        d_r_mutex_lock(&client_flush_request_lock);
+        cache_prepare_owner = NULL;
+        d_r_mutex_unlock(&client_flush_request_lock);
+        signal_event(job->notification->event);
+        cache_prepare_release(job);
+        if (result.status == DR_CACHE_PREPARE_FAILED) {
+            fragment_cache_prepare_cancel(dcontext);
+            dr_abort_with_code(1);
+        }
+    }
+}
 
 static void
 process_client_flush_requests(dcontext_t *dcontext, dcontext_t *alloc_dcontext,
@@ -1412,6 +1795,10 @@ fragment_init(void)
     /* make sure fields are at same place */
     ASSERT(offsetof(fragment_t, flags) == offsetof(future_fragment_t, flags));
     ASSERT(offsetof(fragment_t, tag) == offsetof(future_fragment_t, tag));
+    IF_X64(ASSERT(offsetof(fragment_t, client_prepare_cookie) + sizeof(uint) ==
+                  offsetof(fragment_t, in_xlate)));
+    cache_prepare_initialized = true;
+    cache_prepare_closing = false;
 
     /* ensure we can read this w/o a lock: no cache line crossing, please */
     ASSERT(ALIGNED(&flushtime_global, 4));
@@ -1699,6 +2086,12 @@ cleanup:
     DELETE_LOCK(tracedump_mutex);
     process_client_flush_requests(NULL, GLOBAL_DCONTEXT, client_flush_requests,
                                   false /* no flush */);
+    ASSERT(cache_prepare_head == NULL);
+    if (cache_prepare_failure_event != NULL) {
+        destroy_event(cache_prepare_failure_event);
+        cache_prepare_failure_event = NULL;
+    }
+    cache_prepare_initialized = false;
     DELETE_LOCK(client_flush_request_lock);
 }
 
@@ -2022,6 +2415,7 @@ fragment_thread_init(dcontext_t *dcontext)
     ASSIGN_INIT_LOCK_FREE(pt->fragment_delete_mutex, fragment_delete_mutex);
 
     pt->could_be_linking = false;
+    pt->cache_prepare_wait_job = NULL;
     pt->wait_for_unlink = false;
     pt->about_to_exit = false;
     pt->flush_queue_nonempty = false;
@@ -2152,6 +2546,33 @@ fragment_thread_reset_free(dcontext_t *dcontext)
 #endif /* !DEBUG */
 }
 
+void
+fragment_cache_prepare_thread_exit(dcontext_t *dcontext)
+{
+    if (!cache_prepare_initialized || !fragment_cache_preparation_pending())
+        return;
+    d_r_mutex_lock(&client_flush_request_lock);
+    for (cache_prepare_job_t *job = cache_prepare_head; job != NULL; job = job->next) {
+        if (job->submitter == dcontext ||
+            (cache_prepare_owner == dcontext && job == cache_prepare_head)) {
+            job->submitter = NULL;
+            /* Wake waiters to select a new owner, without resetting their
+             * notification. All one-shot events remain alive with the job
+             * until its last waiter releases its reference.
+             */
+            cache_prepare_notification_t *notification = global_unprotected_heap_alloc(
+                sizeof(*notification) HEAPACCT(ACCT_CLIENT));
+            notification->event = create_broadcast_event();
+            notification->next = job->notification;
+            job->notification = notification;
+            signal_event(notification->next->event);
+        }
+    }
+    if (cache_prepare_owner == dcontext)
+        cache_prepare_owner = NULL;
+    d_r_mutex_unlock(&client_flush_request_lock);
+}
+
 /* atexit cleanup */
 void
 fragment_thread_exit(dcontext_t *dcontext)
@@ -2161,6 +2582,12 @@ fragment_thread_exit(dcontext_t *dcontext)
     /* case 7966: don't initialize at all for hotp_only & thin_client */
     if (RUNNING_WITHOUT_CODE_CACHE())
         return;
+
+    if (pt->cache_prepare_wait_job != NULL) {
+        cache_prepare_release(pt->cache_prepare_wait_job);
+        pt->cache_prepare_wait_job = NULL;
+    }
+    fragment_cache_prepare_thread_exit(dcontext);
 
     if (TRACEDUMP_ENABLED() && PRIVATE_TRACES_ENABLED()) {
         /* write out all traces prior to deleting any, so links print nicely */
@@ -2201,6 +2628,13 @@ fragment_thread_exited(dcontext_t *dcontext)
 void
 fragment_fork_init(dcontext_t *dcontext)
 {
+    /* Normal fork keeps valid prepared fragments. A vanished producer has no
+     * live stack here; restart its still-queued request in the child instead
+     * of retaining an owner pointer to a destroyed thread context.
+     */
+    if (cache_prepare_owner != NULL && cache_prepare_owner != dcontext) {
+        cache_prepare_owner = NULL;
+    }
     /* XXX: what about global file? */
     per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
     if (TRACEDUMP_ENABLED() && PRIVATE_TRACES_ENABLED()) {
@@ -2279,6 +2713,8 @@ fragment_init_heap(fragment_t *f, app_pc tag, int direct_exits, int indirect_exi
 #endif
 
     f->in_xlate.incoming_stubs = NULL;
+    f->client_prepare_size = 0;
+    f->client_prepare_cookie = 0;
 #ifdef CUSTOM_TRACES_RET_REMOVAL
     f->num_calls = 0;
     f->num_rets = 0;

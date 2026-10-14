@@ -2638,6 +2638,106 @@ DR_API
 bool
 dr_prepopulate_cache(app_pc *tags, size_t tags_count);
 
+/** A caller-verified contiguous basic block, excluding embedded data. */
+typedef struct _dr_cache_prepare_span_t {
+    app_pc start;
+    app_pc end; /**< Exclusive instruction boundary. */
+} dr_cache_prepare_span_t;
+
+typedef enum {
+    DR_CACHE_PREPARE_READY,     /**< Every requested span has executable cache code. */
+    DR_CACHE_PREPARE_CANCELLED, /**< The caller withdrew this source generation. */
+    DR_CACHE_PREPARE_FAILED,    /**< A requested span could not be prepared safely. */
+} dr_cache_prepare_status_t;
+
+typedef struct _dr_cache_prepare_result_t {
+    dr_cache_prepare_status_t status;
+    uint cookie;
+    size_t generated;
+    size_t reused;
+    app_pc failed_pc;
+} dr_cache_prepare_result_t;
+
+/**
+ * Preparation submitted from a controlled client callback. The queue copies
+ * spans and this structure; user_data must remain valid until complete returns.
+ * A cookie is a nonzero, address-space-local identifier for the exact source
+ * generation and client compilation policy. Clients must not recycle cookies
+ * while fragments carrying them can remain alive. Ordinary fork preserves
+ * valid cookies and cache fragments; a new exec image starts a new domain.
+ * Work is performed by the submitting task at its next safe dispatch boundary.
+ * If that task exits, including removal in a normal fork child, a task that
+ * requires the request may take ownership. Unrelated tasks do not prepare it.
+ *
+ * is_current, is_range_current, begin and complete run outside the BB-building
+ * lock. is_current validates the complete request before preparation and before
+ * READY. If supplied, is_range_current validates the current source range before
+ * each bounded emission or reuse, avoiding repeated whole-request validation.
+ * Without it, is_current is also called before each bounded emission or reuse.
+ * Existing
+ * fragments with cookie zero are never reused. A missing reuse callback permits
+ * only an exact nonzero cookie match. A supplied reuse callback runs while the
+ * fragment is protected against replacement and must be a nonblocking, side-
+ * effect-free policy check. Mismatches are replaced through normal safe lazy
+ * retirement, preserving executions and restoration references to old code.
+ *
+ * READY is reported only after actual emission and cache publication, including
+ * DR splits within each span. No application instruction is executed to prepare
+ * code. FAILED is reported before the runtime stops rather than resuming with
+ * incomplete code. CANCELLED never denotes readiness: the caller must withdraw
+ * the obsolete generation or enqueue its replacement before permitting entry.
+ */
+typedef struct _dr_cache_prepare_request_t {
+    size_t struct_size;
+    const dr_cache_prepare_span_t *spans;
+    size_t count;
+    uint cookie;
+    void *user_data;
+    bool (*is_current)(void *drcontext, void *user_data);
+    void (*begin)(void *drcontext, uint cookie, void *user_data);
+    bool (*reuse)(void *drcontext, app_pc tag, uint requested_cookie,
+                  uint observed_cookie, void *user_data);
+    /** Pure, nonblocking check while another thread prepares this request.
+     * False lets this thread continue using an already sufficient execution
+     * version. NULL requires all dispatch entrants to wait. Called under the
+     * request queue lock; may only read immutable request data and this thread's
+     * local state. May not enqueue, allocate, use IPC, invoke application code or
+     * acquire client locks.
+     */
+    bool (*requires_wait)(void *drcontext, app_pc next_tag, void *user_data);
+    void (*complete)(void *drcontext, const dr_cache_prepare_result_t *result,
+                     void *user_data);
+    /** Validates source identity, generation, permissions and original bytes
+     * for [start, end), a nonempty instruction-aligned subrange of one supplied
+     * span. Returning false cancels the request. This does not replace the full
+     * is_current checks before preparation and before publishing READY.
+     */
+    bool (*is_range_current)(void *drcontext, app_pc start, app_pc end, void *user_data);
+    /** Optional retirement callback for cancellation during normal dispatch.
+     * Runs before complete, outside BB/client locks and in a nolinking state,
+     * allowing synchronous unlinking and safe userspace-gate retirement. The
+     * request still owns its queue position; required entrants remain parked.
+     * It must not free user_data: complete retains that responsibility. Shutdown
+     * cancellation does not invoke this callback because app execution will not
+     * resume. Policy-only cancellations may return without retiring anything.
+     */
+    void (*cancel)(void *drcontext, void *user_data);
+} dr_cache_prepare_request_t;
+
+DR_API
+/**
+ * Enqueues preparation for a safe dispatch boundary before either cache or
+ * userspace execution resumes. This call does not recursively build a BB from
+ * a module-load or instrumentation callback. Returns false if the request or
+ * runtime configuration is unsupported; accepted work completes asynchronously.
+ * Currently requires Linux x86-64, shared fine-grained basic blocks, disabled
+ * traces, and zero max_elide_jmp/max_elide_call. Spans must describe decoded,
+ * contiguous application code; unsupported private or native fragments fail
+ * preparation rather than count as ready.
+ */
+bool
+dr_request_cache_preparation(const dr_cache_prepare_request_t *request);
+
 /**
  * Specifies the type of indirect branch for use with dr_prepopulate_indirect_targets().
  */

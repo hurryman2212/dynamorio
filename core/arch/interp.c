@@ -168,6 +168,11 @@ interp_exit(void)
  * B A S I C   B L O C K   B U I L D I N G
  */
 
+typedef struct _cache_prepare_fault_t {
+    dr_jmp_buf_t context;
+    app_pc *failed_pc;
+} cache_prepare_fault_t;
+
 /* we have a lot of data to pass around so we package it in this struct
  * so we can have separate routines for readability
  */
@@ -193,6 +198,8 @@ typedef struct {
                                 */
     bool post_client;          /* has the client already processed the bb? */
     bool for_trace;            /* PR 299808: we tell client if building a trace */
+    cache_prepare_fault_t *prepare_fault;
+    bool prepare_decoding;
 
     /* in and out */
     overlap_info_t *overlap_info; /* if non-null, records overlap information here;
@@ -876,7 +883,14 @@ bb_process_invalid_instr(dcontext_t *dcontext, build_bb_t *bb)
          * avoid this app exception for new opcodes.
          */
         ASSERT(dcontext->bb_build_info == bb);
+        cache_prepare_fault_t *prepare_fault = bb->prepare_fault;
+        if (prepare_fault != NULL)
+            *prepare_fault->failed_pc = bb->instr_start;
         bb_build_abort(dcontext, true /*clean vm area*/, true /*unlock*/);
+        if (prepare_fault != NULL) {
+            DR_LONGJMP(&prepare_fault->context, LONGJMP_EXCEPTION);
+            ASSERT_NOT_REACHED();
+        }
         /* XXX: we use illegal instruction here, even though we
          * know windows uses different exception codes for different
          * types of invalid instructions (for ex. STATUS_INVALID_LOCK
@@ -3389,8 +3403,10 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
             bb->instr_start = bb->cur_pc;
             if (bb->full_decode) {
                 /* only going through this do loop once! */
+                bb->prepare_decoding = bb->prepare_fault != NULL;
                 bb->cur_pc = IF_AARCH64_ELSE(decode_with_ldstex,
                                              decode)(dcontext, bb->cur_pc, bb->instr);
+                bb->prepare_decoding = false;
                 if (bb->record_translation)
                     instr_set_translation(bb->instr, bb->instr_start);
             } else {
@@ -4419,6 +4435,18 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
     }
 }
 
+dr_jmp_buf_t *
+interp_cache_prepare_fault(dcontext_t *dcontext, app_pc target)
+{
+    build_bb_t *bb = (build_bb_t *)dcontext->bb_build_info;
+    if (bb == NULL || bb->prepare_fault == NULL || !bb->prepare_decoding ||
+        !bb->for_cache || !bb->app_interp || target < bb->instr_start ||
+        target - bb->instr_start >= MAX_INSTR_LENGTH)
+        return NULL;
+    *bb->prepare_fault->failed_pc = bb->instr_start;
+    return &bb->prepare_fault->context;
+}
+
 /* Call when about to throw exception or other drastic action in the
  * middle of bb building, in order to free resources
  */
@@ -5029,7 +5057,8 @@ at_native_exec_gateway(dcontext_t *dcontext, app_pc start,
  */
 static inline void
 init_interp_build_bb(dcontext_t *dcontext, build_bb_t *bb, app_pc start,
-                     uint initial_flags, bool for_trace, instrlist_t **unmangled_ilist)
+                     uint initial_flags, bool for_trace, instrlist_t **unmangled_ilist,
+                     cache_prepare_fault_t *prepare_fault)
 {
     ASSERT_OWN_MUTEX(USE_BB_BUILDING_LOCK() && !TESTANY(FRAG_TEMP_PRIVATE, initial_flags),
                      &bb_building_lock);
@@ -5046,6 +5075,7 @@ init_interp_build_bb(dcontext_t *dcontext, build_bb_t *bb, app_pc start,
         initial_flags |
             (INTERNAL_OPTION(store_translations) ? FRAG_HAS_TRANSLATION_INFO : 0),
         NULL /*no overlap*/);
+    bb->prepare_fault = prepare_fault;
     if (!TESTANY(FRAG_TEMP_PRIVATE, initial_flags))
         bb->has_bb_building_lock = true;
     /* We avoid races where there is no hook when we start building a
@@ -5111,10 +5141,11 @@ exit_interp_build_bb(dcontext_t *dcontext, build_bb_t *bb)
  * block is found, and then creates a fragment for the basic block.
  * DOES NOT look in the hashtable to see if such a fragment already exists!
  */
-fragment_t *
-build_basic_block_fragment(dcontext_t *dcontext, app_pc start, uint initial_flags,
-                           bool link, bool visible, bool for_trace,
-                           instrlist_t **unmangled_ilist)
+static fragment_t *
+build_basic_block_fragment_ex(dcontext_t *dcontext, app_pc start, uint initial_flags,
+                              bool link, bool visible, bool for_trace,
+                              instrlist_t **unmangled_ilist, app_pc stop_pc,
+                              app_pc *end_pc, cache_prepare_fault_t *prepare_fault)
 {
     fragment_t *f;
     build_bb_t bb;
@@ -5131,7 +5162,12 @@ build_basic_block_fragment(dcontext_t *dcontext, app_pc start, uint initial_flag
      */
     image_entry = check_for_image_entry(start);
 
-    init_interp_build_bb(dcontext, &bb, start, initial_flags, for_trace, unmangled_ilist);
+    init_interp_build_bb(dcontext, &bb, start, initial_flags, for_trace, unmangled_ilist,
+                         prepare_fault);
+    if (stop_pc != NULL) {
+        bb.stop_pc = stop_pc;
+        bb.full_decode = true;
+    }
     if (at_native_exec_gateway(dcontext, start,
                                &bb.native_call _IF_DEBUG(false /*not xfer tgt*/))) {
         DODEBUG({ report_native_module(dcontext, bb.start_pc); });
@@ -5154,7 +5190,7 @@ build_basic_block_fragment(dcontext_t *dcontext, app_pc start, uint initial_flag
             vm_area_destroy_list(dcontext, bb.vmlist);
             dcontext->bb_build_info = NULL;
             init_interp_build_bb(dcontext, &bb, start, initial_flags, for_trace,
-                                 unmangled_ilist);
+                                 unmangled_ilist, prepare_fault);
             /* PR 232617 - build_native_exec_bb doesn't support setting
              * translation info, but it also doesn't pass the built bb to the
              * client (it contains no app code) so we don't need it. */
@@ -5214,11 +5250,43 @@ build_basic_block_fragment(dcontext_t *dcontext, app_pc start, uint initial_flag
     });
 #endif
 
+    if (end_pc != NULL && !bb.native_exec)
+        *end_pc = bb.end_pc;
     exit_interp_build_bb(dcontext, &bb);
 build_basic_block_fragment_done:
     dcontext->whereami = wherewasi;
     KSTOP(bb_building);
     return f;
+}
+
+fragment_t *
+build_basic_block_fragment(dcontext_t *dcontext, app_pc start, uint initial_flags,
+                           bool link, bool visible, bool for_trace,
+                           instrlist_t **unmangled_ilist)
+{
+    return build_basic_block_fragment_ex(dcontext, start, initial_flags, link, visible,
+                                         for_trace, unmangled_ilist, NULL, NULL, NULL);
+}
+
+fragment_t *
+build_basic_block_fragment_prepare(dcontext_t *dcontext, app_pc start, app_pc stop_pc,
+                                   app_pc *end_pc, app_pc *failed_pc)
+{
+    *end_pc = NULL;
+    *failed_pc = NULL;
+    cache_prepare_fault_t fault = { .failed_pc = failed_pc };
+    dr_where_am_i_t wherewasi = dcontext->whereami;
+    if (DR_SETJMP(&fault.context) == 0)
+        return build_basic_block_fragment_ex(dcontext, start, 0, true, true, false, NULL,
+                                             stop_pc, end_pc, &fault);
+    /* Normal bb_build_abort has cleaned the partial block and released its
+     * lock. Restore the caller's contract before reporting FAILED in dispatch.
+     */
+    ASSERT(dcontext->bb_build_info == NULL);
+    SELF_PROTECT_LOCAL(dcontext, WRITABLE);
+    SHARED_BB_LOCK();
+    dcontext->whereami = wherewasi;
+    return NULL;
 }
 
 /* Builds an instrlist_t as though building a bb from pretend_pc, but decodes

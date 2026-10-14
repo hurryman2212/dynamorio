@@ -913,6 +913,7 @@ instrument_exit_event(void)
     /* support dr_get_mcontext() from the exit event */
     if (!standalone_library)
         get_thread_private_dcontext()->client_data->mcontext_in_dcontext = true;
+    fragment_cache_prepare_cancel(get_thread_private_dcontext());
     call_all(exit_callbacks, int (*)(void));
 }
 
@@ -1559,6 +1560,7 @@ instrument_thread_exit_event(dcontext_t *dcontext)
     dcontext->client_data->mcontext_in_dcontext = true;
     /* Note - currently own initexit lock when this is called (see PR 227619). */
     call_all(thread_exit_callbacks, int (*)(void *), (void *)dcontext);
+    fragment_cache_prepare_thread_exit(dcontext);
 }
 
 void

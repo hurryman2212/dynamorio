@@ -1443,6 +1443,10 @@ build_basic_block_fragment(dcontext_t *dcontext, app_pc start_pc, uint initial_f
                            bool linked, bool visible, bool for_trace,
                            instrlist_t **unmangled_ilist);
 
+fragment_t *
+build_basic_block_fragment_prepare(dcontext_t *dcontext, app_pc start_pc, app_pc stop_pc,
+                                   app_pc *end_pc, app_pc *failed_pc);
+
 void
 interp(dcontext_t *dcontext);
 uint
@@ -1693,6 +1697,11 @@ typedef struct dr_jmp_buf_t {
     kernel_sigset_t sigmask;
 #endif
 } dr_jmp_buf_t;
+
+/* Only enabled during the core source decoder, outside client callbacks. */
+dr_jmp_buf_t *
+interp_cache_prepare_fault(dcontext_t *dcontext, app_pc target);
+
 int
 dr_longjmp(dr_jmp_buf_t *buf, int val);
 int
