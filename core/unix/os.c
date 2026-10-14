@@ -3954,11 +3954,13 @@ os_new_thread_pre(dcontext_t *dcontext, bool client_thread)
     uint attempts = 0;
     while (true) {
         __atomic_add_fetch(&uninit_thread_count, 1, __ATOMIC_SEQ_CST);
-        if (!__atomic_load_n(&thread_creation_closed, __ATOMIC_SEQ_CST))
+        if (!__atomic_load_n(&thread_creation_closed, __ATOMIC_SEQ_CST) &&
+            !__atomic_load_n(&dcontext->thread_record->group_exit_requested,
+                             __ATOMIC_SEQ_CST))
             return true;
         __atomic_sub_fetch(&uninit_thread_count, 1, __ATOMIC_SEQ_CST);
         /* No signal inheritance, child stack or TLS transition exists yet.
-         * A final exit won the race: app creators must remain safely terminable,
+         * An exit won the race: app creators must remain safely terminable,
          * while a client creation request can report failure without waiting. */
         if (client_thread)
             return false;
@@ -8715,6 +8717,24 @@ handle_exit(dcontext_t *dcontext)
 
     d_r_mutex_lock(&thread_initexit_lock);
 #ifdef LINUX
+    if (dcontext->sys_num == SYSNUM_EXIT_PROCESS) {
+        /* Close this group before settling accepted children. A child that
+         * publishes during the drain inherits closure in add_thread, so the
+         * later member snapshot stays complete across synchronization waits.
+         */
+        const runtime_thread_id_t closing_group = get_runtime_thread_group();
+        thread_record_t **closing_threads;
+        int closing_count;
+        get_list_of_threads_ex(&closing_threads, &closing_count, true /*include execve*/);
+        for (int i = 0; i < closing_count; ++i) {
+            if (closing_threads[i]->runtime_group == closing_group)
+                (void)__atomic_exchange_n(&closing_threads[i]->group_exit_requested, true,
+                                          __ATOMIC_SEQ_CST);
+        }
+        global_heap_free(closing_threads,
+                         closing_count *
+                             sizeof(*closing_threads) HEAPACCT(ACCT_THREAD_MGT));
+    }
     /* A successful CLONE_VM child may still be absent from the thread list.
      * Decide which groups survive only after its startup record is published.
      * Waiting later during cleanup is too late: it can destroy the shared
