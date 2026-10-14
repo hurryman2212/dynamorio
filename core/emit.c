@@ -42,6 +42,7 @@
 #include "globals.h"
 #include "link.h"
 #include "fragment.h"
+#include "fragment_shared.h"
 #include "fcache.h"
 #include "proc.h"
 #include "instrlist.h"
@@ -399,6 +400,8 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
     dr_isa_mode_t isa_mode;
     uint mode_flags;
 
+    bool shared_candidate;
+
     KSTART(emit);
     /* we do entire cache b/c links may touch many units
      * XXX: change to lazier version triggered by segfaults or something?
@@ -430,6 +433,9 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
     else if (dr_get_isa_mode(dcontext) == DR_ISA_IA32)
         flags |= FRAG_X86_TO_X64;
 #endif
+    shared_candidate = fragment_shared_candidate(dcontext, ilist, flags);
+    if (shared_candidate)
+        fragment_shared_add_entry(dcontext, ilist);
     for (inst = instrlist_first(ilist); inst; inst = instr_get_next(inst)) {
         /* Since decode_fragment needs to be able to decode from the code
          * cache, we require that each fragment has a single mode
@@ -572,6 +578,7 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
                         num_indirect_stubs, stub_size_total + extra_jmp_padding_stubs,
                         flags);
     ASSERT(f != NULL);
+    f->shared_entry_size = shared_candidate ? 5 : 0;
     DOSTATS({
         /* PR 217008: avoid gcc warning from truncation assert in XSTATS_TRACK_MAX:
          * "comparison is always true due to limited range of data type"
@@ -756,6 +763,9 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
         /* bb-only finalization */
     }
     mangle_finalize(dcontext, ilist, f);
+
+    if (shared_candidate)
+        fragment_shared_publish(dcontext, f, ilist);
 
     /* add fragment to vm area lists */
     vm_area_add_fragment(dcontext, f, vmlist);

@@ -52,6 +52,7 @@
 #include "dr_tools.h"
 #include "ir_utils.h"
 #include "../fragment.h"
+#include "../fragment_shared.h"
 #include "../fcache.h"
 #include "../emit.h"
 #include "../link.h"
@@ -5744,6 +5745,14 @@ dr_insert_clean_call_ex_varg(void *drcontext, instrlist_t *ilist, instr_t *where
     instrlist_set_our_mangling(ilist, true);
     if (TESTANY(DR_CLEANCALL_RETURNS_TO_NATIVE, save_flags))
         call_flags |= META_CALL_RETURNS_TO_NATIVE;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Normalize only the callee transfer, without borrowing R11 or changing the
+     * save/restore helpers. Explicit INDIRECT requests retain their API behavior.
+     */
+    if (fragment_shared_compact_enabled() && X64_MODE_DC(dcontext) &&
+        !DYNAMO_OPTION(satisfy_w_xor_x) && !TESTANY(DR_CLEANCALL_INDIRECT, save_flags))
+        call_flags |= META_CALL_TARGET_CELL;
+#endif
     insert_meta_call_vargs(dcontext, ilist, insert_at, call_flags, encode_pc, callee,
                            num_args, args);
     instrlist_set_our_mangling(ilist, false);
@@ -6621,15 +6630,17 @@ dr_insert_cbr_instrumentation_help(void *drcontext, instrlist_t *ilist, instr_t 
      * how the context switch code is inserted.
      */
     while (!instr_opcode_valid(app_flags_ok) ||
-           instr_get_opcode(app_flags_ok) != OP_call) {
+           (instr_get_opcode(app_flags_ok) != OP_call &&
+            !clean_call_targets(app_flags_ok, (app_pc)callee))) {
         app_flags_ok = instr_get_next(app_flags_ok);
         CLIENT_ASSERT(app_flags_ok != NULL,
                       "dr_insert_cbr_instrumentation: cannot find call instr");
         if (instr_get_opcode(app_flags_ok) == OP_popf)
             break;
     }
-    if (instr_get_opcode(app_flags_ok) == OP_call) {
-        if (opnd_get_pc(instr_get_target(app_flags_ok)) == (app_pc)callee) {
+    if (instr_get_opcode(app_flags_ok) == OP_call ||
+        clean_call_targets(app_flags_ok, (app_pc)callee)) {
+        if (clean_call_targets(app_flags_ok, (app_pc)callee)) {
             /* call to clean callee
              * move a few instrs back till right before push xbx, or mov rbx => r3
              */

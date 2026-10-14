@@ -2108,7 +2108,12 @@ drreg_event_restore_state_without_ilist(void *drcontext, bool restore_memory,
     while (pc < info->raw_mcontext->pc) {
         instr_reset(drcontext, &inst);
         IF_DEBUG(prev_pc = pc;)
-        pc = decode(drcontext, pc, &inst);
+        pc = dr_decode_fragment_instruction(drcontext, info->fragment_info.cache_start_pc,
+                                            pc, &inst);
+        if (pc == NULL) {
+            instr_free(drcontext, &inst);
+            return false;
+        }
         if (is_our_spill_or_restore(drcontext, &inst, &spill, &reg, &slot, &offs)) {
             LOG(drcontext, DR_LOG_ALL, 3,
                 "%s @" PFX " found %s to %s offs=0x%x => slot %d\n", __FUNCTION__,

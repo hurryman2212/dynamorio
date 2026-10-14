@@ -469,6 +469,8 @@ typedef enum {
     META_CALL_RETURNS = 0x0002,
     /* alias of DR_CLEANCALL_RETURNS_TO_NATIVE */
     META_CALL_RETURNS_TO_NATIVE = 0x0004,
+    /* Use an immutable reachable target cell for the callee transfer only. */
+    META_CALL_TARGET_CELL = 0x0008,
 } meta_call_flags_t;
 
 cache_pc
@@ -1602,6 +1604,14 @@ void
 clean_call_opt_init(void);
 void
 clean_call_opt_exit(void);
+#if defined(LINUX) && defined(X86) && defined(X64)
+app_pc *
+clean_call_target_cell(app_pc callee);
+#endif
+#ifdef X86
+bool
+clean_call_targets(instr_t *instr, app_pc callee);
+#endif
 bool
 analyze_clean_call(dcontext_t *dcontext, clean_call_info_t *cci, instr_t *where,
                    void *callee, bool save_fpstate, bool always_out_of_line,

@@ -42,6 +42,7 @@
 #include "../globals.h"
 #include "../link.h"
 #include "../fragment.h"
+#include "../fragment_shared.h"
 
 #include "arch.h"
 #include "instr.h"
@@ -884,7 +885,7 @@ recreate_app_state_from_info(dcontext_t *tdcontext, const translation_info_t *in
          */
         instr_reset(tdcontext, &instr);
         prev_cpc = cpc;
-        cpc = decode(tdcontext, cpc, &instr);
+        cpc = dr_decode_fragment_instruction(tdcontext, start_cache, cpc, &instr);
         if (cpc == NULL) {
             LOG(THREAD_GET, LOG_INTERP, 2,
                 "recreate_app -- failed to decode cache pc " PFX "\n", cpc);
@@ -1472,6 +1473,7 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
         cache_pc cti_pc;
         instrlist_t *ilist = NULL;
         fragment_t *f = owning_f;
+        bool shared_coordinates = false;
         bool alloc = false;
         dr_isa_mode_t old_mode;
 #ifdef WINDOWS
@@ -1504,6 +1506,15 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
          */
         if (f == NULL)
             f = fragment_pclookup_with_linkstubs(tdcontext, mcontext->pc, &alloc);
+
+        /* Preserve original ilist coordinates for core, drreg and drbbdup
+         * spill restoration, including the jump after a private instruction.
+         */
+        if (f != NULL) {
+            cache_pc original = fragment_shared_original_pc(f, mcontext->pc);
+            shared_coordinates = original != mcontext->pc;
+            mcontext->pc = original;
+        }
 
         /* If the passed-in fragment is fake, we need to get the linkstubs */
         if (f != NULL && TESTANY(FRAG_FAKE, f->flags)) {
@@ -1575,6 +1586,8 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
         /* if pc is in an exit stub, we find the corresponding exit instr */
         cti_pc = NULL;
         for (l = FRAGMENT_EXIT_STUBS(f); l; l = LINKSTUB_NEXT_EXIT(l)) {
+            if (shared_coordinates)
+                break;
             if (EXIT_HAS_LOCAL_STUB(l->flags, f->flags)) {
                 /* XXX: as computing the stub pc becomes more expensive,
                  * should perhaps check fragment_body_end_pc() or something
@@ -1603,7 +1616,7 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
                 "\ttarget " PFX " is inside an exit stub, looking for its cti "
                 " " PFX "\n",
                 mcontext->pc, cti_pc);
-            mcontext->pc = cti_pc;
+            mcontext->pc = fragment_shared_original_pc(f, cti_pc);
         }
 
         /* Recreate in same mode as original fragment */
@@ -1624,12 +1637,12 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
                    INTERNAL_OPTION(safe_translate_flushed));
             res = recreate_app_state_from_info(
                 tdcontext, FRAGMENT_TRANSLATION_INFO(f), (byte *)f->start_pc,
-                (byte *)f->start_pc + f->size, mcontext, just_pc _IF_DEBUG(f->flags));
+                fragment_shared_original_end(f), mcontext, just_pc _IF_DEBUG(f->flags));
             STATS_INC(recreate_via_stored_info);
         } else {
             res = recreate_app_state_from_ilist(
                 tdcontext, ilist, (byte *)f->tag, (byte *)FCACHE_ENTRY_PC(f),
-                (byte *)f->start_pc + f->size, mcontext, just_pc, f->flags);
+                fragment_shared_original_end(f), mcontext, just_pc, f->flags);
             STATS_INC(recreate_via_app_ilist);
         }
         DEBUG_DECLARE(ok =) dr_set_isa_mode(tdcontext, old_mode, NULL);

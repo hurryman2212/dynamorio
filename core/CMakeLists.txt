@@ -195,6 +195,7 @@ set(CORE_SRCS
     options.c
     dynamo.c
     fragment.c
+    fragment_shared.c
     fcache.c
     link.c
     dispatch.c

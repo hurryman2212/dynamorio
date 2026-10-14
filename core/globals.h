@@ -365,8 +365,9 @@ typedef struct _client_to_do_list_t {
 /* Clients need a separate list to queue up flush requests from dr_flush() */
 typedef struct _client_flush_req_t {
     app_pc start;
-    size_t size;
-    uint flush_id; /* client supplied identifier for this flush */
+    size_t size;          /* Zero denotes an exact shared-fragment promotion at start. */
+    uint flush_id;        /* client flush identifier, or exact promotion recipe serial */
+    uint promotion_delay; /* Dispatch boundaries before retrying a busy promotion. */
     void (*flush_callback)(int);
     struct _client_flush_req_t *next;
 } client_flush_req_t;

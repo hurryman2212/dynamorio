@@ -412,13 +412,14 @@ struct _fcache;
 #define UNIT_RESERVED_SIZE(u) ((size_t)((u)->reserved_end_pc - (u)->start_pc))
 
 typedef struct _fcache_unit_t {
-    cache_pc start_pc;        /* start address of fcache storage */
-    cache_pc end_pc;          /* end address of committed storage, open-ended */
-    cache_pc cur_pc;          /* if not filled up yet, bottom of cache */
-    cache_pc reserved_end_pc; /* reservation end address, open-ended */
-    size_t size;              /* committed size: equals (end_pc - start_pc) */
-    bool full;                /* to tell whether cache is filled to end */
-    struct _fcache *cache;    /* up-pointer to parent cache */
+    fragment_t *immutable_fragment; /* non-allocator view, indexed separately */
+    cache_pc start_pc;              /* start address of fcache storage */
+    cache_pc reserved_end_pc;       /* reservation end address, open-ended */
+    cache_pc end_pc;                /* end address of committed storage, open-ended */
+    cache_pc cur_pc;                /* if not filled up yet, bottom of cache */
+    size_t size;                    /* committed size: equals (end_pc - start_pc) */
+    bool full;                      /* to tell whether cache is filled to end */
+    struct _fcache *cache;          /* up-pointer to parent cache */
 #if defined(SIDELINE) || defined(WINDOWS_PC_SAMPLE)
     dcontext_t *dcontext;
 #endif
@@ -1141,6 +1142,30 @@ fcache_lookup_unit(cache_pc pc)
     return (fcache_unit_t *)vmvector_lookup(fcache_unit_areas, pc);
 }
 
+void *
+fcache_register_shared_view(fragment_t *fragment, cache_pc start, size_t size)
+{
+    /* The lookup prefix identifies these registrations before any allocator
+     * field is touched. Immutable views have no allocator/list/protection state.
+     */
+    ASSERT(offsetof(fcache_unit_t, end_pc) == sizeof(fcache_shared_view_t));
+    fcache_shared_view_t *view = global_heap_alloc(sizeof(*view) HEAPACCT(ACCT_FRAGMENT));
+    view->immutable_fragment = fragment;
+    view->start_pc = start;
+    view->reserved_end_pc = start + size;
+    vmvector_add(fcache_unit_areas, start, start + size, view);
+    return view;
+}
+
+void
+fcache_unregister_shared_view(void *registration)
+{
+    fcache_shared_view_t *view = registration;
+    ASSERT(view != NULL && view->immutable_fragment != NULL);
+    vmvector_remove(fcache_unit_areas, view->start_pc, view->reserved_end_pc);
+    global_heap_free(view, sizeof(*view) HEAPACCT(ACCT_FRAGMENT));
+}
+
 /* Returns the fragment_t whose body (not cache slot) contains lookup_pc */
 fragment_t *
 fcache_fragment_pclookup(dcontext_t *dcontext, cache_pc lookup_pc, fragment_t *wrapper)
@@ -1150,6 +1175,8 @@ fcache_fragment_pclookup(dcontext_t *dcontext, cache_pc lookup_pc, fragment_t *w
     fcache_unit_t *unit = fcache_lookup_unit(lookup_pc);
     if (unit == NULL)
         return NULL;
+    if (unit->immutable_fragment != NULL)
+        return unit->immutable_fragment;
     LOG(THREAD, LOG_CACHE, 5, "fcache_fragment_pclookup " PFX " -> " PFX "-" PFX "\n",
         lookup_pc, unit->start_pc, unit->end_pc);
     if (unit->cache->is_coarse) {
@@ -1255,6 +1282,8 @@ fcache_pc_in_live_unit(fcache_t *cache, cache_pc pc)
             return true;
     }
     unit = fcache_lookup_unit(pc);
+    if (unit != NULL && unit->immutable_fragment != NULL)
+        return true;
     /* pending flush is still considered live: removed from all lists
      * just prior to flush synch
      */
@@ -1380,6 +1409,7 @@ fcache_create_unit(dcontext_t *dcontext, fcache_t *cache, cache_pc pc, size_t si
         /* use global heap b/c this can be re-used by later threads */
         u = (fcache_unit_t *)nonpersistent_heap_alloc(
             GLOBAL_DCONTEXT, sizeof(fcache_unit_t) HEAPACCT(ACCT_MEM_MGT));
+        u->immutable_fragment = NULL;
         u->per_thread = false;
         /* Ordinary units use os_heap_reserve's private anonymous backing.
          * Imported frozen units and satisfy_w_xor_x's file-backed aliases do
@@ -3004,9 +3034,9 @@ discard_unused_cache_pages(fcache_unit_t *unit, cache_pc begin, cache_pc end)
 {
     ASSERT(CACHE_PROTECTED(unit->cache));
     ASSERT(begin >= unit->start_pc && end <= unit->end_pc && begin <= end);
-    if (!unit->anonymous_storage || unit->pending_free || unit->cache->is_coarse ||
-        DYNAMO_OPTION(satisfy_w_xor_x) || begin < unit->start_pc || end > unit->end_pc ||
-        begin >= end)
+    if (!unit->anonymous_storage || unit->immutable_fragment != NULL ||
+        unit->pending_free || unit->cache->is_coarse || DYNAMO_OPTION(satisfy_w_xor_x) ||
+        begin < unit->start_pc || end > unit->end_pc || begin >= end)
         return;
     cache_pc first = (cache_pc)ALIGN_FORWARD(begin, PAGE_SIZE);
     cache_pc last = (cache_pc)ALIGN_BACKWARD(end, PAGE_SIZE);
@@ -4656,7 +4686,7 @@ coarse_info_t *
 get_fcache_coarse_info(cache_pc pc)
 {
     fcache_unit_t *unit = fcache_lookup_unit(pc);
-    if (unit == NULL || unit->cache == NULL)
+    if (unit == NULL || unit->immutable_fragment != NULL || unit->cache == NULL)
         return NULL;
     ASSERT((unit->cache->is_coarse && unit->cache->coarse_info != NULL) ||
            (!unit->cache->is_coarse && unit->cache->coarse_info == NULL));

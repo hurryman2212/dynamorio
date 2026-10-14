@@ -89,6 +89,19 @@ fcache_init(void);
 void
 fcache_exit(void);
 
+/* Immutable views use the address index, never the mutable cache allocator. */
+typedef struct {
+    fragment_t *immutable_fragment;
+    cache_pc start_pc;
+    cache_pc reserved_end_pc;
+} fcache_shared_view_t;
+
+void *
+fcache_register_shared_view(fragment_t *fragment, cache_pc start, size_t size);
+
+void
+fcache_unregister_shared_view(void *registration);
+
 bool
 fcache_check_option_compatibility(void);
 

@@ -52,6 +52,13 @@
 
 /* hashtable for storing analyzed callee info */
 static generic_table_t *callee_info_table;
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Published under callee_info_table's lock. Cells outlive every generated fragment,
+ * including private bindings retained after an in-place shared-body adoption.
+ * Keep this independent of callee analysis: -opt_cleancall 0 needs cells too.
+ */
+static generic_table_t *callee_target_table;
+#endif
 /* we only free callee info at exit, when callee_info_table_exit is true. */
 static bool callee_info_table_exit = false;
 #define INIT_HTABLE_SIZE_CALLEE 6 /* should remain small */
@@ -197,6 +204,81 @@ callee_info_table_add(callee_info_t *ci)
     return info;
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+static void
+callee_target_free(dcontext_t *dcontext, void *cell)
+{
+    heap_reachable_free(GLOBAL_DCONTEXT, cell, sizeof(app_pc) HEAPACCT(ACCT_CLEANCALL));
+}
+
+app_pc *
+clean_call_target_cell(app_pc callee)
+{
+    app_pc *cell;
+    TABLE_RWLOCK(callee_info_table, write, lock);
+    if (callee_target_table == NULL) {
+        /* A small lazy table. The payload is the only memory referenced by code.
+         * Its own lock is acquired after releasing the initialization lock.
+         */
+        callee_target_table = generic_hash_create(
+            GLOBAL_DCONTEXT, 4, 80, HASHTABLE_SHARED | HASHTABLE_PERSISTENT,
+            callee_target_free _IF_DEBUG("callee-target cells"));
+    }
+    TABLE_RWLOCK(callee_info_table, write, unlock);
+    TABLE_RWLOCK(callee_target_table, write, lock);
+    cell = generic_hash_lookup(GLOBAL_DCONTEXT, callee_target_table, (ptr_uint_t)callee);
+    if (cell == NULL) {
+        cell =
+            heap_reachable_alloc(GLOBAL_DCONTEXT, sizeof(*cell) HEAPACCT(ACCT_CLEANCALL));
+        /* Include future cache allocations and shared private islands, not only
+         * the currently committed code cache. Unsupported layouts keep the
+         * ordinary call form without dereferencing an unreachable cell.
+         */
+        if (!rel32_reachable_from_vmcode((byte *)cell)) {
+            heap_reachable_free(GLOBAL_DCONTEXT, cell,
+                                sizeof(*cell) HEAPACCT(ACCT_CLEANCALL));
+            cell = NULL;
+        } else {
+            *cell = callee;
+            generic_hash_add(GLOBAL_DCONTEXT, callee_target_table, (ptr_uint_t)callee,
+                             cell);
+        }
+    }
+    TABLE_RWLOCK(callee_target_table, write, unlock);
+    return cell;
+}
+#endif
+
+#ifdef X86
+bool
+clean_call_targets(instr_t *instr, app_pc callee)
+{
+    if (!instr_opcode_valid(instr) || !instr_is_call(instr))
+        return false;
+    opnd_t target = instr_get_target(instr);
+    if (opnd_is_pc(target))
+        return opnd_get_pc(target) == callee;
+#    if defined(LINUX) && defined(X64)
+    if (opnd_is_rel_addr(target)) {
+        /* Identify only our cell for this callee. Never dereference an arbitrary
+         * memory operand supplied by a client or application instruction.
+         */
+        TABLE_RWLOCK(callee_info_table, read, lock);
+        generic_table_t *table = callee_target_table;
+        TABLE_RWLOCK(callee_info_table, read, unlock);
+        if (table == NULL)
+            return false;
+        TABLE_RWLOCK(table, read, lock);
+        app_pc *cell = generic_hash_lookup(GLOBAL_DCONTEXT, table, (ptr_uint_t)callee);
+        bool matches = cell != NULL && opnd_get_addr(target) == (app_pc)cell;
+        TABLE_RWLOCK(table, read, unlock);
+        return matches;
+    }
+#    endif
+    return false;
+}
+#endif
+
 /****************************************************************************/
 /* clean call optimization code */
 
@@ -246,7 +328,7 @@ check_callee_instr(dcontext_t *dcontext, callee_info_t *ci, app_pc next_pc)
         return NULL;
     instr = instrlist_last(ilist);
     cur_pc = instr_get_app_pc(instr);
-    ASSERT(next_pc == cur_pc + instr_length(dcontext, instr));
+    ASSERT(next_pc == cur_pc + instr_length(GLOBAL_DCONTEXT, instr));
     if (!instr_is_cti(instr)) {
         /* special instructions, bail out. */
         if (instr_is_syscall(instr) || instr_is_interrupt(instr)) {
@@ -840,5 +922,11 @@ clean_call_opt_init(void)
 void
 clean_call_opt_exit(void)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (callee_target_table != NULL) {
+        generic_hash_destroy(GLOBAL_DCONTEXT, callee_target_table);
+        callee_target_table = NULL;
+    }
+#endif
     callee_info_table_destroy();
 }
