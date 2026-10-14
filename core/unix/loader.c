@@ -2295,6 +2295,9 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
     kernel_init_sp = (void *)sp;
     dynamorio_set_envp(envp);
 #        if defined(X86) && defined(X64)
+    apicheck(signal_exec_restore_initial(getenv(DYNAMORIO_VAR_EXEC_SIGNALS)),
+             "Invalid early-exec signal handoff");
+    disable_env(DYNAMORIO_VAR_EXEC_SIGNALS);
     apicheck(os_exec_resources_bootstrap(), "Invalid early-exec resource handoff");
 #        endif
 

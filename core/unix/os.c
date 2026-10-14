@@ -7582,6 +7582,7 @@ enum {
     ENV_PROP_CLIENT_EXEC_DATA,
     ENV_PROP_PROCFS_FD,
     ENV_PROP_EXEC_SERVICE,
+    ENV_PROP_EXEC_SIGNALS,
     ENV_PROP_CONFIGDIR,
 };
 
@@ -7601,6 +7602,7 @@ static const char *const env_to_propagate[] = {
     DYNAMORIO_VAR_CLIENT_EXEC_DATA,
     DYNAMORIO_VAR_PROCFS_FD,
     DYNAMORIO_VAR_EXEC_SERVICE,
+    DYNAMORIO_VAR_EXEC_SIGNALS,
     /* These will only be propagated if they exist: */
     DYNAMORIO_VAR_CONFIGDIR,
     DYNAMORIO_VAR_AUTOINJECT,
@@ -7619,7 +7621,7 @@ static const char *const env_to_propagate[] = {
  */
 static void
 add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app_path,
-                bool resource_handoff)
+                bool resource_handoff, const char *exec_signals)
 {
     char **envp = (char **)*execve_param_addr(dcontext, 2);
     int idx, j, preload = -1, ldpath = -1;
@@ -7654,6 +7656,7 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
     need_var[ENV_PROP_EXE_FD] = false;
     need_var[ENV_PROP_PROCFS_FD] = false;
     need_var[ENV_PROP_EXEC_SERVICE] = false;
+    need_var[ENV_PROP_EXEC_SIGNALS] = exec_signals[0] != '\0';
 #if defined(LINUX) && defined(X86) && defined(X64)
     if (resource_handoff) {
         snprintf(exec_service, sizeof(exec_service), "%d:" UINT64_FORMAT_STRING,
@@ -7839,6 +7842,7 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
         case ENV_PROP_CLIENT_EXEC_DATA: val = client_data; break;
         case ENV_PROP_PROCFS_FD: val = procfs_descriptor; break;
         case ENV_PROP_EXEC_SERVICE: val = exec_service; break;
+        case ENV_PROP_EXEC_SIGNALS: val = exec_signals; break;
         default:
             val = getenv(env_to_propagate[j]);
             if (val == NULL)
@@ -8051,7 +8055,9 @@ handle_execve(dcontext_t *dcontext)
     bool expect_to_fail UNUSED = false;
     bool should_inject;
     bool resource_handoff = false;
+    char exec_signals[64] = { 0 };
 #if defined(LINUX) && defined(X86) && defined(X64)
+    uint64 exec_ignored = 0, exec_blocked = 0;
     reg_t original_parameters[5];
     for (uint i = 0; i < 5; ++i)
         original_parameters[i] = sys_param(dcontext, i);
@@ -8064,6 +8070,9 @@ handle_execve(dcontext_t *dcontext)
     const char **argv;
 #endif
 
+    /* Error cleanup must also be valid before an environment was allocated. */
+    dcontext->sys_param0 = dcontext->sys_param1 = 0;
+    dcontext->sys_param3 = dcontext->sys_param4 = 0;
     if (DYNAMO_OPTION(follow_children) && DYNAMO_OPTION(early_inject)) {
         int ret = handle_execve_script(dcontext);
         if (ret != 0)
@@ -8178,6 +8187,17 @@ handle_execve(dcontext_t *dcontext)
     }
 
 #if defined(LINUX) && defined(X86) && defined(X64)
+    if (should_inject && DYNAMO_OPTION(early_inject) && !expect_to_fail && x64) {
+        if (!signal_exec_snapshot(dcontext, &exec_ignored, &exec_blocked)) {
+            if (descriptor_exec == NULL && file != INVALID_FILE)
+                os_close(file);
+            mark_thread_execve(dcontext->thread_record, false);
+            return EIO;
+        }
+        snprintf(exec_signals, sizeof(exec_signals),
+                 "1:" UINT64_FORMAT_STRING ":" UINT64_FORMAT_STRING, exec_ignored,
+                 exec_blocked);
+    }
     if (should_inject && DYNAMO_OPTION(early_inject) && !expect_to_fail && x64 &&
         os_exec_resources_service() != INVALID_FILE &&
         ((os_thread_data_t *)dcontext->os_field)->client_exec_data != 0 &&
@@ -8210,7 +8230,8 @@ handle_execve(dcontext_t *dcontext)
             os_close(file);
 
     if (should_inject)
-        add_dr_env_vars(dcontext, inject_library_path, fname, resource_handoff);
+        add_dr_env_vars(dcontext, inject_library_path, fname, resource_handoff,
+                        exec_signals);
     else {
         dcontext->sys_param0 = 0;
         dcontext->sys_param1 = 0;
@@ -8239,6 +8260,10 @@ handle_execve(dcontext_t *dcontext)
         MCXT_SYSNUM_REG(get_mcontext(dcontext)) = SYS_execveat;
         dcontext->sys_param3 = dcontext->sys_param4 = 0;
         d_r_config_exit();
+        if (!signal_exec_block(dcontext, exec_ignored)) {
+            mark_thread_execve(dcontext->thread_record, false);
+            return EIO;
+        }
         return 0;
     }
 #endif
@@ -8282,6 +8307,15 @@ handle_execve(dcontext_t *dcontext)
      * we'll just live w/o dynamic option re-read.
      */
     d_r_config_exit();
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Only a confirmed rewrite to our loader may inherit this temporary mask.
+     * Other exec paths have no cooperating consumer to remove it. */
+    if (exec_signals[0] != '\0' && dcontext->sys_param4 != 0 &&
+        !signal_exec_block(dcontext, exec_ignored)) {
+        mark_thread_execve(dcontext->thread_record, false);
+        return EIO;
+    }
+#endif
     return 0;
 }
 
@@ -8321,6 +8355,8 @@ handle_execve_post(dcontext_t *dcontext)
      * we have to restore env to how it was and free the allocated heap.
      */
 #if defined(LINUX) && defined(X86) && defined(X64)
+    if (!signal_exec_rollback(dcontext))
+        SYSLOG_INTERNAL_WARNING("Unable to restore signal mask after exec failure");
     /* A vfork parent's cleanup of a departed child is not a failed exec in the
      * calling task. Only the original task can reopen its quiesced signal route.
      * This also applies to a static runtime with no environment to restore. */
@@ -9800,9 +9836,8 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_execve: {
         int ret = handle_execve(dcontext);
         if (ret != 0) {
-#if defined(LINUX) && defined(X86) && defined(X64)
-            os_thread_suspend_restore_after_exec(dcontext);
-#endif
+            mark_thread_execve(dcontext->thread_record, false);
+            handle_execve_post(dcontext);
             execute_syscall = false;
             set_failure_return_val(dcontext, ret);
         }
