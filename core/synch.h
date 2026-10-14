@@ -246,6 +246,10 @@ should_wait_at_safe_spot(dcontext_t *dcontext);
 void
 check_wait_at_safe_spot(dcontext_t *dcontext, thread_synch_permission_t cur_state);
 
+/* Use the configured synchronization sleep/yield policy while waiting without locks. */
+void
+synch_thread_yield(void);
+
 /* use with care!  normally check_wait_at_safe_spot() should be called instead */
 void
 set_synch_state(dcontext_t *dcontext, thread_synch_permission_t state);

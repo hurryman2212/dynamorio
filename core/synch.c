@@ -51,9 +51,6 @@ bool doing_detach = false;   /* set after synchall */
 thread_id_t detacher_tid = INVALID_THREAD_ID;
 runtime_thread_id_t detacher_runtime_id = INVALID_RUNTIME_THREAD_ID;
 
-static void
-synch_thread_yield(void);
-
 /* Thread-local data
  */
 typedef struct _thread_synch_data_t {
@@ -906,7 +903,7 @@ set_synched_thread_context(thread_record_t *trec,
 #define SYNCH_WITH_WAIT_MS ((int)DYNAMO_OPTION(synch_with_sleep_time))
 
 /* for use by synch_with_* routines to wait for thread(s) */
-static void
+void
 synch_thread_yield(void)
 {
     /* xref 9400, 9488 - os_thread_yield() works ok on an UP machine, but on an MP machine

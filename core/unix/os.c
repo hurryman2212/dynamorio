@@ -636,6 +636,9 @@ typedef int *(*errno_loc_t)(void);
 /* Stores whether certain syscalls are unsupported on the system we're running on. */
 static bool is_clone3_enosys = false;
 static bool is_sigqueueinfo_enosys = false;
+/* Final runtime exit closes creation before releasing the thread registry.
+ * Sequentially consistent reservations pair with the final count recheck. */
+DECLARE_NEVERPROT_VAR(static bool thread_creation_closed, false);
 #endif
 
 int suspend_signum;
@@ -1134,6 +1137,7 @@ d_r_os_init(void)
 {
 #ifdef LINUX
     file_t inherited_procfs_root = INVALID_FILE;
+    __atomic_store_n(&thread_creation_closed, false, __ATOMIC_SEQ_CST);
 #endif
     ksynch_init();
 
@@ -3845,6 +3849,9 @@ os_fork_init(dcontext_t *dcontext)
      */
     d_r_mutex_fork_reset(&all_threads_synch_lock);
     d_r_mutex_fork_reset(&thread_initexit_lock);
+#ifdef LINUX
+    __atomic_store_n(&thread_creation_closed, false, __ATOMIC_SEQ_CST);
+#endif
 
     os_fork_post(dcontext, false /*!parent*/);
 
@@ -3933,16 +3940,46 @@ os_swap_dr_tls(dcontext_t *dcontext, bool to_app)
 #endif
 }
 
-static void
-os_new_thread_pre(void)
+static bool
+os_new_thread_pre(dcontext_t *dcontext, bool client_thread)
 {
     /* We use a barrier on new threads to ensure we make progress when
      * attaching to an app that is continually making threads.
      * XXX i#1305: if we fully suspend all threads during attach we can
      * get rid of this barrier.
      */
-    wait_for_event(dr_attach_finished, 0);
+    if (!client_thread)
+        wait_for_event(dr_attach_finished, 0);
+#ifdef LINUX
+    uint attempts = 0;
+    while (true) {
+        __atomic_add_fetch(&uninit_thread_count, 1, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&thread_creation_closed, __ATOMIC_SEQ_CST) &&
+            !__atomic_load_n(&dcontext->thread_record->group_exit_requested,
+                             __ATOMIC_SEQ_CST))
+            return true;
+        __atomic_sub_fetch(&uninit_thread_count, 1, __ATOMIC_SEQ_CST);
+        /* No signal inheritance, child stack or TLS transition exists yet.
+         * An exit won the race: app creators must remain safely terminable,
+         * while a client creation request can report failure without waiting. */
+        if (client_thread)
+            return false;
+        if (DYNAMO_OPTION(synch_all_threads_max_loops) != UINT_MAX &&
+            attempts++ >= DYNAMO_OPTION(synch_all_threads_max_loops)) {
+            REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                        get_application_name(), get_application_pid());
+        }
+        check_wait_at_safe_spot(dcontext, THREAD_SYNCH_NO_LOCKS_NO_XFER);
+        if (INTERNAL_OPTION(single_thread_in_DR))
+            EXITING_DR();
+        synch_thread_yield();
+        if (INTERNAL_OPTION(single_thread_in_DR))
+            ENTERING_DR();
+    }
+#else
     ATOMIC_INC(int, uninit_thread_count);
+    return true;
+#endif
 }
 
 /* This is called from pre_system_call() and before cloning a client thread in
@@ -5347,6 +5384,8 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
 {
     dcontext_t *dcontext = get_thread_private_dcontext();
     byte *xsp = 0;
+    if (!os_new_thread_pre(dcontext, true /*client thread*/))
+        return false;
     /* We do not pass SIGCHLD since don't want signal to parent and don't support
      * waiting on child.
      * We do not pass CLONE_THREAD so that the new thread is in its own thread
@@ -5361,7 +5400,6 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
     pre_second_thread();
     /* need to share signal handler table, prior to creating clone record */
     handle_clone(dcontext, flags);
-    ATOMIC_INC(int, uninit_thread_count);
     void *crec = create_clone_record(dcontext, (reg_t *)&xsp, NULL, NULL);
     /* make sure client_thread_run can get the func and arg, and that
      * signal_thread_inherit gets the right syscall info
@@ -8643,11 +8681,31 @@ handle_exit(dcontext_t *dcontext)
 
     d_r_mutex_lock(&thread_initexit_lock);
 #ifdef LINUX
+    if (dcontext->sys_num == SYSNUM_EXIT_PROCESS) {
+        /* Close this group before settling accepted children. A child that
+         * publishes during the drain inherits closure in add_thread, so the
+         * later member snapshot stays complete across synchronization waits.
+         */
+        const runtime_thread_id_t closing_group = get_runtime_thread_group();
+        thread_record_t **closing_threads;
+        int closing_count;
+        get_list_of_threads_ex(&closing_threads, &closing_count, true /*include execve*/);
+        for (int i = 0; i < closing_count; ++i) {
+            if (closing_threads[i]->runtime_group == closing_group)
+                (void)__atomic_exchange_n(&closing_threads[i]->group_exit_requested, true,
+                                          __ATOMIC_SEQ_CST);
+        }
+        global_heap_free(closing_threads,
+                         closing_count *
+                             sizeof(*closing_threads) HEAPACCT(ACCT_THREAD_MGT));
+    }
     /* A successful CLONE_VM child may still be absent from the thread list.
      * Decide which groups survive only after its startup record is published.
      * Waiting later during cleanup is too late: it can destroy the shared
      * runtime or wait for signal inheritance while holding this same lock. */
     uint attempts = 0;
+retry_exit_check:
+    exit_process = false;
     while (uninit_thread_count > 0) {
         d_r_mutex_unlock(&thread_initexit_lock);
         if (DYNAMO_OPTION(synch_all_threads_max_loops) != UINT_MAX &&
@@ -8658,7 +8716,7 @@ handle_exit(dcontext_t *dcontext)
         check_wait_at_safe_spot(dcontext, THREAD_SYNCH_NO_LOCKS_NO_XFER);
         if (INTERNAL_OPTION(single_thread_in_DR))
             EXITING_DR();
-        os_thread_yield();
+        synch_thread_yield();
         if (INTERNAL_OPTION(single_thread_in_DR))
             ENTERING_DR();
         d_r_mutex_lock(&thread_initexit_lock);
@@ -8667,12 +8725,8 @@ handle_exit(dcontext_t *dcontext)
     if (dcontext->sys_num == SYSNUM_EXIT_PROCESS) {
         /* We can have multiple thread groups within the same address space.
          * We need to know whether this is the only group left.
-         * XXX: we can have races where new threads are created after our
-         * check: we'll live with that for now, but the right approach is to
-         * suspend all threads via synch_with_all_threads(), do the check,
-         * and if exit_process then exit w/o resuming: though have to
-         * coordinate lock access w/ cleanup_and_terminate.
-         * Xref i#94.  Xref PR 541760.
+         * The final creation gate below makes this decision stable across
+         * releasing the registry lock and entering runtime-wide cleanup.
          */
         const runtime_thread_id_t mygroup = get_runtime_thread_group();
         thread_record_t **threads;
@@ -8735,14 +8789,14 @@ handle_exit(dcontext_t *dcontext)
             threads, num_threads * sizeof(thread_record_t *) HEAPACCT(ACCT_THREAD_MGT));
     }
 
-    if (IF_UNIX(uninit_thread_count == 0 &&) is_last_app_thread() && !dynamo_exited) {
+    bool last_app_thread =
+        IF_UNIX(uninit_thread_count == 0 &&) is_last_app_thread() && !dynamo_exited;
+    if (last_app_thread) {
         LOG(THREAD, LOG_TOP | LOG_SYSCALLS, 1,
             "SYS_exit%s(%d) in final thread " TIDFMT " of " PIDFMT
             " => exiting DynamoRIO\n",
             (dcontext->sys_num == SYSNUM_EXIT_PROCESS) ? "_group" : "",
             MCXT_SYSNUM_REG(mc), d_r_get_thread_id(), get_process_id());
-        /* we want to clean up even if not automatic startup! */
-        automatic_startup = true;
         exit_process = true;
     } else {
         LOG(THREAD, LOG_TOP | LOG_THREADS | LOG_SYSCALLS, 1,
@@ -8751,6 +8805,21 @@ handle_exit(dcontext_t *dcontext)
             MCXT_SYSNUM_REG(mc), d_r_get_thread_id(), get_process_id(),
             exit_process ? "process" : "thread");
     }
+#ifdef LINUX
+    if (exit_process &&
+        !__atomic_exchange_n(&thread_creation_closed, true, __ATOMIC_SEQ_CST) &&
+        __atomic_load_n(&uninit_thread_count, __ATOMIC_SEQ_CST) != 0) {
+        /* A creator accepted its reservation before closure. Its child cannot
+         * publish while we hold this lock, so settle startup and classify all
+         * groups again. After a zero-count commit, later creators see closure
+         * and cannot issue a kernel clone. No lock spans runtime cleanup. */
+        __atomic_store_n(&thread_creation_closed, false, __ATOMIC_SEQ_CST);
+        goto retry_exit_check;
+    }
+#endif
+    /* We want final-thread cleanup even when startup was not automatic. */
+    if (last_app_thread)
+        automatic_startup = true;
     d_r_mutex_unlock(&thread_initexit_lock);
     KSTOP(num_exits_dir_syscall);
 
@@ -9169,17 +9238,19 @@ handle_clone_pre(dcontext_t *dcontext)
             sys_param(dcontext, 0), sys_param(dcontext, 1), sys_param(dcontext, 2),
             sys_param(dcontext, 3), sys_param(dcontext, 4));
     }
-    handle_clone(dcontext, flags);
-    if ((flags & CLONE_VM) == 0) {
-        LOG(THREAD, LOG_SYSCALLS, 1, "\tWARNING: CLONE_VM not set!\n");
-    }
-
     /* i#1010: If we have private fds open (usually logfiles), we should
      * clean those up before they get reused by a new thread.
      * XXX: Ideally we'd do this in fd_table_add(), but we can't acquire
      * thread_initexit_lock there.
      */
     cleanup_after_vfork_execve(dcontext);
+
+    if (is_thread_create_syscall(dcontext, dr_clone_args))
+        os_new_thread_pre(dcontext, false /*application thread*/);
+    handle_clone(dcontext, flags);
+    if ((flags & CLONE_VM) == 0) {
+        LOG(THREAD, LOG_SYSCALLS, 1, "\tWARNING: CLONE_VM not set!\n");
+    }
 
     /* For thread creation clone syscalls a clone_record_t structure
      * containing the pc after the app's syscall instr and other data
@@ -9224,7 +9295,6 @@ handle_clone_pre(dcontext_t *dcontext)
                                 NULL);
         }
         os_clone_pre(dcontext);
-        os_new_thread_pre();
 #    if defined(LINUX) && defined(X86) && defined(X64)
         file_table_clone_begin(dcontext);
 #    endif
@@ -9657,7 +9727,7 @@ pre_system_call(dcontext_t *dcontext)
         }
 #    endif
 
-        os_new_thread_pre();
+        os_new_thread_pre(dcontext, false /*application thread*/);
         break;
     }
     case SYS_posix_spawn: {
@@ -9673,8 +9743,11 @@ pre_system_call(dcontext_t *dcontext)
         /* in /usr/src/linux/arch/i386/kernel/process.c */
         uint flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: vfork\n");
-        handle_clone(dcontext, flags);
         cleanup_after_vfork_execve(dcontext);
+#    ifdef LINUX
+        os_new_thread_pre(dcontext, false /*application thread*/);
+#    endif
+        handle_clone(dcontext, flags);
 
         /* save for post_system_call, treated as if SYS_clone */
         dcontext->sys_param0 = (reg_t)flags;
@@ -9691,7 +9764,9 @@ pre_system_call(dcontext_t *dcontext)
                             NULL);
 #    endif
         os_clone_pre(dcontext);
-        os_new_thread_pre();
+#    ifndef LINUX
+        os_new_thread_pre(dcontext, false /*application thread*/);
+#    endif
 #    if defined(LINUX) && defined(X86) && defined(X64)
         file_table_clone_begin(dcontext);
 #    endif

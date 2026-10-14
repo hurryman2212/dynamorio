@@ -304,6 +304,9 @@ typedef struct _thread_record_t {
 #else
     process_id_t pid; /* thread group id */
     bool execve;      /* exiting due to execve (i#237/PR 498284) */
+#    ifdef LINUX
+    bool group_exit_requested; /* closes creation from this runtime group */
+#    endif
 #endif
     uint num;                  /* creation ordinal */
     bool under_dynamo_control; /* used for deciding whether to intercept events */

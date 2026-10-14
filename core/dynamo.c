@@ -2237,6 +2237,24 @@ add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid
         dcontext->thread_record = tr;
 
     d_r_mutex_lock(&all_threads_lock);
+#ifdef LINUX
+    /* A child reserved before exit_group may publish after its group closes.
+     * Inherit closure before it can create another child. Ordinary fork rebuilds
+     * an empty registry, so its sole surviving thread starts open again.
+     */
+    tr->group_exit_requested = false;
+    for (uint i = 0;
+         i < HASHTABLE_SIZE(ALL_THREADS_HASH_BITS) && !tr->group_exit_requested; ++i) {
+        for (thread_record_t *member = all_threads[i]; member != NULL;
+             member = member->next) {
+            if (member->runtime_group == runtime_group &&
+                __atomic_load_n(&member->group_exit_requested, __ATOMIC_SEQ_CST)) {
+                tr->group_exit_requested = true;
+                break;
+            }
+        }
+    }
+#endif
     tr->num = threads_ever_count++;
     hindex = HASH_FUNC_BITS(tr->runtime_id, ALL_THREADS_HASH_BITS);
     tr->next = all_threads[hindex];
