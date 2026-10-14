@@ -5409,7 +5409,7 @@ recreate_fragment_ilist(dcontext_t *dcontext, byte *pc,
      * table (the dcontext's owning thread would also need to be suspended)
      */
     ASSERT((dcontext != GLOBAL_DCONTEXT &&
-            d_r_get_thread_id() == dcontext->owning_thread &&
+            get_runtime_thread_id() == dcontext->owning_runtime_id &&
             is_couldbelinking(dcontext)) ||
            (ASSERT_OWN_MUTEX(true, &thread_initexit_lock), true));
     STATS_INC(num_recreated_fragments);

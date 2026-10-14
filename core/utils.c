@@ -82,8 +82,22 @@
 #include "stddef_wrapper.h" /* for offsetof */
 
 try_except_t global_try_except;
+#ifdef WINDOWS
+runtime_thread_id_t
+get_runtime_thread_id(void)
+{
+    return d_r_get_thread_id();
+}
+
+runtime_thread_id_t
+get_runtime_thread_group(void)
+{
+    return get_process_id();
+}
+#endif
 #ifdef UNIX
 thread_id_t global_try_tid = INVALID_THREAD_ID;
+runtime_thread_id_t global_try_runtime_id = INVALID_RUNTIME_THREAD_ID;
 #endif
 
 int do_once_generation = 1;
@@ -253,7 +267,7 @@ DECLARE_CXTSWPROT_VAR(mutex_t do_threshold_mutex, INIT_LOCK_FREE(do_threshold_mu
 
 /* common format string used for different log files and loglevels */
 #    define DUMP_LOCK_INFO_ARGS(depth, cur_lock, prev)                                  \
-        "%d lock " PFX ": name=%s\nrank=%d owner=" TIDFMT " owning_dc=" PFX " "         \
+        "%d lock " PFX ": name=%s\nrank=%d owner=" RUNTIME_TIDFMT " owning_dc=" PFX " " \
         "%*s" PIFX " prev=" PFX "\n"                                                    \
         "lock %*s%8d %*s%8d %*s%8d %*s%8d %*s%8d+2 %s\n",                               \
             depth, cur_lock, cur_lock->name, cur_lock->rank, cur_lock->owner,           \
@@ -297,7 +311,7 @@ dump_owned_locks(dcontext_t *dcontext)
         depth++;
         LOG(THREAD, LOG_THREADS, 1,
             DUMP_LOCK_INFO_ARGS(depth, cur_lock, cur_lock->prev_owned_lock));
-        ASSERT(cur_lock->owner == dcontext->owning_thread);
+        ASSERT(cur_lock->owner == dcontext->owning_runtime_id);
         cur_lock = cur_lock->prev_owned_lock;
     }
 }
@@ -579,7 +593,7 @@ deadlock_avoidance_lock(mutex_t *lock, bool acquired, bool ownable)
         ASSERT(lock->rank > 0 && "initialize with INIT_LOCK_FREE");
         if (ownable) {
             ASSERT(!lock->owner);
-            lock->owner = d_r_get_thread_id();
+            lock->owner = get_runtime_thread_id();
             lock->owning_dcontext = get_thread_private_dcontext();
         }
         /* add to global list */
@@ -640,7 +654,7 @@ deadlock_avoidance_lock(mutex_t *lock, bool acquired, bool ownable)
          * calls are made on the non acquired path here */
         ASSERT(lock->rank > 0 && "initialize with INIT_LOCK_FREE");
         if (INTERNAL_OPTION(deadlock_avoidance) && ownable) {
-            ASSERT(lock->owner != d_r_get_thread_id() &&
+            ASSERT(lock->owner != get_runtime_thread_id() &&
                    "deadlock on recursive mutex_lock");
         }
         lock->count_times_contended++;
@@ -665,7 +679,7 @@ deadlock_avoidance_unlock(mutex_t *lock, bool ownable)
     if (!ownable)
         return;
 
-    ASSERT(lock->owner == d_r_get_thread_id());
+    ASSERT(lock->owner == get_runtime_thread_id());
     if (INTERNAL_OPTION(deadlock_avoidance) && lock->owning_dcontext != NULL &&
         lock->owning_dcontext != GLOBAL_DCONTEXT) {
         dcontext_t *dcontext = get_thread_private_dcontext();
@@ -696,7 +710,7 @@ deadlock_avoidance_unlock(mutex_t *lock, bool ownable)
             }
         }
     }
-    lock->owner = INVALID_THREAD_ID;
+    lock->owner = INVALID_RUNTIME_THREAD_ID;
     lock->owning_dcontext = NULL;
 }
 #    define DEADLOCK_AVOIDANCE_LOCK(lock, acquired, ownable) \
@@ -721,7 +735,7 @@ d_r_mutex_fork_reset(mutex_t *mutex)
      */
     mutex->lock_requests = LOCK_FREE_STATE;
 #    ifdef DEADLOCK_AVOIDANCE
-    mutex->owner = INVALID_THREAD_ID;
+    mutex->owner = INVALID_RUNTIME_THREAD_ID;
     mutex->owning_dcontext = NULL;
 #    endif
 }
@@ -997,10 +1011,10 @@ own_recursive_lock(recursive_lock_t *lock)
 #ifdef DEADLOCK_AVOIDANCE
     ASSERT(!mutex_ownable(&lock->lock) || OWN_MUTEX(&lock->lock));
 #endif
-    ASSERT(lock->owner == INVALID_THREAD_ID);
+    ASSERT(lock->owner == INVALID_RUNTIME_THREAD_ID);
     ASSERT(lock->count == 0);
-    lock->owner = d_r_get_thread_id();
-    ASSERT(lock->owner != INVALID_THREAD_ID);
+    lock->owner = get_runtime_thread_id();
+    ASSERT(lock->owner != INVALID_RUNTIME_THREAD_ID);
     lock->count = 1;
 }
 
@@ -1011,7 +1025,7 @@ acquire_recursive_app_lock(recursive_lock_t *lock, priv_mcontext_t *mc)
        busy try_lock
     */
 
-    if (ATOMIC_READ_THREAD_ID(&lock->owner) == d_r_get_thread_id()) {
+    if (ATOMIC_READ_RUNTIME_THREAD_ID(&lock->owner) == get_runtime_thread_id()) {
         lock->count++;
     } else {
         d_r_mutex_lock_app(&lock->lock, mc);
@@ -1029,7 +1043,7 @@ acquire_recursive_lock(recursive_lock_t *lock)
 bool
 try_recursive_lock(recursive_lock_t *lock)
 {
-    if (ATOMIC_READ_THREAD_ID(&lock->owner) == d_r_get_thread_id()) {
+    if (ATOMIC_READ_RUNTIME_THREAD_ID(&lock->owner) == get_runtime_thread_id()) {
         lock->count++;
     } else {
         if (!d_r_mutex_trylock(&lock->lock))
@@ -1045,11 +1059,11 @@ release_recursive_lock(recursive_lock_t *lock)
 #ifdef DEADLOCK_AVOIDANCE
     ASSERT(!mutex_ownable(&lock->lock) || OWN_MUTEX(&lock->lock));
 #endif
-    ASSERT(lock->owner == d_r_get_thread_id());
+    ASSERT(lock->owner == get_runtime_thread_id());
     ASSERT(lock->count > 0);
     lock->count--;
     if (lock->count == 0) {
-        lock->owner = INVALID_THREAD_ID;
+        lock->owner = INVALID_RUNTIME_THREAD_ID;
         d_r_mutex_unlock(&lock->lock);
     }
 }
@@ -1057,7 +1071,7 @@ release_recursive_lock(recursive_lock_t *lock)
 bool
 self_owns_recursive_lock(recursive_lock_t *lock)
 {
-    return (ATOMIC_READ_THREAD_ID(&lock->owner) == d_r_get_thread_id());
+    return (ATOMIC_READ_RUNTIME_THREAD_ID(&lock->owner) == get_runtime_thread_id());
 }
 
 /* Read write locks */
@@ -1131,7 +1145,7 @@ d_r_read_lock(read_write_lock_t *rw)
                  * instead of in the loop body but it doesn't seem wortwhile
                  */
                 /* We have the lock so we do not need a load-acquire. */
-                if (rw->writer == d_r_get_thread_id()) {
+                if (rw->writer == get_runtime_thread_id()) {
                     /* we would share the code below but we do not want
                      * the deadlock avoidance to consider this an acquire
                      */
@@ -1166,7 +1180,7 @@ d_r_read_lock(read_write_lock_t *rw)
              * and avoids the syscall (xref PR 473640).
              */
             /* We have the lock so we do not need a load-acquire. */
-            if (rw->writer == d_r_get_thread_id()) {
+            if (rw->writer == get_runtime_thread_id()) {
                 /* we would share the code below but we do not want
                  * the deadlock avoidance to consider this an acquire
                  */
@@ -1242,7 +1256,7 @@ d_r_write_lock(read_write_lock_t *rw)
             /* XXX: last places where we yield instead of wait */
             os_thread_yield();
         }
-        rw->writer = d_r_get_thread_id();
+        rw->writer = get_runtime_thread_id();
         return;
     }
 
@@ -1255,7 +1269,7 @@ d_r_write_lock(read_write_lock_t *rw)
         DEADLOCK_AVOIDANCE_LOCK(&rw->lock, false, LOCK_NOT_OWNABLE);
         rwlock_wait_contended_writer(rw);
     }
-    rw->writer = d_r_get_thread_id();
+    rw->writer = get_runtime_thread_id();
 }
 
 bool
@@ -1265,7 +1279,7 @@ d_r_write_trylock(read_write_lock_t *rw)
         ASSERT_NOT_TESTED();
         /* We have the lock so we do not need a load-acquire. */
         if (rw->num_readers == 0) {
-            rw->writer = d_r_get_thread_id();
+            rw->writer = get_runtime_thread_id();
             return true;
         } else {
             /* We need to duplicate the bottom of d_r_write_unlock() */
@@ -1305,7 +1319,7 @@ d_r_read_unlock(read_write_lock_t *rw)
         if (mutex_testlock(&rw->lock)) {
             /* test that it was not this thread owning both write and read lock */
             /* We have the lock so we do not need a load-acquire. */
-            if (rw->writer != d_r_get_thread_id()) {
+            if (rw->writer != get_runtime_thread_id()) {
                 /* we're assuming the writer has been forced to wait,
                    but since we can't tell whether it did indeed wait this
                    notify may leave signaled the event for the next turn
@@ -1331,7 +1345,7 @@ d_r_write_unlock(read_write_lock_t *rw)
 #ifdef DEADLOCK_AVOIDANCE
     ASSERT(!mutex_ownable(&rw->lock) || rw->writer == rw->lock.owner);
 #endif
-    rw->writer = INVALID_THREAD_ID;
+    rw->writer = INVALID_RUNTIME_THREAD_ID;
     if (INTERNAL_OPTION(spin_yield_rwlock)) {
         d_r_mutex_unlock(&rw->lock);
         return;
@@ -1355,7 +1369,7 @@ d_r_write_unlock(read_write_lock_t *rw)
 bool
 self_owns_write_lock(read_write_lock_t *rw)
 {
-    return (ATOMIC_READ_THREAD_ID(&rw->writer) == d_r_get_thread_id());
+    return (ATOMIC_READ_RUNTIME_THREAD_ID(&rw->writer) == get_runtime_thread_id());
 }
 
 /****************************************************************************/
@@ -2022,7 +2036,7 @@ DECLARE_NEVERPROT_VAR(
     });
 DECLARE_CXTSWPROT_VAR(static mutex_t report_buf_lock, INIT_LOCK_FREE(report_buf_lock));
 /* Avoid deadlock w/ nested reports */
-DECLARE_CXTSWPROT_VAR(static thread_id_t report_buf_lock_owner, 0);
+DECLARE_CXTSWPROT_VAR(static runtime_thread_id_t report_buf_lock_owner, 0);
 
 #define ASSERT_ROOM(reportbuf, curbuf, maxlen) \
     ASSERT(curbuf + maxlen < reportbuf + sizeof(reportbuf))
@@ -2037,7 +2051,7 @@ under_internal_exception(void)
 {
 #    ifdef DEADLOCK_AVOIDANCE
     /* ASSUMPTION: reading owner field is atomic */
-    return (report_buf_lock.owner == d_r_get_thread_id());
+    return (report_buf_lock.owner == get_runtime_thread_id());
 #    else
     /* mutexes normally don't have an owner, stay safe no matter who owns */
     return mutex_testlock(&report_buf_lock);
@@ -2137,12 +2151,12 @@ report_dynamorio_problem(dcontext_t *dcontext, uint dumpcore_flag, app_pc except
     if (dcontext == NULL)
         dcontext = GLOBAL_DCONTEXT;
 
-    if (report_buf_lock_owner == d_r_get_thread_id()) {
+    if (report_buf_lock_owner == get_runtime_thread_id()) {
         /* nested report: can't do much except bail on inner */
         return;
     }
     d_r_mutex_lock(&report_buf_lock);
-    report_buf_lock_owner = d_r_get_thread_id();
+    report_buf_lock_owner = get_runtime_thread_id();
     /* we assume the caller does a DO_ONCE to prevent hanging on a
      * fault in this routine, if called to report a fatal error.
      */

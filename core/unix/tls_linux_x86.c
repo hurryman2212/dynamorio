@@ -441,7 +441,7 @@ tls_thread_init(os_local_state_t *os_tls, byte *segment)
         LOG(GLOBAL, LOG_THREADS, 1, "os_tls_init: cur gs base is " PFX "\n", cur_gs);
         /* If we're a non-initial thread, gs will be set to the parent thread's value */
         if (cur_gs == NULL || cur_gs == (byte *)NON_ZERO_UNINIT_GSBASE ||
-            is_dynamo_address(cur_gs) ||
+            is_dynamo_address(cur_gs) || os_runtime_identity_is_bootstrap(cur_gs) ||
             /* By resolving i#107, we can handle gs conflicts between app and dr. */
             INTERNAL_OPTION(mangle_app_seg)) {
             res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_SET_GS, segment);
@@ -597,8 +597,12 @@ tls_thread_preinit(void)
      */
     if (safe_read_tls_magic() == TLS_MAGIC_INVALID) {
         os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
-        if (tls != NULL &&
-            tls->state.spill_space.dcontext->owning_thread == get_sys_thread_id())
+#    if defined(LINUX)
+        if (tls != NULL && os_runtime_identity_is_bootstrap(tls))
+            return true;
+#    endif
+        if (tls != NULL && tls->state.spill_space.dcontext != NULL &&
+            tls->state.spill_space.dcontext->owning_runtime_id == get_runtime_thread_id())
             return true;
     }
     /* XXX: What about Mac on AMD?  Presumably by the time anyone wants to run

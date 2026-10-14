@@ -1396,6 +1396,54 @@ DR_API
 file_t
 dr_open_file(const char *fname, uint mode_flags);
 
+#ifdef UNIX
+DR_API
+/**
+ * Configures Linux x86-64 internal thread suspension through a service that
+ * implements dr_thread_suspend.h. Call during dr_client_main() with a borrowed,
+ * protected, inherited SOCK_SEQPACKET descriptor. The caller keeps this control
+ * endpoint alive through the last runtime synchronization, including shutdown.
+ * Core owns the separate channels it creates for individual tasks. Repeating
+ * this call with the same descriptor is allowed; changing services is rejected.
+ *
+ * Returns true only after the calling task has registered with the service.
+ * Missing kernel capabilities, service errors, or unregistered foreign task
+ * groups fail without sending signals to guessed namespace-local PID/TID values.
+ * Successfully delivering a notification does not replace DR's suspension ACK.
+ */
+bool
+dr_set_thread_suspend_service(file_t broker_fd);
+
+DR_API
+/**
+ * Adopts an existing descriptor without changing its number. The descriptor is
+ * protected from application close/dup operations and remains open across fork.
+ * If \p inherit_exec is true it also remains open across exec, so a reinjected
+ * client can adopt the same inherited descriptor. Close with dr_close_file().
+ * The caller must own the descriptor and arrange quiescence while adopting it.
+ */
+bool
+dr_adopt_file_descriptor(file_t fd, bool inherit_exec);
+
+DR_API
+/**
+ * Adopts an existing descriptor in place, with independent exec and fork policy.
+ * This has the same protection, ownership, and caller-quiescence requirements as
+ * dr_adopt_file_descriptor(). It neither opens a path nor duplicates the descriptor.
+ * If \p inherit_exec is true, FD_CLOEXEC is cleared; otherwise it is set.
+ * If \p close_on_fork is true, the descriptor is closed in a fork child with the
+ * same semantics as #DR_FILE_CLOSE_ON_FORK. Parent and sibling descriptors are
+ * unaffected. Re-adoption updates both policies and preserves other DR flags.
+ *
+ * Returns false without taking ownership or closing the input on failure.
+ * dr_adopt_file_descriptor(fd, inherit_exec) is equivalent to calling this routine
+ * with close_on_fork=false. Release an adopted descriptor with dr_close_file().
+ */
+bool
+dr_adopt_file_descriptor_ex(file_t fd, bool inherit_exec, bool close_on_fork);
+
+#endif
+
 DR_API
 /** Closes file \p f. */
 void
@@ -2221,8 +2269,11 @@ DR_API
  * low-privilege process where another process injected a thread).  This
  * function returns true iff all threads were suspended, in which case \p
  * num_unsuspended will be 0.
+ * A false return still supplies the partial array and retains its synchronization
+ * ownership; it does not automatically resume the successfully suspended peers.
  *
- * The caller must invoke dr_resume_all_other_threads() in order to resume
+ * The caller must invoke dr_resume_all_other_threads(), even on a false return,
+ * in order to resume
  * the suspended threads, free the \p drcontexts array, and release
  * coarse-grain locks that prevent new threads from being created.
  *

@@ -67,6 +67,7 @@
 #endif
 /* for open */
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 #include "../globals.h"
 #include "../hashtable.h"
@@ -89,6 +90,12 @@
 
 #ifdef LINUX
 #    include <sys/vfs.h> /* for statfs */
+#    ifndef AT_EMPTY_PATH
+#        define AT_EMPTY_PATH 0x1000
+#    endif
+#    ifndef O_PATH
+#        define O_PATH 010000000
+#    endif
 #    ifndef PROC_SUPER_MAGIC
 #        define PROC_SUPER_MAGIC 0x9fa0
 #    endif
@@ -279,9 +286,13 @@ handle_execve_post(dcontext_t *dcontext);
 /* Helper used by os_list_threads() and os_list_threads_by_pid(). */
 static thread_id_t *
 os_list_threads_from_task_dir(dcontext_t *dcontext, const char *task_path,
-                              uint *num_threads_out);
+                              bool current_process, uint *num_threads_out);
 static bool
 os_switch_lib_tls(dcontext_t *dcontext, bool to_app);
+#if defined(LINUX) && defined(X86) && defined(X64)
+static uint64
+runtime_takeover_payload(process_id_t pid, thread_id_t tid);
+#endif
 static bool
 os_switch_seg_to_context(dcontext_t *dcontext, reg_id_t seg, bool to_app);
 #ifdef X86
@@ -358,9 +369,76 @@ static int min_dr_fd;
 
 /* we store all DR files so we can prevent the app from changing them,
  * and so we can close them in a child of fork.
- * the table key is the fd and the payload is the set of DR_FILE_* flags.
+ * The table key is the fd; policy is local to its kernel file-table domain.
+ * Only task-channel ownership is shared across copied descriptor ledgers.
  */
-static generic_table_t *fd_table;
+typedef struct {
+    uint64 filetable_id;
+    runtime_thread_id_t task;
+    uint references;
+} task_channel_owner_t;
+
+typedef struct {
+    uint flags;
+    uint64 identity;
+    task_channel_owner_t *channel_owner;
+} protected_fd_t;
+
+static void
+protected_fd_free(dcontext_t *dcontext, void *payload)
+{
+    protected_fd_t *entry = payload;
+    if (entry->channel_owner != NULL &&
+        __atomic_sub_fetch(&entry->channel_owner->references, 1, __ATOMIC_ACQ_REL) == 0)
+        UNPROTECTED_GLOBAL_FREE(entry->channel_owner,
+                                sizeof(*entry->channel_owner) HEAPACCT(ACCT_OTHER));
+    UNPROTECTED_GLOBAL_FREE(entry, sizeof(*entry) HEAPACCT(ACCT_OTHER));
+}
+
+typedef struct _file_table_domain_t {
+    generic_table_t *table;
+    recursive_lock_t transaction;
+    uint64 identity;
+    uint references;
+    file_t global_log;
+#ifdef LINUX
+    /* Pin the mount, not a task file: fork children query their own mm. */
+    file_t proc_mount;
+#endif
+    volatile int frozen;
+    struct _file_table_domain_t *next;
+    struct _file_table_domain_t *retired_next;
+} file_table_domain_t;
+
+typedef struct _file_table_snapshot_t {
+    file_table_domain_t *parent;
+    file_table_domain_t *child;
+    volatile int references;
+} file_table_snapshot_t;
+
+#ifdef LINUX
+DECLARE_NEVERPROT_VAR(static file_table_domain_t initial_file_table,
+                      { .global_log = INVALID_FILE, .proc_mount = INVALID_FILE });
+#else
+DECLARE_NEVERPROT_VAR(static file_table_domain_t initial_file_table,
+                      { .global_log = INVALID_FILE });
+#endif
+static file_table_domain_t *file_table_domains;
+DECLARE_NEVERPROT_VAR(static file_table_domain_t *retired_file_tables, NULL);
+DECLARE_NEVERPROT_VAR(static uint64 file_table_sequence, 0);
+DECLARE_NEVERPROT_VAR(static uint64 protected_file_sequence, 0);
+
+static file_table_domain_t *
+current_file_table(void);
+
+static void
+file_tables_exit(void);
+
+/* All existing descriptor consumers use the current kernel file-table domain. */
+#define fd_table (current_file_table()->table)
+#ifdef LINUX
+#    define procfs_root (current_file_table()->proc_mount)
+#endif
 #define INIT_HTABLE_SIZE_FD 6 /* should remain small */
 /* DR needs to open some files before the fd_table is allocated by d_r_os_init.
  * This is due to constraints on the order of invoking various init routines in
@@ -943,14 +1021,74 @@ detect_unsupported_syscalls(void)
     }
 }
 
-static void
-check_proc_mounted(void)
+/* Before final os_init (including self-relocation), borrow the exec handoff
+ * descriptor or use a temporary mount descriptor. Never leave a descriptor
+ * owned by the old libdynamorio mapping behind when it relocates itself.
+ */
+static file_t
+open_procfs_root(file_t *inherited_out)
 {
-    struct statfs stat;
-    ptr_int_t res = dynamorio_syscall(SYS_statfs, 2, "/proc", &stat);
-    if (res != 0 || stat.f_type != PROC_SUPER_MAGIC) {
-        FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
+    const char *value = our_environ == NULL ? NULL : getenv(DYNAMORIO_VAR_PROCFS_FD);
+    int inherited = INVALID_FILE;
+    char trailing;
+    if (inherited_out != NULL)
+        *inherited_out = INVALID_FILE;
+    if (value == NULL || sscanf(value, "%d%c", &inherited, &trailing) != 1 ||
+        inherited < 3)
+        inherited = INVALID_FILE;
+    for (uint attempt = 0; attempt < 2; ++attempt) {
+        struct statfs stat;
+        file_t root, maps;
+        if (attempt == 0 && inherited == INVALID_FILE)
+            continue;
+        root = dynamorio_syscall(SYS_openat, 4, attempt == 0 ? inherited : AT_FDCWD,
+                                 attempt == 0 ? "." : "/proc",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+        if (root < 0)
+            continue;
+        if (dynamorio_syscall(SYS_fstatfs, 2, root, &stat) != 0 ||
+            stat.f_type != PROC_SUPER_MAGIC) {
+            os_close(root);
+            continue;
+        }
+        /* Require a proc root that can resolve this task, not just an arbitrary
+         * procfs directory or a mount for a descendant PID namespace.
+         */
+        maps = dynamorio_syscall(SYS_openat, 4, root, "thread-self/maps",
+                                 O_RDONLY | O_CLOEXEC, 0);
+        if (maps < 0)
+            maps = dynamorio_syscall(SYS_openat, 4, root, "self/maps",
+                                     O_RDONLY | O_CLOEXEC, 0);
+        if (maps < 0) {
+            os_close(root);
+            continue;
+        }
+        os_close(maps);
+        if (attempt == 0 && inherited_out != NULL)
+            *inherited_out = inherited;
+        return root;
     }
+    return INVALID_FILE;
+}
+
+/* Paths are relative to the original proc mount. thread-self is resolved on
+ * each open by the kernel, in that mount's PID namespace, and still works when
+ * the application hides /proc or its thread-group leader has exited.
+ */
+file_t
+os_open_procfs(const char *path, bool directory)
+{
+    file_t root = procfs_root;
+    file_t file;
+    if (root == INVALID_FILE)
+        root = open_procfs_root(NULL);
+    if (root == INVALID_FILE)
+        return INVALID_FILE;
+    file = dynamorio_syscall(SYS_openat, 4, root, path,
+                             O_RDONLY | O_CLOEXEC | (directory ? O_DIRECTORY : 0), 0);
+    if (procfs_root == INVALID_FILE)
+        os_close(root);
+    return file < 0 ? INVALID_FILE : file;
 }
 #endif /* LINUX */
 
@@ -960,10 +1098,19 @@ is_sigqueue_supported(void)
     return IF_LINUX_ELSE(!is_sigqueueinfo_enosys, false);
 }
 
+static int
+fcntl_syscall(int fd, int cmd, long arg)
+{
+    return dynamorio_syscall(SYSNUM_NO_CANCEL(SYS_fcntl), 3, fd, cmd, arg);
+}
+
 /* os-specific initializations */
 void
 d_r_os_init(void)
 {
+#ifdef LINUX
+    file_t inherited_procfs_root = INVALID_FILE;
+#endif
     ksynch_init();
 
     get_uname();
@@ -1004,8 +1151,9 @@ d_r_os_init(void)
 #endif
 
 #if defined(LINUX)
-    if (!standalone_library)
-        check_proc_mounted();
+    procfs_root = open_procfs_root(&inherited_procfs_root);
+    if (procfs_root == INVALID_FILE && !standalone_library)
+        FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
     detect_unsupported_syscalls();
 #endif
 
@@ -1050,9 +1198,15 @@ d_r_os_init(void)
     IF_NO_MEMQUERY(memcache_init());
 
     /* we didn't have heap in os_file_init() so create and add global logfile now */
+    ASSIGN_INIT_RECURSIVE_LOCK_FREE(initial_file_table.transaction, fd_table_transaction);
+    initial_file_table.identity = ++file_table_sequence;
+    initial_file_table.references = 1;
+    initial_file_table.frozen = 0;
+    initial_file_table.next = NULL;
+    file_table_domains = &initial_file_table;
     fd_table = generic_hash_create(
         GLOBAL_DCONTEXT, INIT_HTABLE_SIZE_FD, 80 /* load factor: not perf-critical */,
-        HASHTABLE_SHARED | HASHTABLE_PERSISTENT, NULL _IF_DEBUG("fd table"));
+        HASHTABLE_SHARED | HASHTABLE_PERSISTENT, protected_fd_free _IF_DEBUG("fd table"));
     /* Add to fd_table the entries that we could not add before as fd_table was
      * not initialized.
      */
@@ -1061,6 +1215,22 @@ d_r_os_init(void)
         fd_table_add(fd_add_pre_heap[num_fd_add_pre_heap],
                      fd_add_pre_heap_flags[num_fd_add_pre_heap]);
     }
+
+#ifdef LINUX
+    if (procfs_root != INVALID_FILE) {
+        file_t private_root = fd_priv_dup(procfs_root);
+        if (private_root >= 0) {
+            os_close(procfs_root);
+            procfs_root = private_root;
+        }
+        if (!os_adopt_file_descriptor(procfs_root, false, false))
+            FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
+    }
+    if (inherited_procfs_root != INVALID_FILE)
+        os_close(inherited_procfs_root);
+    disable_env(DYNAMORIO_VAR_PROCFS_FD);
+
+#endif
 
     /* Ensure initialization */
     get_dynamorio_dll_start();
@@ -1507,8 +1677,16 @@ os_slow_exit(void)
     memquery_exit();
     ksynch_exit();
 
-    generic_hash_destroy(GLOBAL_DCONTEXT, fd_table);
-    fd_table = NULL;
+#ifdef LINUX
+    if (procfs_root != INVALID_FILE) {
+        os_close_protected(procfs_root);
+        procfs_root = INVALID_FILE;
+    }
+#endif
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_thread_suspend_service_exit();
+#endif
+    file_tables_exit();
 
     if (doing_detach) {
         vsyscall_page_start = NULL;
@@ -1824,13 +2002,546 @@ os_timeout(int time_in_milliseconds)
         } while (0)
 #endif /* X86/ARM/RISCV64 */
 
-#ifdef X86
+#if defined(X86) && (!defined(LINUX) || !defined(X64))
 /* We use this at thread init and exit to make it easy to identify
  * whether TLS is initialized (i#2089).
  * We assume alignment does not matter.
  */
 static os_local_state_t uninit_tls; /* has .magic == 0 */
 #endif
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Bootstrap identity cannot allocate from the DR heap or acquire an owned lock:
+ * both need this identity before normal TLS exists. These temporary pages are
+ * replaced by ordinary TLS during init, and restored only for final cleanup.
+ */
+#    define RUNTIME_TLS_SIZE ALIGN_FORWARD(sizeof(os_local_state_t), 4096)
+DECLARE_NEVERPROT_VAR(static os_local_state_t *runtime_bootstraps, NULL);
+DECLARE_NEVERPROT_VAR(static uint64 runtime_identity_counter, 0);
+DECLARE_NEVERPROT_VAR(static int runtime_bootstrap_lock, 0);
+
+static void
+runtime_identity_failed(void)
+{
+    static const char message[] = "DynamoRIO runtime identity bootstrap failed\n";
+    dynamorio_syscall(SYS_write, 3, STDERR_FILENO, message, sizeof(message) - 1);
+    dynamorio_syscall(SYS_exit_group, 1, 127);
+    for (;;)
+        __asm__ volatile("pause");
+}
+
+static uint64
+runtime_bootstrap_acquire(void)
+{
+    uint64 all = UINT64_MAX, previous = 0;
+    if (dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &all, &previous,
+                          sizeof(all)) != 0)
+        runtime_identity_failed();
+    while (__atomic_exchange_n(&runtime_bootstrap_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+    return previous;
+}
+
+static void
+runtime_bootstrap_release(uint64 mask, bool restore)
+{
+    __atomic_store_n(&runtime_bootstrap_lock, 0, __ATOMIC_RELEASE);
+    if (restore &&
+        dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &mask, NULL,
+                          sizeof(mask)) != 0)
+        runtime_identity_failed();
+}
+
+static void *
+runtime_gs_base(void)
+{
+    void *base = NULL;
+    if (os_fsgsbase_enabled())
+        __asm__ volatile("rdgsbase %0" : "=r"(base) : : "memory");
+    else if (dynamorio_syscall(SYS_arch_prctl, 2, ARCH_GET_GS, &base) != 0)
+        runtime_identity_failed();
+    return base;
+}
+
+static void
+runtime_set_gs(void *base)
+{
+    if (os_fsgsbase_enabled() && read_thread_register(SEG_GS) == 0 &&
+        (ptr_uint_t)base < (((ptr_uint_t)1 << 47) - 4096))
+        __asm__ volatile("wrgsbase %0" : : "r"(base) : "memory");
+    else if (dynamorio_syscall(SYS_arch_prctl, 2, ARCH_SET_GS, base) != 0)
+        runtime_identity_failed();
+}
+
+static os_local_state_t *
+runtime_bootstrap_current(void)
+{
+    void *base = runtime_gs_base();
+    uint64 mask = runtime_bootstrap_acquire();
+    os_local_state_t *entry = runtime_bootstraps;
+    while (entry != NULL && entry != base)
+        entry = entry->runtime_bootstrap_next;
+    runtime_bootstrap_release(mask, true);
+    return entry;
+}
+#endif
+
+static file_table_domain_t *
+current_file_table(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (!standalone_library) {
+        if (first_thread_tls_initialized && !last_thread_tls_exited) {
+            uint magic = safe_read_tls_magic();
+            if (magic == TLS_MAGIC_VALID || magic == TLS_MAGIC_INVALID) {
+                os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
+                if (tls != NULL && tls->file_table != NULL)
+                    return tls->file_table;
+            }
+        } else if (runtime_bootstraps != NULL) {
+            os_local_state_t *tls = runtime_bootstrap_current();
+            if (tls != NULL && tls->file_table != NULL)
+                return tls->file_table;
+        }
+    }
+#endif
+    return &initial_file_table;
+}
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+file_t *
+os_main_logfile_slot(void)
+{
+    return &current_file_table()->global_log;
+}
+
+static void
+file_table_drop(file_table_domain_t *files)
+{
+    if (files == NULL)
+        return;
+    uint previous = __atomic_load_n(&files->references, __ATOMIC_ACQUIRE);
+    while (previous != 0 &&
+           !__atomic_compare_exchange_n(&files->references, &previous, previous - 1,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    }
+    if (previous != 1 || files == &initial_file_table)
+        return;
+    file_table_domain_t *head;
+    do {
+        head = __atomic_load_n(&retired_file_tables, __ATOMIC_ACQUIRE);
+        files->retired_next = head;
+    } while (!__atomic_compare_exchange_n(&retired_file_tables, &head, files, false,
+                                          __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
+}
+
+static void
+file_table_collect(void)
+{
+    file_table_domain_t *entry =
+        __atomic_exchange_n(&retired_file_tables, NULL, __ATOMIC_ACQ_REL);
+    while (entry != NULL) {
+        file_table_domain_t *next = entry->retired_next;
+        uint64 mask = runtime_bootstrap_acquire();
+        file_table_domain_t **link = &file_table_domains;
+        while (*link != NULL && *link != entry)
+            link = &(*link)->next;
+        if (*link != NULL)
+            *link = entry->next;
+        runtime_bootstrap_release(mask, true);
+        generic_hash_destroy(GLOBAL_DCONTEXT, entry->table);
+        DELETE_RECURSIVE_LOCK(entry->transaction);
+        UNPROTECTED_GLOBAL_FREE(entry, sizeof(*entry) HEAPACCT(ACCT_OTHER));
+        entry = next;
+    }
+}
+#endif
+
+/* Called with this domain's transaction held. No other table is operated on:
+ * copied relay endpoints are closed only by a task using that kernel table. */
+static void
+file_table_sweep_channels(file_table_domain_t *files)
+{
+    TABLE_RWLOCK(files->table, write, lock);
+    int iterator = 0;
+    ptr_uint_t descriptor;
+    protected_fd_t *entry;
+    while ((iterator = generic_hash_iterate_next(GLOBAL_DCONTEXT, files->table, iterator,
+                                                 &descriptor, (void **)&entry)) >= 0) {
+        if (entry->channel_owner != NULL &&
+            __atomic_load_n(&entry->channel_owner->filetable_id, __ATOMIC_ACQUIRE) !=
+                files->identity) {
+            close_syscall((file_t)descriptor);
+            iterator = generic_hash_iterate_remove(GLOBAL_DCONTEXT, files->table,
+                                                   iterator, descriptor);
+        }
+    }
+    TABLE_RWLOCK(files->table, write, unlock);
+}
+
+static file_table_domain_t *
+file_table_transaction_begin(void)
+{
+    file_table_domain_t *files = current_file_table();
+    if (files->table == NULL)
+        return files;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    file_table_collect();
+#endif
+    for (;;) {
+        acquire_recursive_lock(&files->transaction);
+        if (__atomic_load_n(&files->frozen, __ATOMIC_ACQUIRE) == 0) {
+            file_table_sweep_channels(files);
+            return files;
+        }
+        release_recursive_lock(&files->transaction);
+        /* A clone has copied this ledger and is about to copy the kernel
+         * table. Its first returning task unfreezes it without an owned lock.
+         */
+        os_thread_yield();
+    }
+}
+
+static void
+file_table_transaction_end(file_table_domain_t *files)
+{
+    if (files->table != NULL)
+        release_recursive_lock(&files->transaction);
+}
+
+static void
+file_tables_exit(void)
+{
+    /* Debug closes its final main log after OS/heap metadata cleanup. Preserve
+     * this caller's role in the immortal initial slot until that final close. */
+    initial_file_table.global_log = current_file_table()->global_log;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_local_state_t *tls = runtime_bootstrap_current();
+    if (tls != NULL)
+        tls->file_table = &initial_file_table;
+#endif
+    file_table_domain_t *entry = file_table_domains;
+    file_table_domains = NULL;
+    retired_file_tables = NULL;
+    while (entry != NULL) {
+        file_table_domain_t *next = entry->next;
+        generic_table_t *table = entry->table;
+        entry->table = NULL;
+        if (table != NULL)
+            generic_hash_destroy(GLOBAL_DCONTEXT, table);
+        DELETE_RECURSIVE_LOCK(entry->transaction);
+        if (entry != &initial_file_table)
+            UNPROTECTED_GLOBAL_FREE(entry, sizeof(*entry) HEAPACCT(ACCT_OTHER));
+        entry = next;
+    }
+}
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* The caller holds the source transaction, so no descriptor mutation can
+ * cross the copied metadata/kernel file-table boundary. */
+static file_table_domain_t *
+file_table_copy(file_table_domain_t *source)
+{
+    file_table_domain_t *copy =
+        UNPROTECTED_GLOBAL_ALLOC(sizeof(*copy) HEAPACCT(ACCT_OTHER));
+    memset(copy, 0, sizeof(*copy));
+    ASSIGN_INIT_RECURSIVE_LOCK_FREE(copy->transaction, fd_table_transaction);
+    copy->identity = __atomic_add_fetch(&file_table_sequence, 1, __ATOMIC_RELAXED);
+    if (copy->identity == 0)
+        runtime_identity_failed();
+    copy->references = 1;
+    copy->global_log = source->global_log;
+    copy->proc_mount = source->proc_mount;
+    copy->table = generic_hash_create(GLOBAL_DCONTEXT, INIT_HTABLE_SIZE_FD, 80,
+                                      HASHTABLE_SHARED | HASHTABLE_PERSISTENT,
+                                      protected_fd_free _IF_DEBUG("fd domain table"));
+    TABLE_RWLOCK(source->table, read, lock);
+    size_t count = source->table->entries;
+    ptr_uint_t *entries = count == 0
+        ? NULL
+        : global_heap_alloc(count * 2 * sizeof(*entries) HEAPACCT(ACCT_OTHER));
+    int iterator = 0;
+    size_t used = 0;
+    ptr_uint_t descriptor;
+    void *flags;
+    while ((iterator = generic_hash_iterate_next(GLOBAL_DCONTEXT, source->table, iterator,
+                                                 &descriptor, &flags)) >= 0) {
+        ASSERT(used < count);
+        entries[used * 2] = descriptor;
+        entries[used * 2 + 1] = (ptr_uint_t)flags;
+        ++used;
+    }
+    TABLE_RWLOCK(source->table, read, unlock);
+    TABLE_RWLOCK(copy->table, write, lock);
+    for (size_t index = 0; index < used; ++index) {
+        protected_fd_t *entry =
+            UNPROTECTED_GLOBAL_ALLOC(sizeof(*entry) HEAPACCT(ACCT_OTHER));
+        *entry = *(protected_fd_t *)entries[index * 2 + 1];
+        if (entry->channel_owner != NULL)
+            __atomic_add_fetch(&entry->channel_owner->references, 1, __ATOMIC_RELAXED);
+        generic_hash_add(GLOBAL_DCONTEXT, copy->table, entries[index * 2], entry);
+    }
+    TABLE_RWLOCK(copy->table, write, unlock);
+    if (entries != NULL)
+        global_heap_free(entries, count * 2 * sizeof(*entries) HEAPACCT(ACCT_OTHER));
+    uint64 mask = runtime_bootstrap_acquire();
+    copy->next = file_table_domains;
+    file_table_domains = copy;
+    runtime_bootstrap_release(mask, true);
+    return copy;
+}
+
+/* The kernel has already made a private table. Transfer this task's reference,
+ * retaining its channel while making old-table copies eligible for local cleanup.
+ * No other task can access the new domain before this task publishes it in TLS. */
+static file_table_domain_t *
+file_table_unshare_commit(dcontext_t *dcontext, file_table_domain_t *source,
+                          file_table_domain_t *copy)
+{
+    os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
+    ASSERT(tls != NULL && tls->file_table == source);
+    TABLE_RWLOCK(copy->table, write, lock);
+    int iterator = 0;
+    protected_fd_t *entry;
+    while ((iterator = generic_hash_iterate_next(GLOBAL_DCONTEXT, copy->table, iterator,
+                                                 NULL, (void **)&entry)) >= 0) {
+        if (entry->channel_owner != NULL &&
+            entry->channel_owner->task == get_runtime_thread_id())
+            __atomic_store_n(&entry->channel_owner->filetable_id, copy->identity,
+                             __ATOMIC_RELEASE);
+    }
+    TABLE_RWLOCK(copy->table, write, unlock);
+    thread_suspend_channel_t *channel =
+        &((os_thread_data_t *)dcontext->os_field)->suspend_channel;
+    if (channel->filetable_id == source->identity)
+        channel->filetable_id = copy->identity;
+    tls->file_table = copy;
+    file_table_transaction_end(source);
+    file_table_drop(source);
+    return file_table_transaction_begin();
+}
+
+static void
+file_table_snapshot_release(file_table_snapshot_t *snapshot)
+{
+    if (snapshot == NULL)
+        return;
+    __atomic_store_n(&snapshot->parent->frozen, 0, __ATOMIC_RELEASE);
+    if (__atomic_sub_fetch(&snapshot->references, 1, __ATOMIC_ACQ_REL) == 0) {
+        file_table_drop(snapshot->parent);
+        UNPROTECTED_GLOBAL_FREE(snapshot, sizeof(*snapshot) HEAPACCT(ACCT_OTHER));
+    }
+}
+
+static void
+file_table_clone_begin(dcontext_t *parent)
+{
+    os_thread_data_t *data = parent->os_field;
+    os_local_state_t *bootstrap = data->runtime_child_bootstrap;
+    if (bootstrap == NULL)
+        runtime_identity_failed();
+    file_table_domain_t *files = file_table_transaction_begin();
+    if (data->runtime_clone_shares_files) {
+        ASSERT(bootstrap->file_table == files);
+    } else {
+        file_table_snapshot_t *snapshot =
+            UNPROTECTED_GLOBAL_ALLOC(sizeof(*snapshot) HEAPACCT(ACCT_OTHER));
+        snapshot->parent = files;
+        __atomic_add_fetch(&files->references, 1, __ATOMIC_RELAXED);
+        snapshot->child = file_table_copy(files);
+        snapshot->references = 2;
+        data->runtime_file_snapshot = snapshot;
+        bootstrap->file_snapshot = snapshot;
+        file_table_drop(bootstrap->file_table);
+        bootstrap->file_table = snapshot->child;
+        __atomic_store_n(&files->frozen, 1, __ATOMIC_RELEASE);
+    }
+    file_table_transaction_end(files);
+}
+#endif
+
+void *
+os_runtime_identity_prepare(runtime_thread_id_t id, runtime_thread_id_t group,
+                            void *app_gs)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    file_table_domain_t *files = current_file_table();
+    if (id == INVALID_RUNTIME_THREAD_ID && files->table != NULL)
+        __atomic_add_fetch(&files->references, 1, __ATOMIC_RELAXED);
+    uint64 mask = runtime_bootstrap_acquire();
+    if (id == INVALID_RUNTIME_THREAD_ID) {
+        if (runtime_identity_counter == UINT64_MAX)
+            runtime_identity_failed();
+        id = ++runtime_identity_counter;
+    }
+    ptr_int_t allocation =
+        dynamorio_syscall(SYS_mmap, 6, NULL, RUNTIME_TLS_SIZE, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((ptr_uint_t)allocation >= (ptr_uint_t)-4095)
+        runtime_identity_failed();
+    os_local_state_t *tls = (os_local_state_t *)allocation;
+    tls->self = tls;
+    tls->magic = TLS_MAGIC_INVALID;
+    tls->runtime_id = id;
+    tls->runtime_group = group != INVALID_RUNTIME_THREAD_ID ? group : id;
+    tls->file_table = files;
+    tls->runtime_app_gs = app_gs;
+    tls->tid = (thread_id_t)dynamorio_syscall(SYS_gettid, 0);
+    tls->runtime_bootstrap_next = runtime_bootstraps;
+    runtime_bootstraps = tls;
+    runtime_bootstrap_release(mask, true);
+    return tls;
+#else
+    return NULL;
+#endif
+}
+
+void
+os_runtime_identity_enter(void *bootstrap)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (bootstrap == NULL)
+        runtime_identity_failed();
+    os_local_state_t *tls = bootstrap;
+    tls->tid = (thread_id_t)dynamorio_syscall(SYS_gettid, 0);
+    runtime_set_gs(tls);
+    if (tls->file_snapshot != NULL)
+        __atomic_store_n(&tls->file_snapshot->parent->frozen, 0, __ATOMIC_RELEASE);
+#endif
+}
+
+void
+os_runtime_identity_discard(void *bootstrap)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (bootstrap == NULL)
+        return;
+    uint64 mask = runtime_bootstrap_acquire();
+    os_local_state_t **entry = &runtime_bootstraps;
+    while (*entry != NULL && *entry != bootstrap)
+        entry = &(*entry)->runtime_bootstrap_next;
+    if (*entry != NULL) {
+        file_table_drop((*entry)->file_table);
+        *entry = (*entry)->runtime_bootstrap_next;
+        if (dynamorio_syscall(SYS_munmap, 2, bootstrap, RUNTIME_TLS_SIZE) != 0)
+            runtime_identity_failed();
+    }
+    runtime_bootstrap_release(mask, true);
+#endif
+}
+
+bool
+os_runtime_identity_is_bootstrap(void *base)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    uint64 mask = runtime_bootstrap_acquire();
+    os_local_state_t *entry = runtime_bootstraps;
+    while (entry != NULL && entry != base)
+        entry = entry->runtime_bootstrap_next;
+    bool found = entry != NULL;
+    runtime_bootstrap_release(mask, true);
+    return found;
+#else
+    return false;
+#endif
+}
+
+void
+os_runtime_identity_init(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (first_thread_tls_initialized && !last_thread_tls_exited) {
+        uint magic = safe_read_tls_magic();
+        if (magic == TLS_MAGIC_VALID || magic == TLS_MAGIC_INVALID) {
+            os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
+            if (tls != NULL && tls->runtime_id != INVALID_RUNTIME_THREAD_ID)
+                return;
+        }
+    }
+    if (runtime_bootstrap_current() == NULL) {
+        void *base = runtime_gs_base();
+        os_runtime_identity_enter(os_runtime_identity_prepare(
+            INVALID_RUNTIME_THREAD_ID, INVALID_RUNTIME_THREAD_ID, base));
+    }
+#endif
+}
+
+void
+os_runtime_identity_finish(bool restore_signal_mask)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    void *base = runtime_gs_base();
+    uint64 mask = runtime_bootstrap_acquire();
+    os_local_state_t **entry = &runtime_bootstraps;
+    while (*entry != NULL && *entry != base)
+        entry = &(*entry)->runtime_bootstrap_next;
+    if (*entry != NULL) {
+        os_local_state_t *tls = *entry;
+        *entry = tls->runtime_bootstrap_next;
+        file_table_drop(tls->file_table);
+        tls->file_table = NULL;
+        runtime_set_gs(tls->runtime_app_gs);
+        if (dynamorio_syscall(SYS_munmap, 2, tls, RUNTIME_TLS_SIZE) != 0)
+            runtime_identity_failed();
+    }
+    runtime_bootstrap_release(mask, restore_signal_mask);
+#endif
+}
+
+void *
+os_runtime_clone_prepare(dcontext_t *parent, uint64 flags)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_thread_data_t *data = parent->os_field;
+    if (data->runtime_child_bootstrap != NULL)
+        runtime_identity_failed();
+    data->runtime_clone_shares_files = TESTANY(CLONE_FILES, flags);
+    data->runtime_child_bootstrap = os_runtime_identity_prepare(
+        INVALID_RUNTIME_THREAD_ID,
+        TESTANY(CLONE_THREAD, flags) ? get_runtime_thread_group()
+                                     : INVALID_RUNTIME_THREAD_ID,
+        os_get_app_tls_base(parent, SEG_GS));
+    return data->runtime_child_bootstrap;
+#else
+    return NULL;
+#endif
+}
+
+void
+os_runtime_clone_complete(dcontext_t *parent, bool succeeded)
+{
+#ifdef LINUX
+    os_thread_data_t *data = parent->os_field;
+#    if defined(X86) && defined(X64)
+    if (!succeeded) {
+        os_runtime_identity_discard(data->runtime_child_bootstrap);
+        file_table_snapshot_release(data->runtime_file_snapshot);
+    }
+    file_table_snapshot_release(data->runtime_file_snapshot);
+    data->runtime_file_snapshot = NULL;
+    data->runtime_child_bootstrap = NULL;
+#    endif
+    void *record = data->pending_clone_record;
+    data->pending_clone_record = NULL;
+    if (!succeeded)
+        signal_clone_failed(parent, record);
+#endif
+}
+
+void
+os_runtime_clone_child_ready(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
+    if (tls != NULL && tls->runtime_signal_mask_valid) {
+        uint64 mask = tls->runtime_signal_mask;
+        tls->runtime_signal_mask_valid = false;
+        if (dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &mask, NULL,
+                              sizeof(mask)) != 0)
+            runtime_identity_failed();
+    }
+#endif
+}
 
 static bool
 is_thread_tls_initialized(void)
@@ -1862,7 +2573,8 @@ is_thread_tls_initialized(void)
          * or TLS for detaching threads.  This var is not cleared until re-init,
          * so we have no race with the end of detach.
          */
-        if (detacher_tid != INVALID_THREAD_ID && detacher_tid != get_sys_thread_id())
+        if (detacher_runtime_id != INVALID_RUNTIME_THREAD_ID &&
+            detacher_runtime_id != get_runtime_thread_id())
             return false;
         /* To handle WSL (i#1986) where fs and gs start out equal to ss (0x2b),
          * and when the MSR is used having a zero selector, and other complexities,
@@ -1977,6 +2689,74 @@ is_thread_tls_allocated(void)
 }
 #endif
 
+bool
+os_runtime_identity_present(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (first_thread_tls_initialized && !last_thread_tls_exited) {
+        uint magic = safe_read_tls_magic();
+        if (magic == TLS_MAGIC_VALID || magic == TLS_MAGIC_INVALID) {
+            os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
+            if (tls != NULL && tls->runtime_id != INVALID_RUNTIME_THREAD_ID)
+                return true;
+        }
+    }
+    return runtime_bootstrap_current() != NULL;
+#else
+    return true;
+#endif
+}
+
+runtime_thread_id_t
+get_runtime_thread_id(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* The standalone decoder does not take over application tasks or install
+     * DR TLS. Preserve its kernel-identity locking contract in that explicit
+     * mode; an uninitialized managed task must still fail closed below.
+     */
+    if (standalone_library)
+        return (runtime_thread_id_t)dynamorio_syscall(SYS_gettid, 0);
+    if (first_thread_tls_initialized && !last_thread_tls_exited) {
+        uint magic = safe_read_tls_magic();
+        if (magic == TLS_MAGIC_VALID || magic == TLS_MAGIC_INVALID) {
+            os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
+            if (tls != NULL && tls->runtime_id != INVALID_RUNTIME_THREAD_ID)
+                return tls->runtime_id;
+        }
+    }
+    os_local_state_t *bootstrap = runtime_bootstrap_current();
+    if (bootstrap == NULL)
+        runtime_identity_failed();
+    return bootstrap->runtime_id;
+#else
+    return d_r_get_thread_id();
+#endif
+}
+
+runtime_thread_id_t
+get_runtime_thread_group(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (standalone_library)
+        return (runtime_thread_id_t)dynamorio_syscall(SYS_getpid, 0);
+    if (first_thread_tls_initialized && !last_thread_tls_exited) {
+        uint magic = safe_read_tls_magic();
+        if (magic == TLS_MAGIC_VALID || magic == TLS_MAGIC_INVALID) {
+            os_local_state_t *tls = (os_local_state_t *)safe_read_tls_self();
+            if (tls != NULL && tls->runtime_group != INVALID_RUNTIME_THREAD_ID)
+                return tls->runtime_group;
+        }
+    }
+    os_local_state_t *bootstrap = runtime_bootstrap_current();
+    if (bootstrap == NULL)
+        runtime_identity_failed();
+    return bootstrap->runtime_group;
+#else
+    return get_process_id();
+#endif
+}
+
 /* converts a local_state_t offset to a segment offset */
 ushort
 os_tls_offset(ushort tls_offs)
@@ -2042,6 +2822,22 @@ get_os_tls_from_dc(dcontext_t *dcontext)
     if (local_state == NULL)
         return NULL;
     return (os_local_state_t *)(local_state - offsetof(os_local_state_t, state));
+}
+
+uint64
+os_file_table_identity(dcontext_t *context)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (context != NULL && context != GLOBAL_DCONTEXT) {
+        if (context->local_state == NULL)
+            return 0;
+        file_table_domain_t *files = get_os_tls_from_dc(context)->file_table;
+        return files == NULL ? 0 : files->identity;
+    }
+#else
+    (void)context;
+#endif
+    return current_file_table()->identity;
 }
 
 #if defined(AARCHXX) || defined(RISCV64)
@@ -2317,6 +3113,11 @@ os_tls_app_seg_init(os_local_state_t *os_tls, void *segment)
 #endif
     app_lib_tls_base = get_segment_base(TLS_REG_LIB);
     app_alt_tls_base = get_segment_base(TLS_REG_ALT);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* The bootstrap GS is ours, not the application's inherited alternate TLS. */
+    if (os_tls->runtime_id != INVALID_RUNTIME_THREAD_ID)
+        app_alt_tls_base = os_tls->runtime_app_gs;
+#endif
 
     /* If we're a non-initial thread, tls will be set to the parent's value,
      * or to &uninit_tls (i#2089), both of which will be is_dynamo_address().
@@ -2377,6 +3178,11 @@ os_tls_app_seg_init(os_local_state_t *os_tls, void *segment)
 void
 os_tls_init(void)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_local_state_t *bootstrap = runtime_bootstrap_current();
+    if (bootstrap == NULL)
+        runtime_identity_failed();
+#endif
 #ifdef X86
     ASSERT(TLS_MAGIC_OFFSET_ASM == TLS_MAGIC_OFFSET);
     ASSERT(TLS_SELF_OFFSET_ASM == TLS_SELF_OFFSET);
@@ -2402,6 +3208,17 @@ os_tls_init(void)
     memset(segment, 0, PAGE_SIZE);
 #    endif
     os_local_state_t *os_tls = (os_local_state_t *)segment;
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    os_tls->runtime_id = bootstrap->runtime_id;
+    os_tls->runtime_group = bootstrap->runtime_group;
+    os_tls->file_table = bootstrap->file_table;
+    bootstrap->file_table = NULL;
+    os_tls->file_snapshot = bootstrap->file_snapshot;
+    bootstrap->file_snapshot = NULL;
+    os_tls->runtime_app_gs = bootstrap->runtime_app_gs;
+    os_tls->runtime_signal_mask = bootstrap->runtime_signal_mask;
+    os_tls->runtime_signal_mask_valid = bootstrap->runtime_signal_mask_valid;
+#    endif
 
     LOG(GLOBAL, LOG_THREADS, 1, "os_tls_init for thread " TIDFMT "\n",
         d_r_get_thread_id());
@@ -2428,6 +3245,14 @@ os_tls_init(void)
     if (MACHINE_TLS_IS_DR_TLS)
         os_tls_app_seg_init(os_tls, segment);
 
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    /* Both the old bootstrap and the new segment have a readable identity.
+     * Logging inside tls_thread_init may acquire locks on either side of the
+     * GS switch, before that routine returns.
+     */
+    first_thread_tls_initialized = true;
+    last_thread_tls_exited = false;
+#    endif
     tls_thread_init(os_tls, segment);
     ASSERT(os_tls->tls_type != TLS_TYPE_NONE);
     /* store type in global var for convenience: should be same for all threads */
@@ -2456,6 +3281,9 @@ os_tls_init(void)
     set_thread_private_dcontext(NULL);
 #endif
     ASSERT(is_thread_tls_initialized());
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_runtime_identity_discard(bootstrap);
+#endif
 }
 
 static bool
@@ -2485,7 +3313,18 @@ os_tls_thread_exit(local_state_t *local_state)
     ASSERT(offsetof(local_state_t, spill_space) ==
            offsetof(local_state_extended_t, spill_space));
 
-    if (should_zero_tls_at_thread_exit()) {
+    bool identity_retained = false;
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    if (tls_type == TLS_TYPE_ARCH_PRCTL) {
+        /* The normal TLS page is freed before thread_initexit_lock and the
+         * final EXITING_DR lock are released. Keep their owner unchanged.
+         */
+        os_runtime_identity_enter(os_runtime_identity_prepare(
+            os_tls->runtime_id, os_tls->runtime_group, os_tls->app_alt_tls_base));
+        identity_retained = true;
+    }
+#    endif
+    if (should_zero_tls_at_thread_exit() && !identity_retained) {
         tls_thread_free(tls_type, index);
 
 #    if (defined(AARCHXX) || defined(RISCV64)) && !defined(MACOS)
@@ -2552,6 +3391,12 @@ os_tls_exit(local_state_t *local_state, bool other_thread)
     /* ASSUMPTION: local_state_t is laid out at same start as local_state_extended_t */
     os_local_state_t *os_tls =
         (os_local_state_t *)(((byte *)local_state) - offsetof(os_local_state_t, state));
+#        if defined(LINUX) && defined(X86) && defined(X64)
+    if (other_thread) {
+        file_table_drop(os_tls->file_table);
+        os_tls->file_table = NULL;
+    }
+#        endif
     heap_munmap(os_tls->self, PAGE_SIZE, VMM_SPECIAL_MMAP | VMM_PER_THREAD);
 #    endif
 #else
@@ -2658,6 +3503,9 @@ os_thread_init(dcontext_t *dcontext, void *os_data)
      * (don't have app esp register handy here to init now)
      */
     memset(ostd, 0, sizeof(*ostd));
+#ifdef LINUX
+    ostd->exec_procfs_root = INVALID_FILE;
+#endif
 
     ksynch_init_var(&ostd->suspended);
     ksynch_init_var(&ostd->wakeup);
@@ -2718,12 +3566,28 @@ os_thread_init_finalize(dcontext_t *dcontext, void *os_data)
      * thread_initexit_lock (i#2779).
      */
     signal_thread_inherit(dcontext, os_data);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_local_state_t *tls = get_os_tls_from_dc(dcontext);
+    file_table_snapshot_t *snapshot = tls->file_snapshot;
+    tls->file_snapshot = NULL;
+    if (snapshot != NULL) {
+        file_table_domain_t *files = file_table_transaction_begin();
+        file_table_transaction_end(files);
+        file_table_snapshot_release(snapshot);
+    }
+    os_thread_suspend_register(dcontext);
+#endif
 }
 
 void
 os_thread_exit(dcontext_t *dcontext, bool other_thread)
 {
     os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (other_thread)
+        os_thread_suspend_release(dcontext, true);
+#endif
 
     /* i#237/PR 498284: if we had a vfork child call execve we need to clean up
      * the env vars.
@@ -2746,7 +3610,14 @@ os_thread_exit(dcontext_t *dcontext, bool other_thread)
         if (!other_thread) {
             /* Avoid faults in is_thread_tls_initialized() */
             /* XXX i#2088: we need to restore the app's aux seg, if any, instead. */
+#    if defined(LINUX) && defined(X64)
+            /* Keep identity available through heap and lock cleanup. */
+            os_local_state_t *tls = get_os_tls_from_dc(dcontext);
+            tls->magic = TLS_MAGIC_INVALID;
+            runtime_set_gs(tls);
+#    else
             os_set_dr_tls_base(dcontext, NULL, (byte *)&uninit_tls);
+#    endif
         }
         /* We have to free in release build too b/c "local unprotected" is global. */
         HEAP_TYPE_FREE(dcontext, ostd->clone_tls, os_local_state_t, ACCT_THREAD_MGT,
@@ -2842,7 +3713,29 @@ os_fork_init(dcontext_t *dcontext)
     int iter;
     /* We use a larger data size than file_t to avoid clobbering our stack (i#991) */
     ptr_uint_t fd;
-    ptr_uint_t flags;
+    protected_fd_t *entry;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_thread_suspend_fork_child();
+    /* Only this task survives ordinary fork. Preserve its token and the
+     * counter, but discard temporary state belonging to vanished tasks.
+     */
+    __atomic_store_n(&runtime_bootstrap_lock, 0, __ATOMIC_RELAXED);
+    uint64 identity_mask = runtime_bootstrap_acquire();
+    void *current_tls = runtime_gs_base();
+    os_local_state_t **identity = &runtime_bootstraps;
+    while (*identity != NULL) {
+        os_local_state_t *entry = *identity;
+        if (entry == current_tls) {
+            identity = &entry->runtime_bootstrap_next;
+        } else {
+            *identity = entry->runtime_bootstrap_next;
+            file_table_drop(entry->file_table);
+            if (dynamorio_syscall(SYS_munmap, 2, entry, RUNTIME_TLS_SIZE) != 0)
+                runtime_identity_failed();
+        }
+    }
+    runtime_bootstrap_release(identity_mask, true);
+#endif
 
     /* Static assert would save debug build overhead: could use array bound trick */
     ASSERT(sizeof(file_t) <= sizeof(ptr_uint_t));
@@ -2868,10 +3761,10 @@ os_fork_init(dcontext_t *dcontext)
     iter = 0;
     do {
         iter = generic_hash_iterate_next(GLOBAL_DCONTEXT, fd_table, iter, &fd,
-                                         (void **)&flags);
+                                         (void **)&entry);
         if (iter < 0)
             break;
-        if (TESTANY(OS_OPEN_CLOSE_ON_FORK, flags)) {
+        if (TESTANY(OS_OPEN_CLOSE_ON_FORK, entry->flags)) {
             close_syscall((file_t)fd);
             iter = generic_hash_iterate_remove(GLOBAL_DCONTEXT, fd_table, iter, fd);
         }
@@ -2963,6 +3856,19 @@ os_new_thread_pre(void)
 static void
 os_clone_pre(dcontext_t *dcontext)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_thread_data_t *data = dcontext->os_field;
+    os_local_state_t *bootstrap = data->runtime_child_bootstrap;
+    if (bootstrap != NULL) {
+        uint64 all = UINT64_MAX;
+        if (dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &all,
+                              &data->runtime_clone_mask, sizeof(all)) != 0)
+            runtime_identity_failed();
+        data->runtime_clone_mask_valid = true;
+        bootstrap->runtime_signal_mask = data->runtime_clone_mask;
+        bootstrap->runtime_signal_mask_valid = true;
+    }
+#endif
     /* We switch the lib tls segment back to app's segment.
      * Please refer to comment on os_switch_lib_tls.
      */
@@ -2981,6 +3887,19 @@ void
 os_clone_post(dcontext_t *dcontext)
 {
     os_swap_dr_tls(dcontext, false /*to DR*/);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_thread_data_t *data = dcontext->os_field;
+    if (data->runtime_file_snapshot != NULL)
+        __atomic_store_n(&data->runtime_file_snapshot->parent->frozen, 0,
+                         __ATOMIC_RELEASE);
+    if (data->runtime_clone_mask_valid) {
+        uint64 mask = data->runtime_clone_mask;
+        data->runtime_clone_mask_valid = false;
+        if (dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &mask, NULL,
+                              sizeof(mask)) != 0)
+            runtime_identity_failed();
+    }
+#endif
 }
 
 byte *
@@ -3650,7 +4569,8 @@ find_free_memory_in_region(byte *start, byte *end, size_t size,
      */
     app_pc last_end = (app_pc)(PAGE_SIZE * 16);
     bool found = false;
-    memquery_iterator_start(&iter, NULL, false /*won't alloc*/);
+    if (!memquery_iterator_start(&iter, NULL, false /*won't alloc*/))
+        return false;
     while (memquery_iterator_next(&iter)) {
         if (iter.vm_start >= start &&
             MIN(iter.vm_start, end) - MAX(last_end, start) >= size) {
@@ -3845,6 +4765,12 @@ known_thread_signal(thread_record_t *tr, int signum)
         tr->dcontext->thread_port, res);
     return res == 0;
 #else
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    /* Runtime groups need not share a PID namespace. A namespace-local pid/tid
+     * may name a different live task in the caller's namespace. */
+    if (tr->runtime_group != get_runtime_thread_group())
+        return os_thread_suspend_relay(tr, signum) == THREAD_SUSPEND_DELIVERED;
+#    endif
     return thread_signal(tr->pid, tr->id, signum);
 #endif
 }
@@ -3911,6 +4837,12 @@ send_suspend_signal(thread_record_t *tr, pid_t pid, thread_id_t tid)
     else
         return thread_signal(pid, tid, SUSPEND_SIGNAL);
 #else
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    /* The queued-signal route bypasses known_thread_signal, so apply the same
+     * exact-target requirement before either queued or legacy raw delivery. */
+    if (tr != NULL && tr->runtime_group != get_runtime_thread_group())
+        return os_thread_suspend_relay(tr, SUSPEND_SIGNAL) == THREAD_SUSPEND_DELIVERED;
+#    endif
     if (is_sigqueueinfo_enosys) {
         /* We'd prefer to use sigqueueinfo to better distinguish our signals from app
          * signals, and to support SUSPEND_SIGNAL == NUDGESIG_SIGNUM.  If sigqueueinfo
@@ -3924,7 +4856,12 @@ send_suspend_signal(thread_record_t *tr, pid_t pid, thread_id_t tid)
             return thread_signal(pid, tid, SUSPEND_SIGNAL);
     }
     kernel_siginfo_t info;
-    if (!create_nudge_signal_payload(&info, 0, NUDGE_IS_SUSPEND, 0, 0))
+    uint64 identity = 0;
+#    if defined(X86) && defined(X64)
+    if (tr == NULL)
+        identity = runtime_takeover_payload(pid, tid);
+#    endif
+    if (!create_nudge_signal_payload(&info, 0, NUDGE_IS_SUSPEND, 0, identity))
         return false;
     ptr_int_t res =
         dynamorio_syscall(SYS_rt_tgsigqueueinfo, 4, pid, tid, SUSPEND_SIGNAL, &info);
@@ -3936,6 +4873,7 @@ bool
 os_thread_suspend(thread_record_t *tr)
 {
     os_thread_data_t *ostd = (os_thread_data_t *)tr->dcontext->os_field;
+    bool resume_failed_relay = false;
     ASSERT(ostd != NULL);
     /* See synch comments in os_thread_resume: the mutex held there
      * prevents prematurely sending a re-suspend signal.
@@ -3954,10 +4892,31 @@ os_thread_suspend(thread_record_t *tr)
          * to match Windows behavior.
          */
         ASSERT(ksynch_get_value(&ostd->suspended) == 0);
+#if defined(LINUX) && defined(X86) && defined(X64)
+        const bool relay = tr->runtime_group != get_runtime_thread_group();
+        __atomic_store_n(&ostd->suspend_relay_gate,
+                         relay ? THREAD_SUSPEND_ARMED : THREAD_SUSPEND_IDLE,
+                         __ATOMIC_RELEASE);
+#endif
         if (!send_suspend_signal(tr, tr->pid, tr->id)) {
-            ostd->suspend_count--;
-            d_r_mutex_unlock(&ostd->suspend_lock);
-            return false;
+#if defined(LINUX) && defined(X86) && defined(X64)
+            if (relay &&
+                !atomic_compare_exchange_int(&ostd->suspend_relay_gate,
+                                             THREAD_SUSPEND_ARMED,
+                                             THREAD_SUSPEND_CANCELLED)) {
+                /* The handler already owns this request, even if only the
+                 * broker's reply was lost. Wait for its actual ACK and release
+                 * our suspension reference through the normal resume handshake. */
+                ASSERT(__atomic_load_n(&ostd->suspend_relay_gate, __ATOMIC_ACQUIRE) ==
+                       THREAD_SUSPEND_ENTERED);
+                resume_failed_relay = true;
+            } else
+#endif
+            {
+                ostd->suspend_count--;
+                d_r_mutex_unlock(&ostd->suspend_lock);
+                return false;
+            }
         }
     }
     /* we can unlock before the wait loop b/c we're using a separate "resumed"
@@ -3983,6 +4942,10 @@ os_thread_suspend(thread_record_t *tr)
             /* If it still has to wait, give up the cpu. */
             os_thread_yield();
         }
+    }
+    if (resume_failed_relay) {
+        os_thread_resume(tr);
+        return false;
     }
     return true;
 }
@@ -4025,6 +4988,9 @@ os_thread_resume(thread_record_t *tr)
     }
     ksynch_set_value(&ostd->wakeup, 0);
     ksynch_set_value(&ostd->resumed, 0);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    __atomic_store_n(&ostd->suspend_relay_gate, THREAD_SUSPEND_IDLE, __ATOMIC_RELEASE);
+#endif
     d_r_mutex_unlock(&ostd->suspend_lock);
     return true;
 }
@@ -4039,6 +5005,16 @@ os_thread_terminate(thread_record_t *tr)
     os_thread_data_t *ostd = (os_thread_data_t *)tr->dcontext->os_field;
     ASSERT(ostd != NULL);
     ostd->terminate = true;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (tr->runtime_group != get_runtime_thread_group() &&
+        ksynch_get_value(&ostd->suspended) == 1) {
+        /* Wake the existing signal handler to perform its terminated ACK,
+         * avoiding a second relay delivery with a potentially lost response. */
+        ksynch_set_value(&ostd->wakeup, 1);
+        ksynch_wake(&ostd->wakeup);
+        return true;
+    }
+#endif
     /* Even if the thread is currently suspended, it's simpler to send it
      * another signal than to resume it.
      */
@@ -4169,6 +5145,7 @@ client_thread_run(void)
     dcontext_t *dcontext;
     byte *xsp;
     GET_STACK_PTR(xsp);
+    initialize_clone_runtime((reg_t)xsp);
     void *crec = get_clone_record((reg_t)xsp);
     /* i#2335: we support setup separate from start, and we want to allow a client
      * to create a client thread during init, but we do not support that thread
@@ -4318,6 +5295,9 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
     }
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    file_table_clone_begin(dcontext);
+#endif
 #ifdef MACOS
     thread_id_t newpid =
         dynamorio_clone_macos(flags, xsp, NULL, NULL, NULL, client_thread_run);
@@ -4327,6 +5307,7 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
 
     /* i#3526 switch DR's tls back to the original one before cloning. */
     os_clone_post(dcontext);
+    os_runtime_clone_complete(dcontext, (ptr_int_t)newpid > 0);
 #if (defined(AARCHXX) || defined(RISCV64)) && !defined(MACOS)
     write_thread_register(our_tls);
 #endif
@@ -4506,18 +5487,13 @@ shared_library_bounds(DR_PARAM_IN shlib_handle_t lib, DR_PARAM_IN byte *addr,
     return (memquery_library_bounds(name, start, end, NULL, 0, NULL, 0) > 0);
 }
 
-static int
-fcntl_syscall(int fd, int cmd, long arg)
-{
-    return dynamorio_syscall(SYSNUM_NO_CANCEL(SYS_fcntl), 3, fd, cmd, arg);
-}
-
 /* dups curfd to a private fd.
  * returns -1 if unsuccessful.
  */
 file_t
 fd_priv_dup(file_t curfd)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     file_t newfd = -1;
     if (DYNAMO_OPTION(steal_fds) > 0) {
         /* RLIMIT_NOFILES is 1 greater than max and F_DUPFD starts at given value */
@@ -4554,36 +5530,62 @@ fd_priv_dup(file_t curfd)
                                          newfd);
         }
     }
+    /* Persistent private files must not occupy an application standard-stream
+     * slot, even when high-range stealing is disabled or exhausted. */
+    if (newfd < 0 && curfd >= STDIN_FILENO && curfd <= STDERR_FILENO)
+        newfd = fcntl_syscall(curfd, F_DUPFD, STDERR_FILENO + 1);
+    if (newfd >= 0 && files->table != NULL) {
+        fd_mark_close_on_exec(newfd);
+        fd_table_add(newfd, 0);
+    }
+    file_table_transaction_end(files);
     return newfd;
 }
 
 bool
 fd_mark_close_on_exec(file_t fd)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     /* we assume FD_CLOEXEC is the only flag and don't bother w/ F_GETFD */
     if (fcntl_syscall(fd, F_SETFD, FD_CLOEXEC) != 0) {
         SYSLOG_INTERNAL_WARNING("unable to mark file %d as close-on-exec", fd);
+        file_table_transaction_end(files);
         return false;
     }
+    file_table_transaction_end(files);
     return true;
 }
 
 void
 fd_table_add(file_t fd, uint flags)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     if (fd_table != NULL) {
         TABLE_RWLOCK(fd_table, write, lock);
-        DODEBUG({
-            /* i#1010: If the fd is already in the table, chances are it's a
-             * stale logfile fd left behind by a vforked or cloned child that
-             * called execve.  Avoid an assert if that happens.
-             */
-            bool present = generic_hash_remove(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
-            ASSERT_CURIOSITY_ONCE(!present && "stale fd not cleaned up");
-        });
-        generic_hash_add(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd,
-                         /* store the flags, w/ a set bit to ensure not 0 */
-                         (void *)(ptr_uint_t)(flags | OS_OPEN_RESERVED));
+        /* Private duplication installs protection before returning. A caller
+         * may subsequently refine the inherited/close-on-fork policy. */
+        protected_fd_t *previous =
+            generic_hash_lookup(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
+        protected_fd_t *entry =
+            UNPROTECTED_GLOBAL_ALLOC(sizeof(*entry) HEAPACCT(ACCT_OTHER));
+        entry->flags = flags;
+        entry->identity = previous == NULL
+            ? __atomic_add_fetch(&protected_file_sequence, 1, __ATOMIC_RELAXED)
+            : previous->identity;
+        if (entry->identity == 0)
+            os_terminate_with_code(NULL, TERMINATE_PROCESS, 127);
+        entry->channel_owner = previous == NULL ? NULL : previous->channel_owner;
+        if (entry->channel_owner != NULL)
+            __atomic_add_fetch(&entry->channel_owner->references, 1, __ATOMIC_RELAXED);
+        else if (TESTANY(OS_OPEN_TASK_CHANNEL, flags)) {
+            entry->channel_owner = UNPROTECTED_GLOBAL_ALLOC(sizeof(*entry->channel_owner)
+                                                                HEAPACCT(ACCT_OTHER));
+            entry->channel_owner->filetable_id = files->identity;
+            entry->channel_owner->task = get_runtime_thread_id();
+            entry->channel_owner->references = 1;
+        }
+        generic_hash_remove(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
+        generic_hash_add(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd, entry);
         TABLE_RWLOCK(fd_table, write, unlock);
     } else {
         /* We come here only for the main_logfile and the dual_map_file, which
@@ -4598,29 +5600,152 @@ fd_table_add(file_t fd, uint flags)
             num_fd_add_pre_heap++;
         }
     }
+    file_table_transaction_end(files);
 }
 
 void
 fd_table_remove(file_t fd)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     if (fd_table != NULL) {
         TABLE_RWLOCK(fd_table, write, lock);
+        protected_fd_t *entry =
+            generic_hash_lookup(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
+        if (entry != NULL && entry->channel_owner != NULL) {
+            uint64 owner = files->identity;
+            __atomic_compare_exchange_n(&entry->channel_owner->filetable_id, &owner, 0,
+                                        false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+        }
         generic_hash_remove(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
         TABLE_RWLOCK(fd_table, write, unlock);
     } else {
         ASSERT(dynamo_exited || standalone_library);
     }
+    file_table_transaction_end(files);
 }
 
 static bool
 fd_is_dr_owned(file_t fd)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     ptr_uint_t flags;
     ASSERT(fd_table != NULL);
     TABLE_RWLOCK(fd_table, read, lock);
     flags = (ptr_uint_t)generic_hash_lookup(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
     TABLE_RWLOCK(fd_table, read, unlock);
+    file_table_transaction_end(files);
     return (flags != 0);
+}
+
+uint64
+os_file_identity(file_t descriptor)
+{
+    file_table_domain_t *files = file_table_transaction_begin();
+    uint64 identity = 0;
+    if (files->table != NULL) {
+        TABLE_RWLOCK(files->table, read, lock);
+        protected_fd_t *entry =
+            generic_hash_lookup(GLOBAL_DCONTEXT, files->table, (ptr_uint_t)descriptor);
+        if (entry != NULL)
+            identity = entry->identity;
+        TABLE_RWLOCK(files->table, read, unlock);
+    }
+    file_table_transaction_end(files);
+    return identity;
+}
+
+bool
+os_thread_suspend_open_resources(file_t sockets[2], file_t *pidfd, file_t *ackfd)
+{
+    sockets[0] = sockets[1] = INVALID_FILE;
+    *pidfd = *ackfd = INVALID_FILE;
+#if defined(LINUX) && defined(X86) && defined(X64) && defined(SYS_pidfd_open) && \
+    defined(SYS_eventfd2)
+    file_table_domain_t *files = file_table_transaction_begin();
+    file_t descriptors[4] = { INVALID_FILE, INVALID_FILE, INVALID_FILE, INVALID_FILE };
+    bool success = dynamorio_syscall(SYS_socketpair, 4, AF_UNIX,
+                                     SOCK_SEQPACKET | SOCK_CLOEXEC, 0, descriptors) == 0;
+    if (success) {
+        /* Linux PIDFD_THREAD is O_EXCL. Target this exact caller task, not its
+         * thread-group leader. Older kernels reject it instead of weakening
+         * the lifetime guarantee to a numeric process identifier.
+         */
+        descriptors[2] = (file_t)dynamorio_syscall(
+            SYS_pidfd_open, 2, dynamorio_syscall(SYS_gettid, 0), O_EXCL);
+        success = descriptors[2] >= 0;
+    }
+    if (success) {
+        /* eventfd2 uses the same CLOEXEC/NONBLOCK bits as open. Its counter
+         * starts at zero, and no semaphore flag is set. */
+        descriptors[3] = dynamorio_syscall(SYS_eventfd2, 2, 0, O_CLOEXEC | O_NONBLOCK);
+        success = descriptors[3] >= 0;
+    }
+    for (uint i = 0; success && i < 4; ++i) {
+        file_t duplicate = fd_priv_dup(descriptors[i]);
+        if (duplicate >= 0) {
+            close_syscall(descriptors[i]);
+            descriptors[i] = duplicate;
+        } else if (descriptors[i] <= STDERR_FILENO) {
+            success = false;
+            break;
+        }
+        success = os_adopt_file_descriptor(descriptors[i], false, true);
+        if (success)
+            fd_table_add(descriptors[i], OS_OPEN_CLOSE_ON_FORK | OS_OPEN_TASK_CHANNEL);
+    }
+    if (success) {
+        sockets[0] = descriptors[0];
+        sockets[1] = descriptors[1];
+        *pidfd = descriptors[2];
+        *ackfd = descriptors[3];
+    } else {
+        for (uint i = 0; i < 4; ++i)
+            if (descriptors[i] >= 0) {
+                fd_table_remove(descriptors[i]);
+                close_syscall(descriptors[i]);
+            }
+    }
+    file_table_transaction_end(files);
+    return success;
+#else
+    return false;
+#endif
+}
+
+bool
+os_adopt_file_descriptor(file_t fd, bool inherit_exec, bool close_on_fork)
+{
+    if (fd < 0 || fd_table == NULL)
+        return false;
+    file_table_domain_t *files = file_table_transaction_begin();
+    bool adopted = false;
+    TABLE_RWLOCK(fd_table, write, lock);
+    int flags = fcntl_syscall(fd, F_GETFD, 0);
+    if (flags >= 0) {
+        flags = inherit_exec ? flags & ~FD_CLOEXEC : flags | FD_CLOEXEC;
+        if (fcntl_syscall(fd, F_SETFD, flags) == 0) {
+            protected_fd_t *entry =
+                generic_hash_lookup(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
+            if (entry == NULL) {
+                entry = UNPROTECTED_GLOBAL_ALLOC(sizeof(*entry) HEAPACCT(ACCT_OTHER));
+                entry->flags = 0;
+                entry->identity =
+                    __atomic_add_fetch(&protected_file_sequence, 1, __ATOMIC_RELAXED);
+                if (entry->identity == 0)
+                    os_terminate_with_code(NULL, TERMINATE_PROCESS, 127);
+                entry->channel_owner = NULL;
+                generic_hash_add(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd, entry);
+            }
+            if (close_on_fork)
+                entry->flags |= OS_OPEN_CLOSE_ON_FORK;
+            else
+                entry->flags &= ~OS_OPEN_CLOSE_ON_FORK;
+            adopted = true;
+        }
+    }
+    TABLE_RWLOCK(fd_table, write, unlock);
+    file_table_transaction_end(files);
+    return adopted;
 }
 
 static bool
@@ -4633,34 +5758,47 @@ fd_is_in_private_range(file_t fd)
 file_t
 redirect_open(const char *fname, int flags, int mode)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     file_t dup;
     file_t res = open_syscall(fname, flags, mode);
-    if (res < 0)
+    if (res < 0) {
+        file_table_transaction_end(files);
         return res;
+    }
     dup = fd_priv_dup(res);
     if (dup >= 0) {
         close_syscall(res);
         res = dup;
         fd_mark_close_on_exec(res);
-    } /* else just keep original */
+    } else if (res <= STDERR_FILENO) {
+        close_syscall(res);
+        file_table_transaction_end(files);
+        return dup;
+    } /* Otherwise retain the non-standard descriptor. */
     fd_table_add(res, 0 /*unused*/);
+    file_table_transaction_end(files);
     return res;
 }
 
 void
 redirect_close(file_t f)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     fd_table_remove(f);
     close_syscall(f);
+    file_table_transaction_end(files);
 }
 
 file_t
 os_open_protected(const char *fname, int os_open_flags)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     file_t dup;
     file_t res = os_open(fname, os_open_flags);
-    if (res < 0)
+    if (res < 0) {
+        file_table_transaction_end(files);
         return res;
+    }
     /* we could have os_open() always switch to a private fd but it's probably
      * not worth the extra syscall for temporary open/close sequences so we
      * only use it for persistent files
@@ -4670,21 +5808,27 @@ os_open_protected(const char *fname, int os_open_flags)
         close_syscall(res);
         res = dup;
         fd_mark_close_on_exec(res);
-    } /* else just keep original */
+    } else if (res <= STDERR_FILENO) {
+        close_syscall(res);
+        file_table_transaction_end(files);
+        return INVALID_FILE;
+    } /* Otherwise retain the non-standard descriptor. */
 
     /* ditto here, plus for things like config.c opening files we can't handle
      * grabbing locks and often don't have heap available so no fd_table
      */
     fd_table_add(res, os_open_flags);
-
+    file_table_transaction_end(files);
     return res;
 }
 
 void
 os_close_protected(file_t f)
 {
+    file_table_domain_t *files = file_table_transaction_begin();
     fd_table_remove(f);
     os_close(f);
+    file_table_transaction_end(files);
 }
 
 bool
@@ -4857,6 +6001,7 @@ file_t
 os_create_memory_file(const char *name, size_t size)
 {
 #ifdef LINUX
+    file_table_domain_t *files = file_table_transaction_begin();
     char path[MAXIMUM_PATH];
     file_t fd;
     /* We need an in-memory file. We prefer the new memfd_create over /dev/shm (it
@@ -4882,8 +6027,10 @@ os_create_memory_file(const char *name, size_t size)
             fd = open_syscall(path, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
         }
     }
-    if (fd < 0)
+    if (fd < 0) {
+        file_table_transaction_end(files);
         return INVALID_FILE;
+    }
 
     /* Work around an IMA (kernel optional feature "Integrity Measurement
      * Architecture") slowdown where the first executable mmap causes a hash
@@ -4898,16 +6045,19 @@ os_create_memory_file(const char *name, size_t size)
 
     if (dynamorio_syscall(SYS_ftruncate, 2, fd, size) < 0) {
         close_syscall(fd);
+        file_table_transaction_end(files);
         return INVALID_FILE;
     }
     file_t priv_fd = fd_priv_dup(fd);
     close_syscall(fd); /* Close the old descriptor on success *and* error. */
     if (priv_fd < 0) {
+        file_table_transaction_end(files);
         return INVALID_FILE;
     }
     fd = priv_fd;
     fd_mark_close_on_exec(fd); /* We could use MFD_CLOEXEC for memfd_create. */
     fd_table_add(fd, 0 /*keep across fork*/);
+    file_table_transaction_end(files);
     return fd;
 #else
     ASSERT_NOT_IMPLEMENTED(false && "i#3556 NYI for Mac");
@@ -4919,6 +6069,7 @@ void
 os_delete_memory_file(const char *name, file_t fd)
 {
 #ifdef LINUX
+    file_table_domain_t *files = file_table_transaction_begin();
     /* There is no need to delete a memfd_create path, but if we used shm we need
      * to clean it up.  We blindly do this rather than trying to record whether
      * we created this file.
@@ -4929,6 +6080,7 @@ os_delete_memory_file(const char *name, file_t fd)
     os_delete_file(path);
     fd_table_remove(fd);
     close_syscall(fd);
+    file_table_transaction_end(files);
 #else
     ASSERT_NOT_IMPLEMENTED(false && "i#3556 NYI for Mac");
 #endif
@@ -5491,6 +6643,9 @@ ignorable_system_call_normalized(int num)
     case SYS_getitimer:
 #ifdef MACOS
     case SYS_close_nocancel:
+#endif
+#if defined(LINUX) && defined(X86) && defined(X64) && defined(SYS_unshare)
+    case SYS_unshare:
 #endif
 #ifdef SYS_close_range
     case SYS_close_range:
@@ -6074,6 +7229,7 @@ enum {
     ENV_PROP_OPTIONS,
     ENV_PROP_EXECVE_LOGDIR,
     ENV_PROP_EXE_PATH,
+    ENV_PROP_PROCFS_FD,
     ENV_PROP_CONFIGDIR,
 };
 
@@ -6089,6 +7245,7 @@ static const char *const env_to_propagate[] = {
     DYNAMORIO_VAR_EXECVE_LOGDIR,
     /* i#909: needed for early injection */
     DYNAMORIO_VAR_EXE_PATH,
+    DYNAMORIO_VAR_PROCFS_FD,
     /* These will only be propagated if they exist: */
     DYNAMORIO_VAR_CONFIGDIR,
     DYNAMORIO_VAR_AUTOINJECT,
@@ -6114,6 +7271,7 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
     bool need_var[NUM_ENV_TO_PROPAGATE];
     int prop_idx[NUM_ENV_TO_PROPAGATE];
     bool ldpath_us = false, preload_us = false;
+    char procfs_descriptor[32];
     char **new_envp, *var, *old;
 
     /* check if any var needs to be propagated */
@@ -6134,6 +7292,28 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
 
     if (DYNAMO_OPTION(early_inject))
         need_var[ENV_PROP_EXE_PATH] = true;
+    need_var[ENV_PROP_PROCFS_FD] = false;
+#ifdef LINUX
+    if (procfs_root != INVALID_FILE && DYNAMO_OPTION(follow_children)) {
+        os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+        /* Do not toggle CLOEXEC on the shared root: concurrent exec attempts
+         * and uninstrumented exec must not inherit each other's capabilities.
+         */
+        file_t duplicate = fd_priv_dup(procfs_root);
+        if (duplicate < 0)
+            duplicate = fcntl_syscall(procfs_root, F_DUPFD, 3);
+        if (duplicate < 0 || !os_adopt_file_descriptor(duplicate, true, true)) {
+            if (duplicate >= 0)
+                os_close(duplicate);
+            FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
+        }
+        ASSERT(ostd->exec_procfs_root == INVALID_FILE);
+        ostd->exec_procfs_root = duplicate;
+        ostd->exec_procfs_owner = os_file_table_identity(NULL);
+        snprintf(procfs_descriptor, sizeof(procfs_descriptor), "%d", duplicate);
+        need_var[ENV_PROP_PROCFS_FD] = true;
+    }
+#endif
 
     /* iterate the env in target process  */
     if (envp == NULL) {
@@ -6269,6 +7449,7 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
             ASSERT(strcmp(env_to_propagate[j], DYNAMORIO_VAR_EXE_PATH) == 0);
             val = app_path;
             break;
+        case ENV_PROP_PROCFS_FD: val = procfs_descriptor; break;
         default:
             val = getenv(env_to_propagate[j]);
             if (val == NULL)
@@ -6529,6 +7710,14 @@ handle_execve(dcontext_t *dcontext)
      * to know the execve was finished.)
      */
     mark_thread_execve(dcontext->thread_record, true);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* A successful kernel exec replaces our signal handler. First prevent any
+     * new relay notification and wait until all accepted ones reached us. */
+    if (!os_thread_suspend_quiesce_for_exec(dcontext)) {
+        mark_thread_execve(dcontext->thread_record, false);
+        return EIO;
+    }
+#endif
 
 #ifdef STATIC_LIBRARY
     /* no way we can inject, we just lose control */
@@ -6618,6 +7807,14 @@ handle_execve_post(dcontext_t *dcontext)
      * in the parent process.
      * we have to restore env to how it was and free the allocated heap.
      */
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* A vfork parent's cleanup of a departed child is not a failed exec in the
+     * calling task. Only the original task can reopen its quiesced signal route.
+     * This also applies to a static runtime with no environment to restore. */
+    if (dcontext->owning_runtime_id == get_runtime_thread_id() &&
+        !os_thread_suspend_restore_after_exec(dcontext))
+        SYSLOG_INTERNAL_WARNING("Unable to restore thread suspension after exec failure");
+#endif
     char **old_envp = (char **)dcontext->sys_param0;
     char **new_envp = (char **)dcontext->sys_param1;
 #ifdef STATIC_LIBRARY
@@ -6625,6 +7822,12 @@ handle_execve_post(dcontext_t *dcontext)
     return;
 #endif
 #ifdef LINUX
+    os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+    if (ostd->exec_procfs_root != INVALID_FILE) {
+        if (ostd->exec_procfs_owner == os_file_table_identity(NULL))
+            os_close_protected(ostd->exec_procfs_root);
+        ostd->exec_procfs_root = INVALID_FILE;
+    }
     if (dcontext->sys_param4 != 0) {
         /* restore original /proc/.../exe */
         *sys_param_addr(dcontext, 0) = dcontext->sys_param4;
@@ -6811,6 +8014,29 @@ handle_exit(dcontext_t *dcontext)
     priv_mcontext_t *mc = get_mcontext(dcontext);
     bool exit_process = false;
 
+    d_r_mutex_lock(&thread_initexit_lock);
+#ifdef LINUX
+    /* A successful CLONE_VM child may still be absent from the thread list.
+     * Decide which groups survive only after its startup record is published.
+     * Waiting later during cleanup is too late: it can destroy the shared
+     * runtime or wait for signal inheritance while holding this same lock. */
+    uint attempts = 0;
+    while (uninit_thread_count > 0) {
+        d_r_mutex_unlock(&thread_initexit_lock);
+        if (DYNAMO_OPTION(synch_all_threads_max_loops) != UINT_MAX &&
+            attempts++ >= DYNAMO_OPTION(synch_all_threads_max_loops)) {
+            REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                        get_application_name(), get_application_pid());
+        }
+        check_wait_at_safe_spot(dcontext, THREAD_SYNCH_NO_LOCKS_NO_XFER);
+        if (INTERNAL_OPTION(single_thread_in_DR))
+            EXITING_DR();
+        os_thread_yield();
+        if (INTERNAL_OPTION(single_thread_in_DR))
+            ENTERING_DR();
+        d_r_mutex_lock(&thread_initexit_lock);
+    }
+#endif
     if (dcontext->sys_num == SYSNUM_EXIT_PROCESS) {
         /* We can have multiple thread groups within the same address space.
          * We need to know whether this is the only group left.
@@ -6821,23 +8047,35 @@ handle_exit(dcontext_t *dcontext)
          * coordinate lock access w/ cleanup_and_terminate.
          * Xref i#94.  Xref PR 541760.
          */
-        process_id_t mypid = get_process_id();
+        const runtime_thread_id_t mygroup = get_runtime_thread_group();
         thread_record_t **threads;
         int num_threads, i;
         exit_process = true;
-        d_r_mutex_lock(&thread_initexit_lock);
         get_list_of_threads(&threads, &num_threads);
         for (i = 0; i < num_threads; i++) {
-            if (threads[i]->pid != mypid && !IS_CLIENT_THREAD(threads[i]->dcontext)) {
+            if (threads[i]->runtime_group != mygroup &&
+                !IS_CLIENT_THREAD(threads[i]->dcontext)) {
                 exit_process = false;
                 break;
             }
         }
         if (!exit_process) {
             /* We need to clean up the other threads in our group here. */
-            thread_id_t myid = d_r_get_thread_id();
+            const runtime_thread_id_t myid = get_runtime_thread_id();
+            runtime_thread_id_t *members = (runtime_thread_id_t *)global_heap_alloc(
+                num_threads * sizeof(*members) HEAPACCT(ACCT_THREAD_MGT));
+            int num_members = 0;
             priv_mcontext_t mcontext;
             DEBUG_DECLARE(thread_synch_result_t synch_res;)
+            /* A peer synchronization may release the registry lock and clean
+             * records. Keep nonrecycled identities, never stale record pointers.
+             * Numeric PID/TID values can coincide across PID namespaces.
+             */
+            for (i = 0; i < num_threads; ++i) {
+                if (threads[i]->runtime_id != myid &&
+                    threads[i]->runtime_group == mygroup)
+                    members[num_members++] = threads[i]->runtime_id;
+            }
             LOG(THREAD, LOG_TOP | LOG_SYSCALLS, 1,
                 "SYS_exit_group %d not final group: %d cleaning up just "
                 "threads in group\n",
@@ -6845,33 +8083,32 @@ handle_exit(dcontext_t *dcontext)
             /* Set where we are to handle reciprocal syncs */
             copy_mcontext(mc, &mcontext);
             mc->pc = SYSCALL_PC(dcontext);
-            for (i = 0; i < num_threads; i++) {
-                if (threads[i]->id != myid && threads[i]->pid == mypid) {
-                    /* See comments in dynamo_process_exit_cleanup(): we terminate
-                     * to make cleanup easier, but may want to switch to shifting
-                     * the target thread to a stack-free loop.
-                     */
-                    DEBUG_DECLARE(synch_res =)
-                    synch_with_thread(
-                        threads[i]->id, true /*block*/, true /*have initexit lock*/,
-                        THREAD_SYNCH_VALID_MCONTEXT, THREAD_SYNCH_TERMINATED_AND_CLEANED,
-                        THREAD_SYNCH_SUSPEND_FAILURE_IGNORE);
-                    /* initexit lock may be released and re-acquired in course of
-                     * doing the synch so we may have races where the thread
-                     * exits on its own (or new threads appear): we'll live
-                     * with those for now.
-                     */
-                    ASSERT(synch_res == THREAD_SYNCH_RESULT_SUCCESS);
-                }
+            for (i = 0; i < num_members; i++) {
+                /* See comments in dynamo_process_exit_cleanup(): we terminate
+                 * to make cleanup easier, but may want to switch to shifting
+                 * the target thread to a stack-free loop.
+                 */
+                DEBUG_DECLARE(synch_res =)
+                synch_with_thread_runtime(
+                    members[i], true /*block*/, true /*have initexit lock*/,
+                    THREAD_SYNCH_VALID_MCONTEXT, THREAD_SYNCH_TERMINATED_AND_CLEANED,
+                    THREAD_SYNCH_SUSPEND_FAILURE_IGNORE);
+                /* initexit lock may be released and re-acquired in course of
+                 * doing the synch so we may have races where the thread
+                 * exits on its own (or new threads appear): we'll live
+                 * with those for now.
+                 */
+                ASSERT(synch_res == THREAD_SYNCH_RESULT_SUCCESS);
             }
+            global_heap_free(members,
+                             num_threads * sizeof(*members) HEAPACCT(ACCT_THREAD_MGT));
             copy_mcontext(&mcontext, mc);
         }
-        d_r_mutex_unlock(&thread_initexit_lock);
         global_heap_free(
             threads, num_threads * sizeof(thread_record_t *) HEAPACCT(ACCT_THREAD_MGT));
     }
 
-    if (is_last_app_thread() && !dynamo_exited) {
+    if (IF_UNIX(uninit_thread_count == 0 &&) is_last_app_thread() && !dynamo_exited) {
         LOG(THREAD, LOG_TOP | LOG_SYSCALLS, 1,
             "SYS_exit%s(%d) in final thread " TIDFMT " of " PIDFMT
             " => exiting DynamoRIO\n",
@@ -6887,6 +8124,7 @@ handle_exit(dcontext_t *dcontext)
             MCXT_SYSNUM_REG(mc), d_r_get_thread_id(), get_process_id(),
             exit_process ? "process" : "thread");
     }
+    d_r_mutex_unlock(&thread_initexit_lock);
     KSTOP(num_exits_dir_syscall);
 
     block_cleanup_and_terminate(dcontext, MCXT_SYSNUM_REG(mc), sys_param(dcontext, 0),
@@ -7118,7 +8356,7 @@ os_switch_seg_to_context(dcontext_t *dcontext, reg_id_t seg, bool to_app)
                     * invalid TLS, so we don't check get_thread_private_dcontext().
                     */
                    is_thread_tls_allocated() &&
-                       dcontext->owning_thread == get_sys_thread_id());
+                       dcontext->owning_runtime_id == get_runtime_thread_id());
     if (to_app) {
         base = os_get_app_tls_base(dcontext, seg);
     } else {
@@ -7360,6 +8598,9 @@ handle_clone_pre(dcontext_t *dcontext)
         }
         os_clone_pre(dcontext);
         os_new_thread_pre();
+#    if defined(LINUX) && defined(X86) && defined(X64)
+        file_table_clone_begin(dcontext);
+#    endif
     } else {
         /* This is really a fork. */
         if (dcontext->sys_num == SYS_clone3) {
@@ -7652,6 +8893,14 @@ pre_system_call(dcontext_t *dcontext)
         dcontext->sys_param0 = (reg_t)addr;
         dcontext->sys_param1 = len;
         dcontext->sys_param2 = prot;
+#ifdef LINUX
+        /* Linux rejects an unaligned start, and a zero length never changes
+         * a mapping. Let the kernel determine the result without retiring
+         * executable fragments for a protection change that cannot happen.
+         */
+        if (!ALIGNED(addr, PAGE_SIZE) || len == 0)
+            break;
+#endif
         LOG(THREAD, LOG_SYSCALLS, 2,
             "syscall: mprotect addr=" PFX " size=" PFX " prot=%s\n", addr, len,
             memprot_string(osprot_to_memprot(prot)));
@@ -7809,6 +9058,9 @@ pre_system_call(dcontext_t *dcontext)
 #    endif
         os_clone_pre(dcontext);
         os_new_thread_pre();
+#    if defined(LINUX) && defined(X86) && defined(X64)
+        file_table_clone_begin(dcontext);
+#    endif
         break;
     }
 #endif
@@ -7824,6 +9076,9 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_execve: {
         int ret = handle_execve(dcontext);
         if (ret != 0) {
+#if defined(LINUX) && defined(X86) && defined(X64)
+            os_thread_suspend_restore_after_exec(dcontext);
+#endif
             execute_syscall = false;
             set_failure_return_val(dcontext, ret);
         }
@@ -8277,69 +9532,129 @@ pre_system_call(dcontext_t *dcontext)
 #ifdef MACOS
     case SYS_close_nocancel:
 #endif
+#if defined(LINUX) && defined(X86) && defined(X64) && defined(SYS_unshare)
+    case SYS_unshare: {
+        const uint64 flags = sys_param(dcontext, 0);
+        if (!TESTANY(CLONE_FILES, flags))
+            break;
+        file_table_domain_t *files = file_table_transaction_begin();
+        file_table_domain_t *copy = file_table_copy(files);
+        int result = dynamorio_syscall(SYS_unshare, 1, flags);
+        if (result == 0) {
+            files = file_table_unshare_commit(dcontext, files, copy);
+            set_success_return_val(dcontext, 0);
+        } else {
+            file_table_drop(copy);
+            set_failure_return_val(dcontext, -result);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+        }
+        file_table_transaction_end(files);
+        execute_syscall = false;
+        break;
+    }
+#endif
 #ifdef SYS_close_range
     case SYS_close_range: {
-        /* client.file_io indeed tests this for all arch, but it hasn't yet been
-         * run on an AArchXX machine that has close_range available.
-         */
-        IF_AARCHXX(ASSERT_NOT_TESTED());
-        uint first_fd = sys_param(dcontext, 0), last_fd = sys_param(dcontext, 1);
+        const uint first_fd = sys_param(dcontext, 0), last_fd = sys_param(dcontext, 1);
         uint flags = sys_param(dcontext, 2);
-        bool is_cloexec = TESTANY(CLOSE_RANGE_CLOEXEC, flags);
-        if (is_cloexec) {
-            /* client.file_io has a test for CLOSE_RANGE_CLOEXEC, but it hasn't been
-             * verified on a system with kernel version >= 5.11 yet.
-             */
-            ASSERT_NOT_TESTED();
-        }
-        /* We do not let the app execute their own close_range ever. Instead we
-         * make multiple close_range syscalls ourselves, one for each contiguous
-         * sub-range of non-DR-private fds in [first, last].
-         */
+        const bool is_cloexec = TESTANY(CLOSE_RANGE_CLOEXEC, flags);
         execute_syscall = false;
-        if (first_fd > last_fd) {
+        if (first_fd > last_fd ||
+            TESTANY(~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC), flags)) {
             set_failure_return_val(dcontext, EINVAL);
             DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
             break;
         }
-        uint cur_range_first_fd = 0;
-        uint cur_range_last_fd = 0;
-        bool cur_range_valid = false;
-        int ret = 0;
-        for (int i = first_fd; i <= last_fd; i++) {
-            /* Do not allow any changes to DR-owned FDs. */
-            if ((is_cloexec && fd_is_dr_owned(i)) ||
-                (!is_cloexec && !handle_close_range_pre(dcontext, i))) {
-                SYSLOG_INTERNAL_WARNING_ONCE("app trying to close private fd(s)");
-                if (cur_range_valid) {
-                    cur_range_valid = false;
-                    ret = dynamorio_syscall(SYS_close_range, 3, cur_range_first_fd,
-                                            cur_range_last_fd, flags);
-                    if (ret != 0)
-                        break;
-                }
-            } else {
-#    ifdef LINUX
-                if (!is_cloexec) {
-                    signal_handle_close(dcontext, i);
-                }
+        file_table_domain_t *files = file_table_transaction_begin();
+#    if defined(LINUX) && defined(X86) && defined(X64)
+        file_table_domain_t *copy =
+            TESTANY(CLOSE_RANGE_UNSHARE, flags) ? file_table_copy(files) : NULL;
 #    endif
-                if (cur_range_valid) {
-                    ASSERT(cur_range_last_fd == i - 1);
-                    cur_range_last_fd = i;
-                } else {
-                    cur_range_first_fd = i;
-                    cur_range_last_fd = i;
-                    cur_range_valid = true;
-                }
+        /* No real descriptor can be UINT_MAX. This empty range validates kernel
+         * support and applies UNSHARE exactly once, even if the requested range
+         * contains only protected descriptors. It preserves every protected FD.
+         */
+        int ret =
+            dynamorio_syscall(SYS_close_range, 3, (uint)UINT_MAX, (uint)UINT_MAX, flags);
+        if (ret != 0) {
+#    if defined(LINUX) && defined(X86) && defined(X64)
+            file_table_drop(copy);
+#    endif
+            file_table_transaction_end(files);
+            set_failure_return_val(dcontext, -ret);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            break;
+        }
+#    if defined(LINUX) && defined(X86) && defined(X64)
+        if (copy != NULL)
+            files = file_table_unshare_commit(dcontext, files, copy);
+#    endif
+        flags &= ~CLOSE_RANGE_UNSHARE;
+        if (!is_cloexec) {
+            /* Preserve the existing private-libc standard-stream duplication
+             * policy before snapshotting the protected descriptor set.
+             */
+            for (uint fd = first_fd; fd <= MIN(last_fd, (uint)STDERR_FILENO); ++fd)
+                handle_close_range_pre(dcontext, (file_t)fd);
+        }
+        TABLE_RWLOCK(fd_table, read, lock);
+        const uint capacity = fd_table->entries;
+        uint *protected = capacity == 0
+            ? NULL
+            : (uint *)global_heap_alloc(capacity * sizeof(uint) HEAPACCT(ACCT_OTHER));
+        uint count = 0;
+        int iter = 0;
+        ptr_uint_t descriptor;
+        while ((iter = generic_hash_iterate_next(GLOBAL_DCONTEXT, fd_table, iter,
+                                                 &descriptor, NULL)) >= 0) {
+            if (descriptor > INT_MAX || descriptor < first_fd || descriptor > last_fd)
+                continue;
+            /* Protected descriptor sets are small; insertion keeps this bounded
+             * by their population rather than the application's numeric range.
+             */
+            uint at = count;
+            while (at > 0 && protected[at - 1] > descriptor) {
+                protected[at] = protected[at - 1];
+                --at;
+            }
+            protected[at] = (uint)descriptor;
+            ++count;
+        }
+        uint64 cursor = first_fd, completed = first_fd;
+        for (uint i = 0; i <= count; ++i) {
+            const uint64 boundary = i < count ? protected[i] : (uint64)last_fd + 1;
+            if (cursor < boundary) {
+                ret = dynamorio_syscall(SYS_close_range, 3, (uint)cursor,
+                                        (uint)(boundary - 1), flags);
+                if (ret != 0)
+                    break;
+                completed = boundary;
+            }
+            cursor = boundary + 1;
+        }
+        TABLE_RWLOCK(fd_table, read, unlock);
+        file_table_transaction_end(files);
+#    ifdef LINUX
+        /* signalfd cleanup can close protected backing pipes, so perform it
+         * after releasing fd_table's lock and only for successfully closed gaps.
+         */
+        if (!is_cloexec) {
+            cursor = first_fd;
+            for (uint i = 0; i <= count; ++i) {
+                const uint64 boundary = i < count ? protected[i] : (uint64)last_fd + 1;
+                if (boundary > completed)
+                    break;
+                if (cursor < boundary)
+                    signal_handle_close_range(dcontext, (uint)cursor,
+                                              (uint)(boundary - 1));
+                cursor = boundary + 1;
             }
         }
-        if (cur_range_valid) {
-            ret = dynamorio_syscall(SYS_close_range, 3, cur_range_first_fd,
-                                    cur_range_last_fd, flags);
-        }
+#    endif
+        if (protected != NULL)
+            global_heap_free(protected, capacity * sizeof(uint) HEAPACCT(ACCT_OTHER));
         if (ret != 0) {
-            set_failure_return_val(dcontext, ret);
+            set_failure_return_val(dcontext, -ret);
             DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
         } else {
             set_success_return_val(dcontext, 0);
@@ -8348,13 +9663,28 @@ pre_system_call(dcontext_t *dcontext)
     }
 #endif
     case SYS_close: {
-        execute_syscall = handle_close_pre(dcontext);
+        file_table_domain_t *files = file_table_transaction_begin();
+        const bool close_application = handle_close_pre(dcontext);
+        execute_syscall = false;
+        if (close_application) {
+            /* Keep descriptor allocation/protection atomic with application
+             * close, including descriptors created before their private dup. */
+            int result = close_syscall((file_t)sys_param(dcontext, 0));
+            if (result < 0) {
+                set_failure_return_val(dcontext, -result);
+                DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            } else
+                set_success_return_val(dcontext, result);
+            execute_syscall = false;
+        }
+        file_table_transaction_end(files);
 #ifdef LINUX
-        if (execute_syscall)
+        if (close_application)
             signal_handle_close(dcontext, (file_t)sys_param(dcontext, 0));
 #endif
         break;
     }
+
 #if defined(SYS_dup2) || defined(SYS_dup3)
 #    ifdef SYS_dup3
     case SYS_dup3:
@@ -8363,7 +9693,9 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_dup2:
 #    endif
     {
+        file_table_domain_t *files = file_table_transaction_begin();
         file_t newfd = (file_t)sys_param(dcontext, 1);
+        bool duplicated = false;
         if (fd_is_dr_owned(newfd) || fd_is_in_private_range(newfd)) {
             SYSLOG_INTERNAL_WARNING_ONCE("app trying to dup-close DR file(s)");
             LOG(THREAD, LOG_TOP | LOG_SYSCALLS, 1,
@@ -8374,7 +9706,23 @@ pre_system_call(dcontext_t *dcontext)
             } else
                 set_success_return_val(dcontext, 0);
             execute_syscall = false;
+        } else {
+            int result = dynamorio_syscall(dcontext->sys_num, 3, sys_param(dcontext, 0),
+                                           newfd, sys_param(dcontext, 2));
+            if (result < 0) {
+                set_failure_return_val(dcontext, -result);
+                DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            } else {
+                duplicated = true;
+                set_success_return_val(dcontext, result);
+            }
+            execute_syscall = false;
         }
+        file_table_transaction_end(files);
+#    ifdef LINUX
+        if (duplicated)
+            signal_handle_dup(dcontext, (file_t)sys_param(dcontext, 0), newfd);
+#    endif
         break;
     }
 #endif
@@ -8385,6 +9733,35 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_fcntl: {
         int cmd = (int)sys_param(dcontext, 1);
         long arg = (long)sys_param(dcontext, 2);
+        if (cmd == F_SETFD) {
+            file_table_domain_t *files = file_table_transaction_begin();
+            if (!fd_is_dr_owned((file_t)sys_param(dcontext, 0))) {
+                int result = fcntl_syscall((file_t)sys_param(dcontext, 0), cmd, arg);
+                if (result < 0) {
+                    set_failure_return_val(dcontext, -result);
+                    DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+                } else
+                    set_success_return_val(dcontext, result);
+                execute_syscall = false;
+                file_table_transaction_end(files);
+                break;
+            }
+            /* A client can deliberately retain a protected descriptor across
+             * exec. Application descriptor sweeps must not mark it CLOEXEC,
+             * nor make a private close-on-exec descriptor inheritable. Match
+             * the existing protected close/dup2 policy without changing the
+             * descriptor flags held by DR and its clients.
+             */
+            SYSLOG_INTERNAL_WARNING_ONCE("app trying to change DR descriptor flags");
+            if (DYNAMO_OPTION(fail_on_stolen_fds)) {
+                set_failure_return_val(dcontext, EBADF);
+                DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            } else
+                set_success_return_val(dcontext, 0);
+            execute_syscall = false;
+            file_table_transaction_end(files);
+            break;
+        }
         /* we only check for asking for min in private space: not min below
          * but actual will be above (see notes in os_file_init())
          */
@@ -8842,7 +10219,8 @@ os_add_new_app_module(dcontext_t *dcontext, bool at_map, app_pc base, size_t siz
      * and only notify the client after the last one (though that's still before
      * linking and relocation, but that's true on Windows too). */
     /* Get filename & inode for the list. */
-    memquery_iterator_start(&iter, base, true /* plan to alloc a module_area_t */);
+    if (!memquery_iterator_start(&iter, base, true /* plan to alloc a module_area_t */))
+        FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
     while (memquery_iterator_next(&iter)) {
         if (iter.vm_start == base) {
             ASSERT_CURIOSITY(iter.inode != 0 || base == vdso_page_start ||
@@ -9303,6 +10681,11 @@ post_system_call(dcontext_t *dcontext)
         base = (app_pc)dcontext->sys_param0;
         size = dcontext->sys_param1;
         prot = dcontext->sys_param2;
+#ifdef LINUX
+        /* The matching pre-syscall path did not change mapping metadata. */
+        if (!ALIGNED(base, PAGE_SIZE) || size == 0)
+            break;
+#endif
 #ifdef VMX86_SERVER
         /* PR 475111: workaround for PR 107872 */
         if (os_in_vmkernel_userworld() && result == -EBUSY && prot == PROT_NONE) {
@@ -9418,13 +10801,15 @@ post_system_call(dcontext_t *dcontext)
         /* in /usr/src/linux/arch/i386/kernel/process.c */
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: clone returned " PFX "\n",
             MCXT_SYSCALL_RES(mc));
-        /* TODO i#5221: Handle clone3 returning errors other than ENOSYS. */
+        /* Roll back an unsuccessful CLONE_VM startup before restoring the
+         * parent's arguments. No child can release its record on failure. */
         /* We switch the lib tls segment back to dr's privlib segment.
          * Please refer to comment on os_switch_lib_tls.
          * It is only called in parent thread.
          * The child thread's tls setup is done in os_tls_app_seg_init.
          */
         if (was_thread_create_syscall(dcontext)) {
+            os_runtime_clone_complete(dcontext, result >= 0);
             if (INTERNAL_OPTION(private_loader))
                 os_switch_lib_tls(dcontext, false /*to dr*/);
             /* i#2089: we already restored the DR tls in os_clone_post() */
@@ -9486,6 +10871,7 @@ post_system_call(dcontext_t *dcontext)
         mc->xsp = dcontext->sys_param1;
 
         if (MCXT_SYSCALL_RES(mc) != 0) {
+            os_runtime_clone_complete(dcontext, result >= 0);
             /* We switch the lib tls segment back to dr's segment.
              * Please refer to comment on os_switch_lib_tls.
              * It is only called in parent thread.
@@ -10488,6 +11874,8 @@ os_walk_address_space(memquery_iter_t *iter, bool add_modules)
             print_modules(GLOBAL, DUMP_NOT_XML);
     });
 
+    if (iter->error)
+        FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
     return count;
 }
 
@@ -10497,7 +11885,8 @@ find_executable_vm_areas(void)
 {
     int count;
     memquery_iter_t iter;
-    memquery_iterator_start(&iter, NULL, true /*may alloc*/);
+    if (!memquery_iterator_start(&iter, NULL, true /*may alloc*/))
+        FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
     count = os_walk_address_space(&iter, true);
     memquery_iterator_stop(&iter);
 
@@ -11035,6 +12424,9 @@ typedef struct _takeover_record_t {
     thread_id_t tid;
     event_t event;
     void *ptrace_cleanup;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    void *runtime_bootstrap;
+#endif
 } takeover_record_t;
 
 /* When attempting thread takeover, we store an array of thread id and event
@@ -11053,6 +12445,54 @@ static uint num_thread_takeover_records;
  * set up siginfo sharing.
  */
 static dcontext_t *takeover_dcontext;
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+static uint64
+runtime_takeover_payload(process_id_t pid, thread_id_t tid)
+{
+    if (pid != (process_id_t)dynamorio_syscall(SYS_getpid, 0) ||
+        takeover_dcontext == NULL ||
+        takeover_dcontext->owning_runtime_group != get_runtime_thread_group())
+        return 0;
+    for (uint i = 0; i < num_thread_takeover_records; ++i)
+        if (thread_takeover_records[i].tid == tid)
+            return (uint64)(ptr_uint_t)__atomic_load_n(
+                &thread_takeover_records[i].runtime_bootstrap, __ATOMIC_ACQUIRE);
+    return 0;
+}
+#endif
+
+bool
+os_runtime_takeover_enter(uint64 identity)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (os_runtime_identity_present())
+        return true;
+    /* The queued signal carries a published, per-target bootstrap pointer.
+     * Compare against our records before dereferencing it; a namespace-local
+     * numeric TID alone must never select another task's identity.
+     */
+    if (identity == 0)
+        return false;
+    thread_id_t tid = (thread_id_t)dynamorio_syscall(SYS_gettid, 0);
+    for (uint i = 0; i < num_thread_takeover_records; ++i) {
+        takeover_record_t *record = &thread_takeover_records[i];
+        if (record->tid != tid)
+            continue;
+        void *bootstrap = (void *)(ptr_uint_t)identity;
+        if (!__atomic_compare_exchange_n(&record->runtime_bootstrap, &bootstrap, NULL,
+                                         false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            continue;
+        os_local_state_t *tls = bootstrap;
+        tls->runtime_app_gs = runtime_gs_base();
+        os_runtime_identity_enter(tls);
+        return true;
+    }
+    return false;
+#else
+    return true;
+#endif
+}
 
 void
 ptrace_takeover_record_set(thread_id_t tid, void *param)
@@ -11095,6 +12535,129 @@ ptrace_takeover_record_present(thread_id_t tid)
     return false;
 }
 
+/* Directory entries are relative to the proc mount's PID namespace. NSpid's
+ * final value is the task's innermost namespace ID, which is our syscall ID for
+ * threads in our own process. Do not apply this conversion to foreign tasks.
+ */
+static thread_id_t
+os_self_task_namespace_tid(file_t task_dir, const char *entry, thread_id_t proc_tid)
+{
+#ifdef LINUX
+    char path[MAXIMUM_PATH];
+    char bytes[512];
+    const char prefix[] = "NSpid:";
+    size_t matched = 0;
+    bool candidate = true, digits = false, found = false, malformed = false;
+    bool have_data = false;
+    uint value = 0;
+    thread_id_t local_tid = 0;
+    file_t file;
+
+    snprintf(path, BUFFER_SIZE_ELEMENTS(path), "%s/status", entry);
+    NULL_TERMINATE_BUFFER(path);
+    file = dynamorio_syscall(SYS_openat, 4, task_dir, path, O_RDONLY | O_CLOEXEC, 0);
+    if (file < 0) {
+        if (file == -ENOENT || file == -ESRCH)
+            return INVALID_THREAD_ID; /* Exited after getdents. */
+        goto translation_failed;
+    }
+    while (!found) {
+        ssize_t count = os_read(file, bytes, sizeof(bytes));
+        if (count == -EINTR)
+            continue;
+        if (count == -ESRCH || count == -ENOENT)
+            have_data = false;
+        else if (count < 0) {
+            have_data = true;
+            malformed = true;
+        }
+        if (count <= 0)
+            break;
+        have_data = true;
+        for (ssize_t i = 0; i < count; ++i) {
+            const char ch = bytes[i];
+            if (ch == '\n') {
+                if (candidate && matched == sizeof(prefix) - 1) {
+                    if (digits)
+                        local_tid = value;
+                    found = true;
+                    break;
+                }
+                matched = 0;
+                candidate = true;
+            } else if (candidate && matched < sizeof(prefix) - 1) {
+                candidate = ch == prefix[matched++];
+            } else if (candidate) {
+                if (ch >= '0' && ch <= '9') {
+                    const uint digit = ch - '0';
+                    if (value > ((uint)INT_MAX - digit) / 10)
+                        malformed = true;
+                    else
+                        value = value * 10 + digit;
+                    digits = true;
+                } else if (ch == ' ' || ch == '\t') {
+                    if (digits) {
+                        local_tid = value;
+                        value = 0;
+                        digits = false;
+                    }
+                } else
+                    malformed = true;
+            }
+        }
+    }
+    os_close(file);
+    if (found && !malformed)
+        return local_tid;
+    if (!have_data)
+        return INVALID_THREAD_ID;
+    /* Older kernels have no NSpid. A numeric directory entry is safe only if
+     * the proc mount's init and our process demonstrably share a PID namespace.
+     * If that cannot be established, abort rather than signal a different task.
+     */
+    if (!found && !malformed && procfs_root != INVALID_FILE) {
+        char current_namespace[64], mount_namespace[64];
+        long current_size =
+            dynamorio_syscall(SYS_readlinkat, 4, procfs_root, "thread-self/ns/pid",
+                              current_namespace, sizeof(current_namespace));
+        long mount_size = dynamorio_syscall(SYS_readlinkat, 4, procfs_root, "1/ns/pid",
+                                            mount_namespace, sizeof(mount_namespace));
+        if (current_size < 0)
+            current_size =
+                dynamorio_syscall(SYS_readlinkat, 4, procfs_root, "self/ns/pid",
+                                  current_namespace, sizeof(current_namespace));
+        if (current_size > 0 && current_size < sizeof(current_namespace) &&
+            current_size == mount_size &&
+            memcmp(current_namespace, mount_namespace, current_size) == 0)
+            return proc_tid;
+    }
+translation_failed:
+    SYSLOG_INTERNAL_ERROR("cannot translate a proc task ID to our PID namespace");
+    REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_TAKE_OVER_THREADS, 2, get_application_name(),
+                                get_application_pid());
+    return INVALID_THREAD_ID;
+#else
+    return proc_tid;
+#endif
+}
+
+static bool
+os_self_task_exists(thread_id_t tid)
+{
+#ifdef LINUX
+    /* A signal-zero check uses syscall namespace IDs and cannot confuse an
+     * ancestor-mounted proc entry with an unrelated local thread. EPERM does
+     * not prove death; only ESRCH does.
+     */
+    return dynamorio_syscall(SYS_tgkill, 3, get_process_id(), tid, 0) != -ESRCH;
+#else
+    char task[64];
+    snprintf(task, BUFFER_SIZE_ELEMENTS(task), "/proc/self/task/%d", tid);
+    NULL_TERMINATE_BUFFER(task);
+    return os_file_exists(task, false /*!is dir*/);
+#endif
+}
+
 thread_id_t *
 os_list_threads_by_pid(dcontext_t *dcontext, process_id_t pid, uint *num_threads_out)
 {
@@ -11102,12 +12665,12 @@ os_list_threads_by_pid(dcontext_t *dcontext, process_id_t pid, uint *num_threads
 
     snprintf(task_path, BUFFER_SIZE_ELEMENTS(task_path), "/proc/%d/task", pid);
     NULL_TERMINATE_BUFFER(task_path);
-    return os_list_threads_from_task_dir(dcontext, task_path, num_threads_out);
+    return os_list_threads_from_task_dir(dcontext, task_path, false, num_threads_out);
 }
 
 static thread_id_t *
 os_list_threads_from_task_dir(dcontext_t *dcontext, const char *task_path,
-                              uint *num_threads_out)
+                              bool current_process, uint *num_threads_out)
 {
     dir_iterator_t iter;
     file_t task_dir;
@@ -11119,8 +12682,20 @@ os_list_threads_from_task_dir(dcontext_t *dcontext, const char *task_path,
     ASSERT(num_threads_out != NULL);
     *num_threads_out = 0;
 
-    task_dir = os_open_directory(task_path, OS_OPEN_READ);
-    ASSERT(task_dir != INVALID_FILE);
+#ifdef LINUX
+    if (current_process) {
+        task_dir = os_open_procfs("thread-self/..", true);
+        if (task_dir == INVALID_FILE)
+            task_dir = os_open_procfs("self/task", true);
+    } else
+#endif
+        task_dir = os_open_directory(task_path, OS_OPEN_READ);
+    if (task_dir == INVALID_FILE) {
+        SYSLOG_INTERNAL_ERROR("cannot open proc task directory");
+        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_TAKE_OVER_THREADS, 2,
+                                    get_application_name(), get_application_pid());
+        return NULL;
+    }
 
     tids =
         HEAP_ARRAY_ALLOC(dcontext, thread_id_t, tids_alloced, ACCT_THREAD_MGT, PROTECTED);
@@ -11135,6 +12710,11 @@ os_list_threads_from_task_dir(dcontext_t *dcontext, const char *task_path,
         ASSERT_MESSAGE(CHKLVL_ASSERTS, "failed to parse /proc/pid/task entry", r == 1);
         if (tid <= 0)
             continue;
+        if (current_process) {
+            tid = os_self_task_namespace_tid(task_dir, iter.name, tid);
+            if (tid == INVALID_THREAD_ID)
+                continue;
+        }
         if (num_threads == tids_alloced) {
             /* realloc, essentially.  Less expensive than counting first. */
             new_tids = HEAP_ARRAY_ALLOC(dcontext, thread_id_t, tids_alloced * 2,
@@ -11147,8 +12727,12 @@ os_list_threads_from_task_dir(dcontext_t *dcontext, const char *task_path,
         }
         tids[num_threads++] = tid;
     }
-    ASSERT(iter.end == 0); /* No reading errors. */
     os_close(task_dir);
+    if (iter.end != 0) {
+        SYSLOG_INTERNAL_ERROR("cannot read the complete proc task directory");
+        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_TAKE_OVER_THREADS, 2,
+                                    get_application_name(), get_application_pid());
+    }
 
     /* realloc back down to num_threads for caller simplicity. */
     new_tids =
@@ -11178,7 +12762,8 @@ os_list_threads(dcontext_t *dcontext, uint *num_threads_out)
     return NULL;
 #endif
 
-    return os_list_threads_from_task_dir(dcontext, "/proc/self/task", num_threads_out);
+    return os_list_threads_from_task_dir(dcontext, "/proc/self/task", true,
+                                         num_threads_out);
 }
 
 /* List the /proc/self/task directory and add all unknown thread ids to the
@@ -11269,13 +12854,17 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
         /* Create records with events for all the threads we want to signal. */
         LOG(GLOBAL, LOG_THREADS, 1, "TAKEOVER: publishing takeover records\n");
         records = HEAP_ARRAY_ALLOC(dcontext, takeover_record_t, threads_to_signal,
-                                   ACCT_THREAD_MGT, PROTECTED);
+                                   ACCT_THREAD_MGT, UNPROTECTED);
         for (i = 0; i < threads_to_signal; i++) {
             LOG(GLOBAL, LOG_THREADS, 1, "TAKEOVER: will signal thread " TIDFMT "\n",
                 tids[i]);
             records[i].tid = tids[i];
             records[i].event = create_event();
             records[i].ptrace_cleanup = NULL;
+#if defined(LINUX) && defined(X86) && defined(X64)
+            records[i].runtime_bootstrap = os_runtime_identity_prepare(
+                INVALID_RUNTIME_THREAD_ID, dcontext->owning_runtime_group, NULL);
+#endif
 #ifdef PTRACE_TAKEOVER_SUPPORTED
             if (DYNAMO_OPTION(attach_unmask_suspend_signal)) {
                 if (use_ptrace == NULL) {
@@ -11360,10 +12949,7 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
             int attempts = 0;
             while (!wait_for_event(records[i].event, wait_ms)) {
                 /* The thread may have exited (i#2601).  We assume no tid re-use. */
-                char task[64];
-                snprintf(task, BUFFER_SIZE_ELEMENTS(task), "/proc/self/task/%d", tids[i]);
-                NULL_TERMINATE_BUFFER(task);
-                if (!os_file_exists(task, false /*!is dir*/)) {
+                if (!os_self_task_exists(tids[i])) {
                     SYSLOG_INTERNAL_WARNING_ONCE("thread exited while attaching");
                     break;
                 }
@@ -11409,10 +12995,7 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
             for (i = 0; i < threads_to_signal; i++) {
                 if (timed_out[i] == 0)
                     continue;
-                char task[64];
-                snprintf(task, BUFFER_SIZE_ELEMENTS(task), "/proc/self/task/%d", tids[i]);
-                NULL_TERMINATE_BUFFER(task);
-                if (!os_file_exists(task, false /*!is dir*/))
+                if (!os_self_task_exists(tids[i]))
                     continue;
                 retry_tids[retry_count++] = records[i].tid;
             }
@@ -11426,11 +13009,7 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
                     int max_attempts = DYNAMO_OPTION(takeover_timeout_ms) / wait_ms;
                     int attempts = 0;
                     while (!wait_for_event(records[i].event, wait_ms)) {
-                        char task[64];
-                        snprintf(task, BUFFER_SIZE_ELEMENTS(task), "/proc/self/task/%d",
-                                 tids[i]);
-                        NULL_TERMINATE_BUFFER(task);
-                        if (!os_file_exists(task, false /*!is dir*/))
+                        if (!os_self_task_exists(tids[i]))
                             break;
                         if (++attempts > max_attempts) {
                             if (DYNAMO_OPTION(unsafe_ignore_takeover_timeout)) {
@@ -11480,9 +13059,12 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
             }
 #endif
             destroy_event(records[i].event);
+#if defined(LINUX) && defined(X86) && defined(X64)
+            os_runtime_identity_discard(records[i].runtime_bootstrap);
+#endif
         }
         HEAP_ARRAY_FREE(dcontext, records, takeover_record_t, threads_to_signal,
-                        ACCT_THREAD_MGT, PROTECTED);
+                        ACCT_THREAD_MGT, UNPROTECTED);
     }
 
     d_r_mutex_unlock(&thread_initexit_lock);
@@ -11505,7 +13087,7 @@ os_thread_re_take_over(void)
      */
     if (!is_thread_initialized() && is_thread_tls_allocated()) {
         /* It's safe to call thread_lookup() for ourself. */
-        thread_record_t *tr = thread_lookup(get_sys_thread_id());
+        thread_record_t *tr = thread_lookup_runtime(get_runtime_thread_id());
         if (tr != NULL) {
             ASSERT(is_thread_currently_native(tr));
             LOG(GLOBAL, LOG_THREADS, 1, "\tretakeover for cur-native thread " TIDFMT "\n",
@@ -11548,6 +13130,10 @@ os_thread_signal_taken_over(void)
 bool
 os_thread_take_over(priv_mcontext_t *mc, kernel_sigset_t *sigset)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (!os_runtime_identity_present())
+        return false;
+#endif
     dcontext_t *dcontext;
     priv_mcontext_t *dc_mc;
 #ifdef PTRACE_TAKEOVER_SUPPORTED
@@ -11676,7 +13262,7 @@ os_thread_take_over_secondary(priv_mcontext_t *mc)
             break;
     }
     ASSERT(i < num_threads);
-    ASSERT(list[i]->id != get_sys_thread_id());
+    ASSERT(list[i]->runtime_id != get_runtime_thread_id());
     /* Assuming pthreads, prepare signal_field for sharing. */
     handle_clone(list[i]->dcontext, PTHREAD_CLONE_FLAGS);
     dcontext = init_thread_with_shared_siginfo(mc, list[i]->dcontext);

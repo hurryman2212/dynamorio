@@ -72,19 +72,15 @@ static mutex_t memory_info_buf_lock = INIT_LOCK_FREE(memory_info_buf_lock);
 /* lock for iterator where user needs to allocate memory */
 static mutex_t maps_iter_buf_lock = INIT_LOCK_FREE(maps_iter_buf_lock);
 
-/* On all supported linux kernels /proc/self/maps -> /proc/$pid/maps
- * However, what we want is /proc/$tid/maps, so we can't use "self"
- */
-#define PROC_SELF_MAPS "/proc/self/maps"
-
 /* these are defined in /usr/src/linux/fs/proc/array.c */
 #define MAPS_LINE_LENGTH 4096
 /* for systems with sizeof(void*) == 4: */
-#define MAPS_LINE_FORMAT4 "%08lx-%08lx %s %08lx %x:%x " UINT64_FORMAT_STRING " %4096[^\n]"
+#define MAPS_LINE_FORMAT4 \
+    "%08lx-%08lx %15s %08lx %x:%x " UINT64_FORMAT_STRING " %4096[^\n]"
 #define MAPS_LINE_MAX4 49 /* sum of 8  1  8  1 4 1 8 1 5 1 10 1 */
 /* for systems with sizeof(void*) == 8: */
 #define MAPS_LINE_FORMAT8 \
-    "%016lx-%016lx %s %016lx %x:%x " UINT64_FORMAT_STRING " %4096[^\n]"
+    "%016lx-%016lx %15s %016lx %x:%x " UINT64_FORMAT_STRING " %4096[^\n]"
 #define MAPS_LINE_MAX8 73 /* sum of 16  1  16  1 4 1 16 1 5 1 10 1 */
 
 #define MAPS_LINE_MAX MAPS_LINE_MAX8
@@ -143,7 +139,6 @@ memquery_from_os_will_block(void)
 bool
 memquery_iterator_start(memquery_iter_t *iter, app_pc start, bool may_alloc)
 {
-    char maps_name[24]; /* should only need 16 for 5-digit tid */
     maps_iter_t *mi = (maps_iter_t *)&iter->internal;
 
     /* Don't assign the local ptrs until the lock is grabbed to make
@@ -158,14 +153,19 @@ memquery_iterator_start(memquery_iter_t *iter, app_pc start, bool may_alloc)
         mi->comment_buffer = (char *)&comment_buf_scratch;
     }
 
-    /* We need the maps for our thread id, not process id.
-     * "/proc/self/maps" uses pid which fails if primary thread in group
-     * has exited.
-     */
-    snprintf(maps_name, BUFFER_SIZE_ELEMENTS(maps_name), "/proc/%d/maps",
-             d_r_get_thread_id());
-    mi->maps = os_open(maps_name, OS_OPEN_READ);
-    ASSERT(mi->maps != INVALID_FILE);
+    iter->error = false;
+    iter->may_alloc = may_alloc;
+    mi->maps = os_open_procfs("thread-self/maps", false);
+    if (mi->maps == INVALID_FILE)
+        mi->maps = os_open_procfs("self/maps", false);
+    if (mi->maps == INVALID_FILE) {
+        iter->error = true;
+        if (may_alloc)
+            d_r_mutex_unlock(&maps_iter_buf_lock);
+        else
+            d_r_mutex_unlock(&memory_info_buf_lock);
+        return false;
+    }
     mi->buf[BUFSIZE - 1] = '\0'; /* permanently */
 
     mi->newline = NULL;
@@ -213,8 +213,13 @@ memquery_iterator_next(memquery_iter_t *iter)
         ASSERT(mi->bufread <= mi->bufwant);
         LOG(GLOBAL, LOG_VMAREAS, 6, "get_memory_info_from_os: bytes read %d/want %d\n",
             mi->bufread, mi->bufwant);
-        if (mi->bufread <= 0)
+        if (mi->bufread <= 0) {
+            /* A live process has mappings. An empty file cannot establish that
+             * its entire address space is free (e.g. an exited task's maps).
+             */
+            iter->error = true;
             return false;
+        }
         mi->buf[mi->bufread] = '\0';
         mi->newline = strchr(mi->buf, '\n');
         line = mi->buf;
@@ -233,8 +238,10 @@ memquery_iterator_next(memquery_iter_t *iter)
             memmove(mi->buf, line, len);
             mi->bufread = os_read(mi->maps, mi->buf + len, mi->bufwant);
             ASSERT(mi->bufread <= mi->bufwant);
-            if (mi->bufread <= 0)
+            if (mi->bufread <= 0) {
+                iter->error = mi->bufread < 0 || len != 0;
                 return false;
+            }
             mi->bufread += len; /* bufread is total in buf */
             mi->buf[mi->bufread] = '\0';
             mi->newline = strchr(mi->buf, '\n');
@@ -250,8 +257,10 @@ memquery_iterator_next(memquery_iter_t *iter)
     /* Buffer is big enough to hold at least one line: if not, the file changed
      * underneath us after we hit the end.  Just bail.
      */
-    if (mi->newline == NULL)
+    if (mi->newline == NULL) {
+        iter->error = true;
         return false;
+    }
     *mi->newline = '\0';
     LOG(GLOBAL, LOG_VMAREAS, 6, "\nget_memory_info_from_os: line=[%s]\n", line);
     mi->comment_buffer[0] = '\0';
@@ -264,6 +273,10 @@ memquery_iterator_next(memquery_iter_t *iter)
                  (unsigned long *)&iter->vm_start, (unsigned long *)&iter->vm_end, perm,
                  (unsigned long *)&iter->offset, &iter->device_major, &iter->device_minor,
                  &iter->inode, mi->comment_buffer);
+    if (len < 7 || iter->vm_start > iter->vm_end || strlen(perm) != 4) {
+        iter->error = true;
+        return false;
+    }
     if (iter->vm_start == iter->vm_end) {
         /* i#366 & i#599: Merge an empty regions caused by stack guard pages
          * into the stack region if the stack region is less than one page away.
@@ -349,7 +362,11 @@ memquery_from_os(const byte *pc, DR_PARAM_OUT dr_mem_info_t *info,
     app_pc next_start = (app_pc)POINTER_MAX;
     bool found = false;
     ASSERT(info != NULL);
-    memquery_iterator_start(&iter, (app_pc)pc, false /*won't alloc*/);
+    info->type = DR_MEMTYPE_ERROR;
+    *have_type = true;
+    if (!memquery_iterator_start(&iter, (app_pc)pc, false /*won't alloc*/))
+        return false;
+    *have_type = false;
     while (memquery_iterator_next(&iter)) {
         if (pc >= iter.vm_start && pc < iter.vm_end) {
             info->base_pc = iter.vm_start;
@@ -383,6 +400,11 @@ memquery_from_os(const byte *pc, DR_PARAM_OUT dr_mem_info_t *info,
         last_end = iter.vm_end;
     }
     memquery_iterator_stop(&iter);
+    if (iter.error) {
+        info->type = DR_MEMTYPE_ERROR;
+        *have_type = true;
+        return false;
+    }
     if (!found) {
         info->base_pc = last_end;
         info->size = (next_start - last_end);

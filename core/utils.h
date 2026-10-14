@@ -271,8 +271,8 @@ typedef struct _mutex_t {
     /* We flag as a violation if a lock with rank numerically smaller
      * or equal to the rank of a lock already held by the owning thread is acquired
      */
-    uint rank;         /* sets rank order in which this lock can be set */
-    thread_id_t owner; /* TID of owner (reusable, not avail before initialization) */
+    uint rank;                 /* sets rank order in which this lock can be set */
+    runtime_thread_id_t owner; /* Namespace-independent runtime owner. */
     /* Above here is explicitly set w/ INIT_LOCK_NO_TYPE macro so update
      * it if changing them.  Below here is filled with 0's.
      */
@@ -321,12 +321,11 @@ typedef struct _spin_mutex_t {
 /* perhaps for DEBUG all locks should record owner? */
 typedef struct _recursive_lock_t {
     mutex_t lock;
-    /* Requirement: reading owner field is atomic!
-     * Thus must allocate this statically (compiler should 4-byte-align
-     * this field, which is good enough) or align it manually!
+    /* Requirement: reading the owner field is atomic. Its runtime ID type
+     * provides natural alignment, including 8-byte Linux x64 tokens.
      * XXX: Provide creation routine that does that for non-static locks?
      */
-    thread_id_t owner;
+    runtime_thread_id_t owner;
     uint count;
 } recursive_lock_t;
 
@@ -338,7 +337,7 @@ typedef struct _read_write_lock_t {
      */
     volatile int num_readers;
     /* we store the writer so that writers can be readers */
-    thread_id_t writer;
+    runtime_thread_id_t writer;
     volatile int num_pending_readers; /* readers that have contended with a writer */
     contention_event_t writer_waiting_readers; /* event object for writer to wait on */
     contention_event_t readers_waiting_writer; /* event object for readers to wait on */
@@ -497,12 +496,13 @@ enum {
 #    ifdef LINUX
     LOCK_RANK(sigfdtable_lock), /* < table_rwlock */
 #    endif
-    LOCK_RANK(table_rwlock),        /* > dr_client_mutex */
-    LOCK_RANK(loaded_module_areas), /* < dynamo_areas < global_alloc_lock */
-    LOCK_RANK(aslr_areas),          /* < dynamo_areas < global_alloc_lock */
-    LOCK_RANK(aslr_pad_areas),      /* < dynamo_areas < global_alloc_lock */
-    LOCK_RANK(native_exec_areas),   /* < dynamo_areas < global_alloc_lock */
-    LOCK_RANK(thread_vm_areas),     /* currently never used */
+    LOCK_RANK(fd_table_transaction), /* before the descriptor table and heap */
+    LOCK_RANK(table_rwlock),         /* > dr_client_mutex */
+    LOCK_RANK(loaded_module_areas),  /* < dynamo_areas < global_alloc_lock */
+    LOCK_RANK(aslr_areas),           /* < dynamo_areas < global_alloc_lock */
+    LOCK_RANK(aslr_pad_areas),       /* < dynamo_areas < global_alloc_lock */
+    LOCK_RANK(native_exec_areas),    /* < dynamo_areas < global_alloc_lock */
+    LOCK_RANK(thread_vm_areas),      /* currently never used */
 
     LOCK_RANK(app_pc_table_rwlock), /* > after_call_lock, > rct_module_lock,
                                      * > module_data_lock */
@@ -851,6 +851,14 @@ self_owns_write_lock(read_write_lock_t *rw);
         ((thread_id_t)atomic_aligned_read_int((volatile int *)(id)))
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    define ATOMIC_READ_RUNTIME_THREAD_ID(id) \
+        ((runtime_thread_id_t)atomic_aligned_read_int64((volatile int64 *)(id)))
+#else
+#    define ATOMIC_READ_RUNTIME_THREAD_ID(id) \
+        ((runtime_thread_id_t)ATOMIC_READ_THREAD_ID(id))
+#endif
+
 /* test whether locks are held at all */
 #define WRITE_LOCK_HELD(rw) \
     (mutex_testlock(&(rw)->lock) && atomic_aligned_read_int(&(rw)->num_readers) == 0)
@@ -862,7 +870,8 @@ self_owns_write_lock(read_write_lock_t *rw);
  * knowing for sure.
  */
 #ifdef DEADLOCK_AVOIDANCE
-#    define OWN_MUTEX(m) (ATOMIC_READ_THREAD_ID(&(m)->owner) == d_r_get_thread_id())
+#    define OWN_MUTEX(m) \
+        (ATOMIC_READ_RUNTIME_THREAD_ID(&(m)->owner) == get_runtime_thread_id())
 #    define ASSERT_OWN_MUTEX(pred, m) ASSERT(!(pred) || OWN_MUTEX(m))
 #    define ASSERT_DO_NOT_OWN_MUTEX(pred, m) ASSERT(!(pred) || !OWN_MUTEX(m))
 #    define OWN_NO_LOCKS(dc) thread_owns_no_locks(dc)
@@ -1390,6 +1399,7 @@ extern mutex_t do_threshold_mutex;
             !dynamo_initialized) {                                              \
             try__except = &global_try_except;                                   \
             IF_UNIX(global_try_tid = get_sys_thread_id());                      \
+            IF_UNIX(global_try_runtime_id = get_runtime_thread_id());           \
         } else {                                                                \
             if (dc__local == GLOBAL_DCONTEXT)                                   \
                 dc__local = get_thread_private_dcontext();                      \
@@ -1399,6 +1409,7 @@ extern mutex_t do_threshold_mutex;
         ASSERT(try__except != NULL);                                            \
         TRY(try__except, try_statement, EXCEPT(try__except, except_statement)); \
         IF_UNIX(global_try_tid = INVALID_THREAD_ID);                            \
+        IF_UNIX(global_try_runtime_id = INVALID_RUNTIME_THREAD_ID);             \
     } while (0)
 
 /* these use do..while w/ a local to avoid double-eval of dcontext */
@@ -1417,41 +1428,40 @@ extern mutex_t do_threshold_mutex;
     } while (0)
 
 /* internal versions */
-#define TRY(try_pointer, try_statement, except_or_finally)                             \
-    do {                                                                               \
-        try_except_context_t try__state;                                               \
-        /* must be current thread -> where we'll fault */                              \
-        /* We allow NULL solely to avoid duplicating try_statement in                  \
-         * TRY_EXCEPT_ALLOW_NO_DCONTEXT.                                               \
-         */                                                                            \
-        ASSERT(                                                                        \
-            (try_pointer) == &global_try_except || (try_pointer) == NULL ||            \
-            (get_thread_private_dcontext() !=                                          \
-                 NULL && /* Note that the following statement does not dereference the \
-                          * result of get_thread_private_dcontext() (because we need   \
-                          * just the offset of a data member). Still, when the null    \
-                          * sanitizer is enabled, it performs the is-null check, which \
-                          * can fail if the returned value is NULL. So, we need this   \
-                          * is-null check of our own.                                  \
-                          */                                                           \
-             (try_pointer) == &get_thread_private_dcontext()->try_except) ||           \
-            (try_pointer) == /* A currently-native thread: */                          \
-                &thread_lookup(IF_UNIX_ELSE(get_sys_thread_id(), d_r_get_thread_id())) \
-                     ->dcontext->try_except);                                          \
-        if ((try_pointer) != NULL) {                                                   \
-            try__state.prev_context = (try_pointer)->try_except_state;                 \
-            (try_pointer)->try_except_state = &try__state;                             \
-        }                                                                              \
-        if ((try_pointer) == NULL || DR_SETJMP(&try__state.context) == 0) {            \
-            try_statement /* TRY block */ /* make sure there is no return in           \
-                                             try_statement */                          \
-                if ((try_pointer) != NULL)                                             \
-            {                                                                          \
-                POP_TRY_BLOCK(try_pointer, try__state);                                \
-            }                                                                          \
-        }                                                                              \
-        except_or_finally                                                              \
-        /* EXCEPT or FINALLY will POP_TRY_BLOCK on exception */                        \
+#define TRY(try_pointer, try_statement, except_or_finally)                              \
+    do {                                                                                \
+        try_except_context_t try__state;                                                \
+        /* must be current thread -> where we'll fault */                               \
+        /* We allow NULL solely to avoid duplicating try_statement in                   \
+         * TRY_EXCEPT_ALLOW_NO_DCONTEXT.                                                \
+         */                                                                             \
+        ASSERT(                                                                         \
+            (try_pointer) == &global_try_except || (try_pointer) == NULL ||             \
+            (get_thread_private_dcontext() !=                                           \
+                 NULL && /* Note that the following statement does not dereference the  \
+                          * result of get_thread_private_dcontext() (because we need    \
+                          * just the offset of a data member). Still, when the null     \
+                          * sanitizer is enabled, it performs the is-null check, which  \
+                          * can fail if the returned value is NULL. So, we need this    \
+                          * is-null check of our own.                                   \
+                          */                                                            \
+             (try_pointer) == &get_thread_private_dcontext()->try_except) ||            \
+            (try_pointer) == /* A currently-native thread: */                           \
+                &thread_lookup_runtime(get_runtime_thread_id())->dcontext->try_except); \
+        if ((try_pointer) != NULL) {                                                    \
+            try__state.prev_context = (try_pointer)->try_except_state;                  \
+            (try_pointer)->try_except_state = &try__state;                              \
+        }                                                                               \
+        if ((try_pointer) == NULL || DR_SETJMP(&try__state.context) == 0) {             \
+            try_statement /* TRY block */ /* make sure there is no return in            \
+                                             try_statement */                           \
+                if ((try_pointer) != NULL)                                              \
+            {                                                                           \
+                POP_TRY_BLOCK(try_pointer, try__state);                                 \
+            }                                                                           \
+        }                                                                               \
+        except_or_finally                                                               \
+        /* EXCEPT or FINALLY will POP_TRY_BLOCK on exception */                         \
     } while (0)
 
 /* implementation notes: */

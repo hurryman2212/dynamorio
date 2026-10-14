@@ -6385,7 +6385,6 @@ flush_fragments_synchall_start(dcontext_t *ignored, app_pc base, size_t size,
     int i;
     const thread_synch_state_t desired_state =
         THREAD_SYNCH_SUSPENDED_VALID_MCONTEXT_OR_NO_XFER;
-    DEBUG_DECLARE(bool ok;)
     KSTART(synchall_flush);
     LOG(GLOBAL, LOG_FRAGMENT, 2,
         "\nflush_fragments_synchall_start: thread " TIDFMT " suspending all threads\n",
@@ -6393,16 +6392,16 @@ flush_fragments_synchall_start(dcontext_t *ignored, app_pc base, size_t size,
 
     STATS_INC(flush_synchall);
     /* suspend all DR-controlled threads at safe locations */
-    DEBUG_DECLARE(ok =)
-    synch_with_all_threads(desired_state, &flush_threads, &flush_num_threads, cur_state,
-                           /* if we fail to suspend a thread (e.g., for
-                            * privilege reasons), ignore it since presumably
-                            * the failed thread is some injected thread not
-                            * running to-be-flushed code, so we continue
-                            * with the flush!
-                            */
-                           THREAD_SYNCH_SUSPEND_FAILURE_IGNORE);
-    ASSERT(ok);
+    if (!synch_with_all_threads(desired_state, &flush_threads, &flush_num_threads,
+                                cur_state, THREAD_SYNCH_SUSPEND_FAILURE_IGNORE)) {
+        /* A live peer may still execute the code being flushed. Release the
+         * partial stop before reporting failure; never publish this flush. */
+        end_synch_with_all_threads(flush_threads, flush_num_threads, true);
+        flush_threads = NULL;
+        flush_num_threads = 0;
+        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                    get_application_name(), get_application_pid());
+    }
     /* now we own the thread_initexit_lock */
     ASSERT(OWN_MUTEX(&all_threads_synch_lock) && OWN_MUTEX(&thread_initexit_lock));
 
@@ -6771,7 +6770,7 @@ flush_fragments_synch_priv(dcontext_t *dcontext, app_pc base, size_t size,
         tgt_pt = (per_thread_t *)tgt_dcontext->fragment_field;
         LOG(THREAD, LOG_FRAGMENT, 2, "  considering thread #%d/%d = " TIDFMT "\n", i + 1,
             flush_num_threads, flush_threads[i]->id);
-        ASSERT(is_thread_known(tgt_dcontext->owning_thread));
+        ASSERT(thread_lookup_runtime(tgt_dcontext->owning_runtime_id) != NULL);
 
         /* can't do anything, even check if thread has any vm areas overlapping flush
          * region, until sure thread is in fcache or somewhere that won't change

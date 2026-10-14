@@ -116,12 +116,14 @@ memquery_library_bounds_by_iterator_internal(
      * address space even when we have syscalls for memquery (e.g., on Mac).
      * Even if start is non-NULL, it could be in the middle of the library.
      */
-    funcs->memquery_iterator_start(&iter, NULL,
-                                   /* We're never called from a fragile place like a
-                                    * signal handler, so as long as it's not real early
-                                    * it's ok to alloc.
-                                    */
-                                   dynamo_heap_initialized);
+    iter.error = false;
+    if (!funcs->memquery_iterator_start(&iter, NULL,
+                                        /* We're never called from a fragile place like a
+                                         * signal handler, so as long as it's not real
+                                         * early it's ok to alloc.
+                                         */
+                                        dynamo_heap_initialized))
+        return 0;
     libname[0] = '\0';
     while (funcs->memquery_iterator_next(&iter)) {
         LOG(GLOBAL, LOG_VMAREAS, 5, "start=" PFX " end=" PFX " prot=%x comment=%s\n",
@@ -278,6 +280,8 @@ memquery_library_bounds_by_iterator_internal(
         ASSERT_CURIOSITY(image_size == 0 || cur_end - mod_start == image_size);
     }
     funcs->memquery_iterator_stop(&iter);
+    if (iter.error)
+        return 0;
 
     if (name == NULL && *start < mod_start)
         count = 0; /* Our target adjustment missed: we never found a file-backed entry */

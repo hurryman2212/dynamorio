@@ -233,6 +233,36 @@ thread_id_t
 get_tls_thread_id(void);
 thread_id_t
 get_sys_thread_id(void);
+/* NULL/GLOBAL_DCONTEXT selects this task's kernel file-table domain. */
+uint64
+os_file_table_identity(dcontext_t *context);
+/* Stable across inherited descriptor-table copies; zero means not protected. */
+uint64
+os_file_identity(file_t descriptor);
+/* These bootstrap operations do not depend on DR TLS, heap, or owned locks. */
+void
+os_runtime_identity_init(void);
+void *
+os_runtime_identity_prepare(runtime_thread_id_t id, runtime_thread_id_t group,
+                            void *app_gs);
+void
+os_runtime_identity_enter(void *bootstrap);
+void
+os_runtime_identity_discard(void *bootstrap);
+bool
+os_runtime_identity_is_bootstrap(void *base);
+bool
+os_runtime_identity_present(void);
+bool
+os_runtime_takeover_enter(uint64 identity);
+void
+os_runtime_identity_finish(bool restore_signal_mask);
+void *
+os_runtime_clone_prepare(dcontext_t *parent, uint64 flags);
+void
+os_runtime_clone_complete(dcontext_t *parent, bool succeeded);
+void
+os_runtime_clone_child_ready(void);
 bool
 is_thread_terminated(dcontext_t *dcontext);
 void
@@ -582,6 +612,8 @@ reg_t
 get_clone_record_app_xsp(void *record);
 byte *
 get_clone_record_dstack(void *record);
+void
+initialize_clone_runtime(reg_t stack);
 
 #if defined(AARCHXX) || defined(RISCV64)
 reg_t

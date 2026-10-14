@@ -2189,6 +2189,7 @@ reload_dynamorio(void **init_sp, app_pc conflict_start, app_pc conflict_end)
 void
 privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
 {
+    os_runtime_identity_init();
     ptr_int_t *argc = (ptr_int_t *)sp; /* Kernel writes an elf_addr_t. */
     char **argv = (char **)sp + 1;
     char **envp = argv + *argc + 1;
@@ -2285,6 +2286,7 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
     if (get_dynamorio_dll_start() < exe_end + APP_BRK_GAP &&
         get_dynamorio_dll_end() > exe_map) {
         elf_loader_destroy(&exe_ld);
+        os_runtime_identity_finish(true);
         reload_dynamorio(sp, exe_map, exe_end + APP_BRK_GAP);
         ASSERT_NOT_REACHED();
     }

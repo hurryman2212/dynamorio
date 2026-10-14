@@ -90,6 +90,9 @@ typedef struct _thread_pc_info_t {
     pc_profile_entry_t **htable; /* HASH_BITS-bit addressed hash table, key is pc */
     void *special_heap;
     file_t file;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    uint64 file_identity;
+#endif
     int where[DR_WHERE_LAST];
 } thread_pc_info_t;
 
@@ -143,6 +146,9 @@ pcprofile_thread_init(dcontext_t *dcontext, bool shared_itimer, void *parent_inf
     for (i = 0; i < DR_WHERE_LAST; i++)
         info->where[i] = 0;
     info->file = open_log_file("pcsamples", NULL, 0);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    info->file_identity = os_file_identity(info->file);
+#endif
     /* XXX PR 596808: we can easily fill up the initial special heap unit,
      * and creating a new one acquires global locks and can deadlock:
      * we should allocate many units up front or something
@@ -176,7 +182,11 @@ pcprofile_thread_exit(dcontext_t *dcontext)
     if (valid_symtab)
         symtab_exit();
 #endif
-    close_log_file(info->file);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (info->file == STDERR ||
+        (info->file_identity != 0 && os_file_identity(info->file) == info->file_identity))
+#endif
+        close_log_file(info->file);
     special_heap_exit(info->special_heap);
 #ifdef DEBUG
     /* for non-debug we do fast exit path and don't free local heap */
@@ -194,6 +204,9 @@ pcprofile_fork_init(dcontext_t *dcontext)
     info->thread_shared = false;
     pcprofile_reset(info);
     info->file = open_log_file("pcsamples", NULL, 0);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    info->file_identity = os_file_identity(info->file);
+#endif
     set_itimer_callback(dcontext, ITIMER_VIRTUAL, ALARM_FREQUENCY, pcprofile_alarm, NULL);
 }
 
@@ -402,6 +415,14 @@ pcprofile_reset(thread_pc_info_t *info)
 static void
 pcprofile_results(thread_pc_info_t *info)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Inherited copies keep the same origin, even after unshare. A vanished
+     * foreign task can instead leave a descriptor number absent or reused in
+     * this caller's table: never write its samples to that unrelated file. */
+    if (info->file != STDERR &&
+        (info->file_identity == 0 || os_file_identity(info->file) != info->file_identity))
+        return;
+#endif
     int i, total = 0;
     pc_profile_entry_t *e;
 

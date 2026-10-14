@@ -141,6 +141,7 @@ memquery_iterator_start(memquery_iter_t *iter, app_pc start, bool may_alloc)
     memset(ii, 0, sizeof(*ii));
     ii->address = (vm_address_t)start;
     iter->may_alloc = may_alloc;
+    iter->error = false;
     if (may_alloc) {
         ii->dcontext = get_thread_private_dcontext();
         if (ii->dcontext == NULL)

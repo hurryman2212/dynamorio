@@ -743,6 +743,7 @@ os_dump_core_live(dcontext_t *dcontext, char *output_directory DR_PARAM_IN,
                                  * retrying on failure.
                                  */
                                 THREAD_SYNCH_SUSPEND_FAILURE_IGNORE)) {
+        end_synch_with_all_threads(threads, num_threads, /*resume=*/true);
         return false;
     }
 

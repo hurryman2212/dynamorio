@@ -588,7 +588,8 @@ memcache_update_all_from_os(void)
 {
     memquery_iter_t iter;
     LOG(GLOBAL, LOG_SYSCALLS, 1, "updating memcache from maps file\n");
-    memquery_iterator_start(&iter, NULL, true /*may alloc*/);
+    if (!memquery_iterator_start(&iter, NULL, true /*may alloc*/))
+        FATAL_USAGE_ERROR(PROC_NOT_MOUNTED, 0, "");
     memcache_lock();
     /* We clear the entire cache to avoid false positive queries. */
     vmvector_reset_vector(GLOBAL_DCONTEXT, all_memory_areas);

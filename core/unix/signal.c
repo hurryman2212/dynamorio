@@ -198,6 +198,9 @@ sig_is_real_time(int sig)
 /* PR i#149/403015: clone record now passed via a new dstack */
 typedef struct _clone_record_t {
     byte *dstack; /* dstack for new thread - allocated by parent thread */
+#if defined(LINUX) && defined(X86) && defined(X64)
+    void *runtime_bootstrap;
+#endif
 #ifdef MACOS
     /* XXX i#1403: once we have lower-level, earlier thread interception we can
      * likely switch to something closer to what we do on Linux.
@@ -853,6 +856,11 @@ create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp)
     record->dstack = dstack;
     record->caller_id = dcontext->owning_thread;
     record->clone_sysnum = dcontext->sys_num;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    record->runtime_bootstrap = os_runtime_clone_prepare(
+        dcontext,
+        record->clone_sysnum == SYS_vfork ? CLONE_VM | CLONE_VFORK : record->clone_flags);
+#endif
     record->info = *((thread_sig_info_t *)dcontext->signal_field);
     /* Sigstack is not inherited so clear it now to avoid having to figure out
      * where it got its value in signal_thread_inherit (i#3116).
@@ -902,8 +910,35 @@ create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp)
 #ifdef LINUX
     }
 #endif
+#ifdef LINUX
+    os_thread_data_t *data = dcontext->os_field;
+    ASSERT(data->pending_clone_record == NULL);
+    data->pending_clone_record = record;
+#endif
     return (void *)record;
 }
+
+#ifdef LINUX
+void
+signal_clone_failed(dcontext_t *dcontext, void *opaque)
+{
+    clone_record_t *record = opaque;
+    ASSERT(record != NULL && record->parent_info == dcontext->signal_field);
+    ASSERT(TESTANY(CLONE_VM, record->clone_flags));
+    if (!TESTANY(CLONE_SIGHAND, record->clone_flags)) {
+        thread_sig_info_t *parent = record->parent_info;
+        d_r_mutex_lock(&parent->child_lock);
+        ASSERT(parent->num_unstarted_children > 0);
+        --parent->num_unstarted_children;
+        d_r_mutex_unlock(&parent->child_lock);
+    }
+    /* No child owns this stack or copied signal state after a failed syscall.
+     * Shared sighand/itimer state still has the parent's valid reference. */
+    stack_free(record->dstack, DYNAMORIO_STACK_SIZE);
+    ASSERT(uninit_thread_count > 0);
+    ATOMIC_DEC(int, uninit_thread_count);
+}
+#endif
 
 /* This is to support dr_create_client_thread() */
 void
@@ -916,6 +951,32 @@ set_clone_record_fields(void *record, reg_t app_thread_xsp, app_pc continuation_
     rec->continuation_pc = continuation_pc;
     rec->clone_sysnum = clone_sysnum;
     rec->clone_flags = clone_flags;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_local_state_t *bootstrap = rec->runtime_bootstrap;
+    bootstrap->runtime_group = TESTANY(CLONE_THREAD, clone_flags)
+        ? get_runtime_thread_group()
+        : bootstrap->runtime_id;
+    ((os_thread_data_t *)get_thread_private_dcontext()->os_field)
+        ->runtime_clone_shares_files = TESTANY(CLONE_FILES, clone_flags);
+#endif
+}
+
+void
+initialize_clone_runtime(reg_t stack)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* This precedes ENTERING_DR and even get_clone_record's debug assertions.
+     * The parent placed this record at the top of a page-aligned private dstack.
+     */
+    clone_record_t *record = (clone_record_t *)((byte *)ALIGN_FORWARD(stack, PAGE_SIZE) -
+                                                sizeof(clone_record_t));
+    os_runtime_identity_enter(record->runtime_bootstrap);
+    /* The identity is now distinct from the parent's. Normal TLS setup uses
+     * fault-tolerant reads and must receive synchronous faults, even before
+     * its dcontext and signal state are fully initialized.
+     */
+    os_runtime_clone_child_ready();
+#endif
 }
 
 /* i#149/PR 403015: The clone record is passed to the new thread by placing it
@@ -1354,6 +1415,7 @@ signal_thread_inherit(dcontext_t *dcontext, void *clone_record)
     /* Assumed to be async safe. */
     info->fully_initialized = true;
     DOLOG(4, LOG_ASYNCH, dump_unmasked(dcontext, __FUNCTION__););
+    os_runtime_clone_child_ready();
 }
 
 /* When taking over existing app threads, we assume they're using pthreads and
@@ -4644,8 +4706,11 @@ adjust_syscall_for_restart(dcontext_t *dcontext, thread_sig_info_t *info, int si
          */
         return false;
     }
-    /* Don't restart if the app's handler says not to */
+    /* SA_RESTART describes an actual application handler. An explicit default
+     * or ignored disposition must not turn our notification into EINTR. */
     if (info->sighand->action[sig] != NULL &&
+        info->sighand->action[sig]->handler != (handler_t)SIG_DFL &&
+        info->sighand->action[sig]->handler != (handler_t)SIG_IGN &&
         !TESTANY(SA_RESTART, info->sighand->action[sig]->flags)) {
         return false;
     }
@@ -5676,6 +5741,17 @@ is_safe_read_ucxt(kernel_ucontext_t *ucxt)
     return is_safe_read_pc(pc);
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+static bool
+is_relay_suspend_signal(kernel_siginfo_t *siginfo)
+{
+    nudge_arg_t *arg = (nudge_arg_t *)siginfo;
+    return siginfo->si_signo == SUSPEND_SIGNAL && siginfo->si_code == SI_QUEUE &&
+        arg->version == NUDGE_ARG_CURRENT_VERSION && arg->flags == NUDGE_IS_SUSPEND &&
+        arg->nudge_action_mask == DR_THREAD_SUSPEND_MARKER && arg->client_id == 0;
+}
+#endif
+
 /* the main signal handler
  * WARNING: behavior varies with different versions of the kernel!
  * sigaction support was only added with 2.2
@@ -5758,8 +5834,23 @@ main_signal_handler_C(byte *xsp)
     }
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (sig == SUSPEND_SIGNAL && !os_runtime_identity_present()) {
+        nudge_arg_t *identity = (nudge_arg_t *)siginfo;
+        if (siginfo->si_code != SI_QUEUE ||
+            identity->version != NUDGE_ARG_CURRENT_VERSION ||
+            !TESTANY(NUDGE_IS_SUSPEND, identity->flags) ||
+            !os_runtime_takeover_enter(identity->client_arg))
+            return;
+    }
+#endif
     dcontext_t *dcontext = get_thread_private_dcontext();
 #if defined(LINUX) && defined(X86) && defined(X64)
+    /* Thread exit has already retired its route, but a notification accepted
+     * before that retirement can still be pending. Never expose it as app code. */
+    if ((dcontext == NULL || dcontext == GLOBAL_DCONTEXT) &&
+        is_relay_suspend_signal(siginfo))
+        return;
     const bool client_userspace_tls = dcontext != NULL && dcontext != GLOBAL_DCONTEXT &&
         dcontext->client_userspace_active && os_using_app_state(dcontext);
     if (client_userspace_tls)
@@ -5791,7 +5882,7 @@ main_signal_handler_C(byte *xsp)
     if (dcontext == NULL && (sig == SIGSEGV || sig == SIGBUS) &&
         (is_safe_read_ucxt(ucxt) ||
          (!dynamo_initialized && global_try_except.try_except_state != NULL &&
-          global_try_tid == get_sys_thread_id()))) {
+          global_try_runtime_id == get_runtime_thread_id()))) {
         dcontext = GLOBAL_DCONTEXT;
     }
 
@@ -5816,7 +5907,8 @@ main_signal_handler_C(byte *xsp)
              * safest to just set a non-zero value (the kernel ignores zero) for all
              * unknown threads here.  There are no problems for non-attach takeover.
              */
-            if (dcontext == NULL || dcontext->owning_thread != get_sys_thread_id()) {
+            if (dcontext == NULL ||
+                dcontext->owning_runtime_id != get_runtime_thread_id()) {
                 /* tls_thread_preinit() further rules out a temp-native dcontext
                  * and avoids clobbering it, to preserve the thread_lookup() case
                  * below (which we do not want to run first as we could swap to
@@ -5852,7 +5944,7 @@ main_signal_handler_C(byte *xsp)
           detacher_tid == INVALID_THREAD_ID && safe_read_tls_magic() == TLS_MAGIC_INVALID)
 #endif
              )) {
-        tr = thread_lookup(get_sys_thread_id());
+        tr = thread_lookup_runtime(get_runtime_thread_id());
         if (tr != NULL)
             dcontext = tr->dcontext;
     }
@@ -5905,7 +5997,7 @@ main_signal_handler_C(byte *xsp)
     ENTERING_DR();
     if (dcontext == GLOBAL_DCONTEXT) {
         local = false;
-        tr = thread_lookup(get_sys_thread_id());
+        tr = thread_lookup_runtime(get_runtime_thread_id());
     } else {
         tr = dcontext->thread_record;
         local = local_heap_protected(dcontext);
@@ -5999,7 +6091,7 @@ main_signal_handler_C(byte *xsp)
 #endif
             LOG(THREAD, LOG_ALL, level, "TRY fault at " PFX "\n", pc);
             ASSERT(dynamo_initialized || global_try_except.try_except_state == NULL ||
-                   global_try_tid == get_sys_thread_id());
+                   global_try_runtime_id == get_runtime_thread_id());
             if (TESTANY(DUMPCORE_TRY_EXCEPT, DYNAMO_OPTION(dumpcore_mask)))
                 os_dump_core("try/except fault");
 
@@ -6530,7 +6622,7 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
             IF_ARM(dr_set_isa_mode(dcontext, get_pc_mode_from_cpsr(sc), NULL));
         }
         execute_default_from_dispatch(dcontext, sig, frame);
-        return true;
+        return default_action[sig] != DEFAULT_IGNORE;
     }
     CLIENT_ASSERT(action == DR_SIGNAL_DELIVER, "invalid signal event return value");
 
@@ -7445,6 +7537,12 @@ receive_pending_signal(dcontext_t *dcontext)
                 dcontext->signals_pending = -1;
                 break;
             }
+            /* Ignored notifications do not execute an application handler.
+             * Drain this queue before returning to application code: an older
+             * entry can own the restart context for the syscall that DR
+             * temporarily completed with EINTR to reach this safe point. */
+            if (info->sigpending[sig] != NULL)
+                --sig;
         }
     }
     /* Only one signal can be delivered ignoring the back-in-dispatch blocked set. */
@@ -8683,6 +8781,7 @@ sig_detach_go_native(sig_detach_info_t *info)
     /* Skip pretcode */
     xsp += sizeof(char *);
 #endif
+    os_runtime_identity_finish(false);
     notify_and_jmp_without_stack(info->detached, (byte *)dynamorio_sigreturn, xsp);
 
     ASSERT_NOT_REACHED();
@@ -8695,6 +8794,15 @@ sig_detach(dcontext_t *dcontext, sigframe_rt_t *frame, KSYNCH_TYPE *detached)
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
     byte *xsp;
     sig_detach_info_t detach_info;
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* ACKed retirement proves that no old kernel notification can outlive the
+     * handler. Never dequeue/requeue an application signal to establish this. */
+    if (!os_thread_suspend_release(dcontext, false)) {
+        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                    get_application_name(), get_application_pid());
+    }
+#endif
 
     LOG(THREAD, LOG_ASYNCH, 1, "%s: detaching\n", __FUNCTION__);
     DOLOG(3, LOG_ASYNCH,
@@ -8796,6 +8904,21 @@ is_signal_for_us(kernel_siginfo_t *siginfo, int sig_expecting)
     return true;
 }
 
+static void
+terminate_from_suspend_handler(dcontext_t *dcontext, kernel_ucontext_t *ucxt)
+{
+    os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
+    byte *app_xsp;
+    if (IS_CLIENT_THREAD(dcontext))
+        app_xsp = (byte *)SIGCXT_FROM_UCXT(ucxt)->SC_XSP;
+    else
+        app_xsp = (byte *)get_mcontext(dcontext)->xsp;
+    LOG(THREAD, LOG_ASYNCH, 2, "handle_suspend_signal: exiting\n");
+    ASSERT(app_xsp != NULL);
+    notify_and_jmp_without_stack(&ostd->terminated, (byte *)dynamorio_sys_exit, app_xsp);
+    ASSERT_NOT_REACHED();
+}
+
 /* Returns whether to pass on to app */
 static bool
 handle_suspend_signal(dcontext_t *dcontext, kernel_siginfo_t *siginfo,
@@ -8804,10 +8927,22 @@ handle_suspend_signal(dcontext_t *dcontext, kernel_siginfo_t *siginfo,
     os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
     kernel_sigset_t prevmask;
     sig_full_cxt_t sc_full;
+    bool relay_notification = false;
     ASSERT(ostd != NULL);
 
     if (!is_signal_for_us(siginfo, SUSPEND_SIGNAL))
         return true; /* pass to app */
+#if defined(LINUX) && defined(X86) && defined(X64)
+    relay_notification = is_relay_suspend_signal(siginfo);
+    if (relay_notification) {
+        uint64 ticket;
+        memcpy(&ticket, (const byte *)siginfo + DR_THREAD_SUSPEND_TICKET_OFFSET,
+               sizeof(ticket));
+        /* Acknowledge receipt before consuming/capturing the notification. The
+         * broker reads this before deciding whether a later SEND can coalesce. */
+        os_thread_suspend_acknowledge(dcontext, ticket);
+    }
+#endif
 
     if (is_sigqueue_supported() && SUSPEND_SIGNAL == NUDGESIG_SIGNUM) {
         nudge_arg_t *arg = (nudge_arg_t *)siginfo;
@@ -8828,25 +8963,31 @@ handle_suspend_signal(dcontext_t *dcontext, kernel_siginfo_t *siginfo,
          * We don't have a lot of options: we're terminating, so we go ahead
          * and use the app stack.
          */
-        byte *app_xsp;
-        if (IS_CLIENT_THREAD(dcontext))
-            app_xsp = (byte *)SIGCXT_FROM_UCXT(ucxt)->SC_XSP;
-        else
-            app_xsp = (byte *)get_mcontext(dcontext)->xsp;
-        LOG(THREAD, LOG_ASYNCH, 2, "handle_suspend_signal: exiting\n");
-        ASSERT(app_xsp != NULL);
-        notify_and_jmp_without_stack(&ostd->terminated, (byte *)dynamorio_sys_exit,
-                                     app_xsp);
-        ASSERT_NOT_REACHED();
+        terminate_from_suspend_handler(dcontext, ucxt);
         return false;
     }
 
-    if (!doing_detach && is_thread_currently_native(dcontext->thread_record) &&
+    if (!relay_notification && !doing_detach &&
+        is_thread_currently_native(dcontext->thread_record) &&
         !IS_CLIENT_THREAD(dcontext) IF_APP_EXPORTS(&&!dr_api_exit)) {
         if (!sig_take_over(ucxt))
             return false;
         ASSERT_NOT_REACHED(); /* else, shouldn't return */
     }
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (relay_notification ||
+        __atomic_load_n(&ostd->suspend_relay_gate, __ATOMIC_ACQUIRE) !=
+            THREAD_SUSPEND_IDLE) {
+        /* Claim only once committed to the ordinary suspended/resumed ACK path.
+         * A cancelled or duplicate relay is internal even after the request
+         * returned. A concurrent non-marker signal keeps its app semantics if
+         * cancellation won before this handler could claim the request. */
+        if (!atomic_compare_exchange_int(&ostd->suspend_relay_gate, THREAD_SUSPEND_ARMED,
+                                         THREAD_SUSPEND_ENTERED))
+            return !relay_notification;
+    }
+#endif
 
     /* If suspend_count is 0, we are not trying to suspend this thread
      * (os_thread_resume() may have already decremented suspend_count to 0, but
@@ -8927,6 +9068,10 @@ handle_suspend_signal(dcontext_t *dcontext, kernel_siginfo_t *siginfo,
         }
     }
     LOG(THREAD, LOG_ASYNCH, 2, "handle_suspend_signal: awake now\n");
+    if (ostd->terminate) {
+        terminate_from_suspend_handler(dcontext, ucxt);
+        return false;
+    }
 
     if (unblocked_sigs) {
         /* re-block so our exit from main_signal_handler is not interrupted */

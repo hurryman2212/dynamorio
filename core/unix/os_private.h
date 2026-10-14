@@ -49,6 +49,9 @@
 #include "tls.h"
 #include "memquery.h"
 #include "../drlibc/drlibc_unix.h"
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    include "thread_suspend.h"
+#endif
 
 #if defined(ANDROID)
 #    include <android/api-level.h>
@@ -157,6 +160,10 @@ typedef struct _os_thread_data_t {
      */
     mutex_t suspend_lock;
     int suspend_count;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    thread_suspend_channel_t suspend_channel;
+    volatile int suspend_relay_gate;
+#endif
 
     /* Thread synchronization data held across a fork. */
     thread_record_t **fork_threads;
@@ -198,6 +205,20 @@ typedef struct _os_thread_data_t {
 #ifdef X86
     void *app_thread_areas;              /* data structure for app's thread area info */
     struct _os_local_state_t *clone_tls; /* i#2089: a copy for children to inherit */
+#    if defined(LINUX) && defined(X64)
+    void *runtime_child_bootstrap;
+    struct _file_table_snapshot_t *runtime_file_snapshot;
+    bool runtime_clone_shares_files;
+    uint64 runtime_clone_mask;
+    bool runtime_clone_mask_valid;
+#    endif
+#endif
+#ifdef LINUX
+    /* Parent-only borrow. A successful child can already have reused its
+     * dstack, so only dereference this record when the clone syscall failed. */
+    void *pending_clone_record;
+    file_t exec_procfs_root;
+    uint64 exec_procfs_owner;
 #endif
 } os_thread_data_t;
 
@@ -218,6 +239,11 @@ long
 munmap_syscall(byte *addr, size_t len);
 
 /* in os.c */
+#ifdef LINUX
+file_t
+os_open_procfs(const char *path, bool directory);
+#endif
+
 bool
 os_thread_take_over(priv_mcontext_t *mc, kernel_sigset_t *sigset);
 
@@ -326,6 +352,10 @@ void
 signal_reinstate_alarm_handlers(dcontext_t *dcontext);
 void
 handle_clone(dcontext_t *dcontext, uint64 flags);
+#ifdef LINUX
+void
+signal_clone_failed(dcontext_t *dcontext, void *record);
+#endif
 /* If returns false to skip the syscall, the result is in "result". */
 bool
 handle_sigaction(dcontext_t *dcontext, int sig, const kernel_sigaction_t *act,
@@ -383,6 +413,9 @@ signal_handle_dup(dcontext_t *dcontext, file_t src, file_t dst);
 
 void
 signal_handle_close(dcontext_t *dcontext, file_t fd);
+
+void
+signal_handle_close_range(dcontext_t *dcontext, uint first, uint last);
 #endif
 
 void
