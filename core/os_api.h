@@ -569,6 +569,12 @@ dr_invoke_x64_routine(dr_auxlib64_routine_ptr_t func64, uint num_params, ...);
  * (e.g., https://github.com/DynamoRIO/drmemory/issues/1778).
  */
 #define DR_MEMPROT_VDSO 0x20
+/**
+ * Linux mapping metadata: writes through other mappings or address spaces may
+ * change this mapping's bytes.  Local read-only protection does not make shared
+ * application instruction bytes immutable.  This is not an OS permission bit.
+ */
+#define DR_MEMPROT_SHARED 0x40
 
 /**
  * Flags describing memory used by dr_query_memory_ex().

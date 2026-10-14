@@ -312,6 +312,9 @@ static callback_list_t end_trace_callbacks = {
 static callback_list_t fragdel_callbacks = {
     0,
 };
+static callback_list_t code_change_callbacks = {
+    0,
+};
 static callback_list_t restore_state_callbacks = {
     0,
 };
@@ -958,6 +961,7 @@ free_all_callback_lists(void)
     free_callback_list(&trace_callbacks);
     free_callback_list(&end_trace_callbacks);
     free_callback_list(&fragdel_callbacks);
+    free_callback_list(&code_change_callbacks);
     free_callback_list(&restore_state_callbacks);
     free_callback_list(&restore_state_ex_callbacks);
     free_callback_list(&module_load_callbacks);
@@ -1217,6 +1221,22 @@ dr_unregister_end_trace_event(dr_custom_trace_action_t (*func)(void *drcontext, 
                                                                void *next_tag))
 {
     return remove_callback(&end_trace_callbacks, (void (*)(void))func, true);
+}
+
+void
+dr_register_code_change_event(void (*func)(void *drcontext, app_pc start, size_t size))
+{
+    if (!INTERNAL_OPTION(code_api)) {
+        CLIENT_ASSERT(false, "asking for code-change event when code_api is disabled");
+        return;
+    }
+    add_callback(&code_change_callbacks, (callback_t)func, true);
+}
+
+bool
+dr_unregister_code_change_event(void (*func)(void *drcontext, app_pc start, size_t size))
+{
+    return remove_callback(&code_change_callbacks, (callback_t)func, true);
 }
 
 void
@@ -1764,6 +1784,12 @@ dr_fragment_deleted_hook_exists(void)
 }
 
 bool
+dr_code_change_hook_exists(void)
+{
+    return code_change_callbacks.num > 0;
+}
+
+bool
 dr_end_trace_hook_exists(void)
 {
     return (end_trace_callbacks.num > 0);
@@ -2005,6 +2031,15 @@ instrument_trace(dcontext_t *dcontext, app_pc tag, instrlist_t *trace, bool tran
 #endif
 
     return ret;
+}
+
+void
+instrument_code_changed(dcontext_t *dcontext, app_pc start, size_t size)
+{
+    if (code_change_callbacks.num == 0 || hide_tag_from_client(start))
+        return;
+    call_all(code_change_callbacks, int (*)(void *, app_pc, size_t), (void *)dcontext,
+             start, size);
 }
 
 /* Notify user when a fragment is deleted from the cache
@@ -3479,23 +3514,43 @@ dr_memory_protect(void *base, size_t size, uint new_prot)
      * from putting hooks in ntdll.
      */
     CLIENT_ASSERT(!standalone_library, "API not supported in standalone mode");
+    if (POINTER_OVERFLOW_ON_ADD(base, size))
+        return false;
     if (!dynamo_vm_area_overlap(base, ((byte *)base) + size)) {
-        uint mod_prot = new_prot;
-        uint res =
-            app_memory_protection_change(get_thread_private_dcontext(), base, size,
-                                         new_prot, &mod_prot, NULL, false /*!image*/);
-        if (res != DO_APP_MEM_PROT_CHANGE) {
-            if (res == FAIL_APP_MEM_PROT_CHANGE || res == PRETEND_APP_MEM_PROT_CHANGE) {
+        for (byte *cursor = base; cursor < (byte *)base + size;) {
+            size_t amount = (byte *)base + size - cursor;
+            uint mapping_prot = new_prot;
+#ifdef LINUX
+            dr_mem_info_t info;
+            if (!query_memory_ex_from_os(cursor, &info) || info.type == DR_MEMTYPE_FREE ||
+                info.base_pc > cursor ||
+                POINTER_OVERFLOW_ON_ADD(info.base_pc, info.size) ||
+                info.base_pc + info.size <= cursor)
                 return false;
-            } else {
-                /* SUBSET_APP_MEM_PROT_CHANGE should only happen for
-                 * PROGRAM_SHEPHERDING.  XXX: not sure how common
-                 * this will be: for now we just fail.
-                 */
-                return false;
+            amount = MIN(amount, (size_t)(info.base_pc + info.size - cursor));
+            mapping_prot =
+                (new_prot & ~MEMPROT_META_FLAGS) | (info.prot & MEMPROT_META_FLAGS);
+#endif
+            uint mod_prot = mapping_prot;
+            uint res = app_memory_protection_change(get_thread_private_dcontext(), cursor,
+                                                    amount, mapping_prot, &mod_prot, NULL,
+                                                    false /*!image*/);
+            if (res != DO_APP_MEM_PROT_CHANGE) {
+                if (res == FAIL_APP_MEM_PROT_CHANGE ||
+                    res == PRETEND_APP_MEM_PROT_CHANGE) {
+                    return false;
+                } else {
+                    /* SUBSET_APP_MEM_PROT_CHANGE should only happen for
+                     * PROGRAM_SHEPHERDING.  XXX: not sure how common
+                     * this will be: for now we just fail.
+                     */
+                    return false;
+                }
             }
+            CLIENT_ASSERT(mod_prot == mapping_prot,
+                          "internal error on dr_memory_protect()");
+            cursor += amount;
         }
-        CLIENT_ASSERT(mod_prot == new_prot, "internal error on dr_memory_protect()");
     }
     return set_protection(base, size, new_prot);
 }

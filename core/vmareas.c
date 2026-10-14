@@ -133,6 +133,12 @@ enum {
 
     /* i#1114: for areas containing JIT code flushed via annotation or inference */
     VM_JIT_MANAGED = 0x2000,
+
+    /* Application bytes may be changed through another shared mapping even
+     * while this address is read-only.  Page protection cannot replace SMC
+     * checks for these original code regions.
+     */
+    VM_SHARED_SOURCE = 0x4000,
 };
 
 /* simple way to disable sandboxing */
@@ -2712,6 +2718,11 @@ add_executable_vm_area(app_pc start, app_pc end, uint vm_flags, uint frag_flags,
     coarse_info_t *info = NULL;
     coarse_info_t *tofree = NULL;
     app_pc delay_start = NULL, delay_end = NULL;
+    if (TESTANY(VM_SHARED_SOURCE, vm_flags)) {
+        vm_flags &= ~(VM_UNMOD_IMAGE | VM_DELAY_READONLY);
+        frag_flags &= ~FRAG_COARSE_GRAIN;
+        frag_flags |= SANDBOX_FLAG();
+    }
     /* only expect to see the *_READONLY flags on WRITABLE regions */
     ASSERT(!TESTANY(VM_DELAY_READONLY, vm_flags) || TESTANY(VM_WRITABLE, vm_flags));
     ASSERT(!TESTANY(VM_MADE_READONLY, vm_flags) || TESTANY(VM_WRITABLE, vm_flags));
@@ -2719,7 +2730,8 @@ add_executable_vm_area(app_pc start, app_pc end, uint vm_flags, uint frag_flags,
     {
         /* we only expect certain flags */
         uint expect = VM_WRITABLE | VM_UNMOD_IMAGE | VM_MADE_READONLY |
-            VM_DELAY_READONLY | VM_WAS_FUTURE | VM_EXECUTED_FROM | VM_DRIVER_ADDRESS;
+            VM_DELAY_READONLY | VM_WAS_FUTURE | VM_EXECUTED_FROM | VM_DRIVER_ADDRESS |
+            VM_SHARED_SOURCE;
 #    ifdef PROGRAM_SHEPHERDING
         expect |= VM_PATTERN_REVERIFY;
 #    endif
@@ -3944,6 +3956,14 @@ is_driver_address(app_pc addr)
         return TESTANY(VM_DRIVER_ADDRESS, vm_flags);
     }
     return false;
+}
+
+bool
+is_shared_code_source(app_pc addr)
+{
+    uint vm_flags;
+    return get_executable_area_vm_flags(addr, &vm_flags) &&
+        TESTANY(VM_SHARED_SOURCE, vm_flags);
 }
 
 #ifdef PROGRAM_SHEPHERDING /********************************************/
@@ -6135,6 +6155,14 @@ app_memory_allocation(dcontext_t *dcontext, app_pc base, size_t size, uint prot,
     LOG(GLOBAL, LOG_VMAREAS, 1, "New +x app memory region: " PFX "-" PFX " %s\n", base,
         base + size, memprot_string(prot));
 
+    if (TESTANY(MEMPROT_SHARED, prot)) {
+        uint vm_flags =
+            VM_SHARED_SOURCE | (TESTANY(MEMPROT_WRITE, prot) ? VM_WRITABLE : 0);
+        add_executable_vm_area(base, base + size, vm_flags, SANDBOX_FLAG(),
+                               false /*no lock*/ _IF_DEBUG(comment));
+        return true;
+    }
+
     if (!TESTANY(MEMPROT_WRITE, prot)) {
         uint frag_flags = 0;
         if (DYNAMO_OPTION(coarse_units) && image && !RUNNING_WITHOUT_CODE_CACHE()) {
@@ -6291,6 +6319,40 @@ app_memory_deallocation(dcontext_t *dcontext, app_pc base, size_t size,
         LOG(GLOBAL, LOG_VMAREAS, 2,
             "removing future exec " PFX "-" PFX " since now freed\n", base, base + size);
     }
+#endif
+}
+
+/* A successful fixed mapping has already replaced the original pages.  Retire
+ * their fragments and area metadata without restoring the old mapping's
+ * writability onto the new allocation.
+ */
+void
+app_memory_replacement(dcontext_t *dcontext, app_pc base, size_t size)
+{
+    ASSERT_OWN_NO_LOCKS();
+    ASSERT(ALIGNED(base, PAGE_SIZE));
+    ASSERT(!POINTER_OVERFLOW_ON_ADD(size, PAGE_SIZE - 1));
+    size = ALIGN_FORWARD(size, PAGE_SIZE);
+    ASSERT(!dynamo_vm_area_overlap(base, base + size));
+#ifdef RETURN_AFTER_CALL
+    bool was_executable =
+        executable_vm_area_overlap(base, base + size, false /*have lock*/);
+#endif
+    flush_fragments_in_region_start(dcontext, base, size, false /*own initexit_lock*/,
+                                    true /*free futures*/, true /*exec invalid*/,
+                                    false /*force synchall*/,
+                                    THREAD_SYNCH_NO_LOCKS_NO_XFER _IF_DGCDIAG(NULL));
+    remove_vm_area(executable_areas, base, base + size, false /*restore protection*/);
+    flush_fragments_in_region_finish(dcontext, false /*keep initexit_lock*/);
+    ASSERT_DO_NOT_OWN_MUTEX(true, &thread_initexit_lock);
+#ifdef RETURN_AFTER_CALL
+    if (was_executable && DYNAMO_OPTION(ret_after_call) &&
+        !DYNAMO_OPTION(rac_dgc_sticky) && is_dyngen_code(base))
+        invalidate_after_call_target_range(dcontext, base, base + size);
+#endif
+#ifdef PROGRAM_SHEPHERDING
+    if (USING_FUTURE_EXEC_LIST && futureexec_vm_area_overlap(base, base + size))
+        remove_futureexec_vm_area(base, base + size);
 #endif
 }
 
@@ -6848,7 +6910,11 @@ app_memory_protection_change_internal(dcontext_t *dcontext, bool update_areas,
          * change from rw to r.  thus this should be like the change-to-selfmod case
          * in handle_modified_code => add new vector routine?  (case 3570)
          */
-        add_executable_vm_area(base, base + size, image ? VM_UNMOD_IMAGE : 0, 0,
+        add_executable_vm_area(base, base + size,
+                               TESTANY(MEMPROT_SHARED, prot) ? VM_SHARED_SOURCE
+                                   : image                   ? VM_UNMOD_IMAGE
+                                                             : 0,
+                               0,
                                should_finish_flushing /* own lock if flushed */
                                    _IF_DEBUG("protection change"));
     }
@@ -6961,7 +7027,10 @@ app_memory_protection_change_internal(dcontext_t *dcontext, bool update_areas,
                 }
                 /* XXX : see note at top of function about bug 2833 */
                 ASSERT(!TESTANY(MEMPROT_WRITE, prot)); /* sanity check */
-                add_executable_vm_area(base, base + size, image ? VM_UNMOD_IMAGE : 0,
+                add_executable_vm_area(base, base + size,
+                                       TESTANY(MEMPROT_SHARED, prot) ? VM_SHARED_SOURCE
+                                           : image                   ? VM_UNMOD_IMAGE
+                                                                     : 0,
                                        frag_flags_pfx,
                                        false /*no lock*/ _IF_DEBUG(comment));
             }
@@ -7731,7 +7800,8 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
             }
 #endif
             if ((is_in_dr IF_WINDOWS(&&!in_private_library(pc))) || !is_allocated_mem ||
-                prot == 0 /*no access flags*/ || is_being_unloaded) {
+                !TESTANY(MEMPROT_READ | MEMPROT_WRITE | MEMPROT_EXEC, prot) ||
+                is_being_unloaded) {
                 if (xfer) {
                     /* don't follow cti, wait for app to get there and then
                      * handle this (might be pathological case where cti is
@@ -7895,6 +7965,10 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
 
     /* Ensure we looked up the mem attributes, if a new area */
     ASSERT(area != NULL || size > 0);
+    if (area == NULL && TESTANY(MEMPROT_SHARED, prot) && !is_dynamo_address(pc)) {
+        vm_flags |= VM_SHARED_SOURCE;
+        frag_flags |= SANDBOX_FLAG();
+    }
     /* XXX: fits nicely down below as alternative to marking read-only,
      * but must be here for vm==NULL so will stop bb at cti -- although
      * here it gets executed multiple times until actually switch to sandboxing
@@ -11047,7 +11121,7 @@ vm_area_selfmod_check_clear_exec_count(dcontext_t *dcontext, fragment_t *f)
     app_pc start, end;
     bool ok;
     bool convert_s2ro = true;
-    if (DYNAMO_OPTION(sandbox2ro_threshold) == 0)
+    if (DYNAMO_OPTION(sandbox2ro_threshold) == 0 || is_shared_code_source(f->tag))
         return false;
 
     /* NOTE - we could only grab the readlock here.  Even though we're going to

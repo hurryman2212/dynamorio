@@ -2373,7 +2373,9 @@ sandbox_top_of_bb_check_s2ro(dcontext_t *dcontext, app_pc start_pc)
             /* We can't make stack regions ro so don't put in the instrumentation. */
             !is_address_on_stack(dcontext, start_pc) &&
             /* Case 9098 we don't want to ever make RO untrackable driver areas. */
-            !is_driver_address(start_pc));
+            !is_driver_address(start_pc) &&
+            /* Read-only aliases cannot trap writes from another mapping. */
+            !is_shared_code_source(start_pc));
 }
 
 /* Returns false if failed to add sandboxing b/c of a problematic ilist --

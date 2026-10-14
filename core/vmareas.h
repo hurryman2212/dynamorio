@@ -595,6 +595,12 @@ void
 app_memory_deallocation(dcontext_t *dcontext, app_pc base, size_t size,
                         bool own_initexit_lock, bool image);
 
+/* Retire an already-replaced original mapping without changing its successor's
+ * permissions.  The caller must not hold locks.
+ */
+void
+app_memory_replacement(dcontext_t *dcontext, app_pc base, size_t size);
+
 /* memory region base:base+size now has privileges prot
  * returns one of the following codes
  */
@@ -773,6 +779,10 @@ is_address_on_stack(dcontext_t *dcontext, app_pc address);
  * not a strict opposite of is_user_address() */
 bool
 is_driver_address(app_pc addr);
+
+/* True for original application code backed by a shared mapping. */
+bool
+is_shared_code_source(app_pc addr);
 
 /* XXX clean up: safe_apc_or_thread_target, apc_thread_policy_helper and
  * aslr_report_violation should all be ifdef WINDOWS, and may be in a

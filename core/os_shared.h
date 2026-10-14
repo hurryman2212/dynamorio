@@ -443,6 +443,7 @@ get_dynamorio_library_path(void);
 #define MEMPROT_READ DR_MEMPROT_READ
 #define MEMPROT_WRITE DR_MEMPROT_WRITE
 #define MEMPROT_EXEC DR_MEMPROT_EXEC
+#define MEMPROT_SHARED DR_MEMPROT_SHARED
 #ifdef WINDOWS
 #    define MEMPROT_GUARD DR_MEMPROT_GUARD
 #else
@@ -450,7 +451,7 @@ get_dynamorio_library_path(void);
 #endif
 /* i#1861: avoid merging Android regions w/ different custom comments */
 #define MEMPROT_HAS_COMMENT DR_MEMPROT_GUARD /* Android-only */
-#define MEMPROT_META_FLAGS (MEMPROT_VDSO | MEMPROT_HAS_COMMENT)
+#define MEMPROT_META_FLAGS (MEMPROT_VDSO | MEMPROT_HAS_COMMENT | MEMPROT_SHARED)
 
 /* Ignore any PAGE_SIZE provided by the tool chain and define a new
  * version for DynamoRIO's internal use. Since PAGE_SIZE looks like
