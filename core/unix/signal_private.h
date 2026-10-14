@@ -486,6 +486,12 @@ typedef struct _thread_sig_info_t {
      */
     kernel_sigset_t app_sigblocked;
     mutex_t sigblocked_lock;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Only the calling task's kernel mask changes during early-injected exec.
+     * The old shared sighand and logical application mask remain untouched. */
+    kernel_sigset_t exec_kernel_mask;
+    bool exec_mask_saved;
+#endif
     /* This is a not-guaranteed-accurate indicator of whether we're inside an
      * app signal handler.  We can't know for sure when a handler ends if the
      * app exits with a longjmp instead of siglongjmp.

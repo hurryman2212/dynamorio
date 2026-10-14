@@ -475,6 +475,107 @@ sigprocmask_syscall(int how, kernel_sigset_t *set, kernel_sigset_t *oset,
                              set, oset, sigsetsize);
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+bool
+signal_exec_snapshot(dcontext_t *dcontext, uint64 *ignored, uint64 *blocked)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    kernel_sigset_t kernel_mask;
+    if (sigprocmask_syscall(SIG_SETMASK, NULL, &kernel_mask, sizeof(kernel_mask)) != 0)
+        return false;
+    *ignored = 0;
+    *blocked = kernel_mask.sig[0];
+    bool success = true;
+    d_r_mutex_lock(&info->sigblocked_lock);
+    for (int sig = 1; sig <= MAX_SIGNUM; ++sig) {
+        uint64 bit = (uint64)1 << (sig - 1);
+        if (EMULATE_SIGMASK(info, sig)) {
+            *blocked &= ~bit;
+            if (kernel_sigismember(&info->app_sigblocked, sig))
+                *blocked |= bit;
+        }
+    }
+    d_r_mutex_unlock(&info->sigblocked_lock);
+    /* The kernel never lets an inherited mask block these two signals. */
+    *blocked &= ~(((uint64)1 << (SIGKILL - 1)) | ((uint64)1 << (SIGSTOP - 1)));
+    if (info->sighand->is_shared)
+        d_r_mutex_lock(&info->sighand->lock);
+    for (int sig = 1; sig <= MAX_SIGNUM; ++sig) {
+        if (!signal_is_interceptable(sig))
+            continue;
+        uint64 bit = (uint64)1 << (sig - 1);
+        const kernel_sigaction_t *action = info->sighand->action[sig];
+        kernel_sigaction_t actual;
+        if (action == NULL && !info->sighand->we_intercept[sig]) {
+            if (sigaction_syscall(sig, NULL, &actual) != 0) {
+                success = false;
+                break;
+            }
+            action = &actual;
+        }
+        if (action != NULL && action->handler == (handler_t)SIG_IGN)
+            *ignored |= bit;
+    }
+    if (info->sighand->is_shared)
+        d_r_mutex_unlock(&info->sighand->lock);
+    return success;
+}
+
+bool
+signal_exec_block(dcontext_t *dcontext, uint64 ignored)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    kernel_sigset_t mask = { { ignored } };
+    ASSERT(!info->exec_mask_saved);
+    if (sigprocmask_syscall(SIG_BLOCK, &mask, &info->exec_kernel_mask, sizeof(mask)) != 0)
+        return false;
+    info->exec_mask_saved = true;
+    return true;
+}
+
+bool
+signal_exec_rollback(dcontext_t *dcontext)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    /* A vfork parent may reclaim a successfully execed child's old context. */
+    if (!info->exec_mask_saved || dcontext->owning_runtime_id != get_runtime_thread_id())
+        return true;
+    if (sigprocmask_syscall(SIG_SETMASK, &info->exec_kernel_mask, NULL,
+                            sizeof(info->exec_kernel_mask)) != 0)
+        return false;
+    info->exec_mask_saved = false;
+    return true;
+}
+
+bool
+signal_exec_restore_initial(const char *value)
+{
+    if (value == NULL)
+        return true;
+    uint64 ignored, blocked;
+    char trailing;
+    if (sscanf(value, "1:" UINT64_FORMAT_STRING ":" UINT64_FORMAT_STRING "%c", &ignored,
+               &blocked, &trailing) != 2)
+        return false;
+    uint64 unmaskable = ((uint64)1 << (SIGKILL - 1)) | ((uint64)1 << (SIGSTOP - 1));
+    if ((ignored | blocked) & unmaskable)
+        return false;
+    kernel_sigaction_t action = { 0 };
+    action.handler = (handler_t)SIG_IGN;
+    for (int sig = 1; sig <= MAX_SIGNUM; ++sig) {
+        if ((ignored & ((uint64)1 << (sig - 1))) == 0)
+            continue;
+        /* exec keeps SIG_IGN but clears its flags, restorer and action mask.
+         * sigaction_syscall() would add a restorer, so use the raw operation. */
+        if (dynamorio_syscall(SYS_rt_sigaction, 4, sig, &action, NULL,
+                              sizeof(kernel_sigset_t)) != 0)
+            return false;
+    }
+    kernel_sigset_t mask = { { blocked } };
+    return sigprocmask_syscall(SIG_SETMASK, &mask, NULL, sizeof(mask)) == 0;
+}
+#endif
+
 void
 block_all_noncrash_signals_except(kernel_sigset_t *oset, int num_signals,
                                   ... /* list of signals */)

@@ -349,6 +349,16 @@ bool
 is_thread_signal_info_initialized(dcontext_t *dcontext);
 void
 signal_swap_mask(dcontext_t *dcontext, bool to_app);
+#if defined(LINUX) && defined(X86) && defined(X64)
+bool
+signal_exec_snapshot(dcontext_t *dcontext, uint64 *ignored, uint64 *blocked);
+bool
+signal_exec_block(dcontext_t *dcontext, uint64 ignored);
+bool
+signal_exec_rollback(dcontext_t *dcontext);
+bool
+signal_exec_restore_initial(const char *value);
+#endif
 void
 signal_remove_handlers(dcontext_t *dcontext);
 void
