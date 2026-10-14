@@ -1453,11 +1453,13 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
         return RECREATE_FAILURE;
     } else if (tdcontext->client_userspace_active &&
                !is_on_dstack(tdcontext, (byte *)mcontext->xsp) &&
-               !is_dynamo_address(mcontext->pc) && !is_in_client_lib(mcontext->pc)) {
+               (dr_lookup_userspace_code(mcontext->pc, NULL, NULL) ||
+                (!is_dynamo_address(mcontext->pc) && !is_in_client_lib(mcontext->pc)))) {
         /* Managed userspace regions carry original application state already. This
          * also permits normal thread suspension while another thread patches code.
          */
-        mcontext->pc = userspace_gate_target(mcontext->pc);
+        if (!dr_lookup_userspace_code(mcontext->pc, &mcontext->pc, NULL))
+            mcontext->pc = userspace_gate_target(mcontext->pc);
         return res;
     } else if (in_fcache(mcontext->pc)) {
         /* XXX: what if pc is in separate direct stub???

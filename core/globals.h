@@ -1119,7 +1119,15 @@ struct _dcontext_t {
      * whether a userspace region is ready. Only a suspended thread is cancelled.
      */
     volatile int64 client_userspace_generation;
+    /* Nested signal lookups share this thread's read-side critical section. */
+    volatile int client_userspace_lookup_depth;
+    bool client_userspace_threads_suspended;
     uint64 client_userspace_request_generation;
+    /* Keep the original continuation even if cancellation retires its mapping
+     * before a queued redirect reaches dispatch. These addresses do not own code.
+     */
+    app_pc client_userspace_request_pc;
+    app_pc client_userspace_original_pc;
     /* The x86-64 FXSAVE image is 512 bytes and requires 16-byte alignment. */
     byte client_userspace_fpstate[512 + 15];
     bool client_userspace_fpstate_valid;

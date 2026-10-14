@@ -13223,8 +13223,16 @@ os_thread_take_over_suspended_native(dcontext_t *dcontext)
          */
         if (thread_synch_state_no_xfer(dcontext) ||
             is_on_dstack(dcontext, (byte *)sc->SC_XSP) ||
-            is_dynamo_address((app_pc)sc->SC_XIP) || is_in_client_lib((app_pc)sc->SC_XIP))
+            (!dr_lookup_userspace_code((app_pc)sc->SC_XIP, NULL, NULL) &&
+             (is_dynamo_address((app_pc)sc->SC_XIP) ||
+              is_in_client_lib((app_pc)sc->SC_XIP))))
             return false;
+        /* Cancellation may be followed by immediate mapping retirement while this
+         * peer is still suspended. Save its original continuation now, not at resume.
+         */
+        app_pc original_pc;
+        if (dr_lookup_userspace_code((app_pc)sc->SC_XIP, &original_pc, NULL))
+            sc->SC_XIP = (reg_t)original_pc;
         ostd->retakeover = true;
         return true;
     }

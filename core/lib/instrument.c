@@ -127,6 +127,75 @@ DR_API const char *unique_build_number = STRINGIFY(UNIQUE_BUILD_NUMBER);
 DECLARE_CXTSWPROT_VAR(static read_write_lock_t callback_registration_lock,
                       INIT_READWRITE_LOCK(callback_registration_lock));
 
+struct _dr_userspace_code_t {
+    struct _dr_userspace_code_t *next;
+    struct _dr_userspace_code_t *retired_next;
+    ptr_uint_t handle;
+    app_pc begin;
+    app_pc end;
+    size_t count;
+    uint64 generation;
+    dr_userspace_pc_mapping_t mappings[];
+};
+
+/* Writers use callback_registration_lock. Readers announce themselves before
+ * loading the head; links are atomic and payloads are immutable. Unlinked records
+ * are freed only after every live reader has left, without waiting for readers.
+ * Handles are non-reused integer tokens, never dereferenced or stored as tombstones.
+ */
+DECLARE_CXTSWPROT_VAR(static dr_userspace_code_t *userspace_code, NULL);
+DECLARE_CXTSWPROT_VAR(static dr_userspace_code_t *userspace_code_retired, NULL);
+DECLARE_CXTSWPROT_VAR(static ptr_uint_t userspace_code_handle, 0);
+/* Bootstrap/standalone lookups without a real dcontext remain supported. */
+static volatile int userspace_code_bootstrap_readers;
+
+static void
+reclaim_userspace_code(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Do not acquire thread_initexit_lock here: callers may hold client locks.
+     * The suspension API and exit path already provide this lifetime guard.
+     */
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    if (!standalone_library &&
+        (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
+         !dcontext->client_userspace_threads_suspended))
+        return;
+    thread_record_t **threads = NULL;
+    int count = 0;
+    /* Standalone clients have only GLOBAL_DCONTEXT readers, accounted above,
+     * and no managed-thread table or executable userspace continuations.
+     */
+    if (!standalone_library)
+        get_list_of_threads_ex(&threads, &count, true /* include execve */);
+    d_r_write_lock(&callback_registration_lock);
+    bool quiescent =
+        __atomic_load_n(&userspace_code_bootstrap_readers, __ATOMIC_SEQ_CST) == 0;
+    for (int i = 0; i < count && quiescent; ++i) {
+        if (threads[i]->dcontext != NULL)
+            quiescent =
+                __atomic_load_n(&threads[i]->dcontext->client_userspace_lookup_depth,
+                                __ATOMIC_SEQ_CST) == 0;
+    }
+    dr_userspace_code_t *retired = NULL;
+    if (quiescent) {
+        retired = userspace_code_retired;
+        userspace_code_retired = NULL;
+    }
+    d_r_write_unlock(&callback_registration_lock);
+    if (threads != NULL)
+        global_heap_free(threads, count * sizeof(*threads) HEAPACCT(ACCT_THREAD_MGT));
+    while (retired != NULL) {
+        dr_userspace_code_t *next = retired->retired_next;
+        heap_free(GLOBAL_DCONTEXT, retired,
+                  sizeof(*retired) +
+                      retired->count *
+                          sizeof(retired->mappings[0]) HEAPACCT(ACCT_CLIENT));
+        retired = next;
+    }
+#endif
+}
+
 /* Structures for maintaining lists of event callbacks */
 typedef void (*callback_t)(void);
 typedef struct _callback_list_t {
@@ -953,6 +1022,20 @@ instrument_exit(void)
     vmvector_delete_vector(GLOBAL_DCONTEXT, client_aux_libs);
     client_aux_libs = NULL;
     num_client_libs = 0;
+    while (userspace_code != NULL) {
+        dr_userspace_code_t *record = userspace_code;
+        userspace_code = record->next;
+        heap_free(GLOBAL_DCONTEXT, record,
+                  sizeof(*record) +
+                      record->count * sizeof(record->mappings[0]) HEAPACCT(ACCT_CLIENT));
+    }
+    while (userspace_code_retired != NULL) {
+        dr_userspace_code_t *record = userspace_code_retired;
+        userspace_code_retired = record->retired_next;
+        heap_free(GLOBAL_DCONTEXT, record,
+                  sizeof(*record) +
+                      record->count * sizeof(record->mappings[0]) HEAPACCT(ACCT_CLIENT));
+    }
 #ifdef WINDOWS
     DELETE_LOCK(client_aux_lib64_lock);
 #endif
@@ -1528,6 +1611,11 @@ instrument_thread_init(dcontext_t *dcontext, bool client_thread, bool valid_mc)
 void
 instrument_fork_init(dcontext_t *dcontext)
 {
+    /* This callback follows an address-space fork, never shared-VM vfork. All
+     * other threads were removed from DR's thread table. The surviving thread
+     * has a real dcontext, so no bootstrap reader can survive from the parent.
+     */
+    __atomic_store_n(&userspace_code_bootstrap_readers, 0, __ATOMIC_SEQ_CST);
     call_all(fork_init_callbacks, int (*)(void *), (void *)dcontext);
 }
 #endif
@@ -4973,6 +5061,10 @@ dr_suspend_all_other_threads_ex(DR_PARAM_OUT void ***drcontexts,
     *num_suspended = out_suspended;
     if (num_unsuspended != NULL)
         *num_unsuspended = out_unsuspended;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* A partial list proves lock ownership, not that code publication is safe. */
+    my_dcontext->client_userspace_threads_suspended = out_unsuspended == 0;
+#endif
     return out_unsuspended == 0;
 }
 
@@ -4995,6 +5087,10 @@ dr_resume_all_other_threads(DR_PARAM_IN void **drcontexts, DR_PARAM_IN uint num_
     LOG(GLOBAL, LOG_FRAGMENT, 2, "dr_resume_all_other_threads\n");
     threads = (thread_record_t **)drcontexts[num_suspended];
     num_threads = (int)(ptr_int_t)drcontexts[num_suspended + 1];
+    /* An unregister may have met an interrupted lookup. Retry once while the
+     * thread table is still stable; a busy reader simply defers reclamation.
+     */
+    reclaim_userspace_code();
     for (i = 0; i < num_suspended; i++) {
         dcontext_t *dcontext = (dcontext_t *)drcontexts[i];
         if (dcontext->client_data->suspended && dcontext->client_data->cur_mc != NULL) {
@@ -5017,6 +5113,9 @@ dr_resume_all_other_threads(DR_PARAM_IN void **drcontexts, DR_PARAM_IN uint num_
     }
     global_heap_free(drcontexts,
                      (num_threads + 2) * sizeof(dcontext_t *) HEAPACCT(ACCT_THREAD_MGT));
+#if defined(LINUX) && defined(X86) && defined(X64)
+    get_thread_private_dcontext()->client_userspace_threads_suspended = false;
+#endif
     end_synch_with_all_threads(threads, num_threads, true /*resume*/);
     return true;
 }
@@ -5060,10 +5159,18 @@ dr_cancel_suspended_userspace_execution(void *drcontext)
          !(thread_synch_state_no_xfer(dcontext) &&
            dcontext->client_data->mcontext_in_dcontext)))
         return false;
+    /* A suspended reader must finish its lookup before any copied mapping can
+     * be retired. Never abandon its critical section through a context redirect.
+     */
+    if (__atomic_load_n(&dcontext->client_userspace_lookup_depth, __ATOMIC_SEQ_CST) != 0)
+        return false;
     CLIENT_ASSERT(OWN_MUTEX(&all_threads_synch_lock) && OWN_MUTEX(&thread_initexit_lock),
                   "userspace cancellation requires suspended threads");
     atomic_add_exchange_int64(&dcontext->client_userspace_generation, 1);
     dcontext->client_userspace_target = NULL;
+    if (dcontext->client_userspace_request_pc != NULL &&
+        dcontext->next_tag == dcontext->client_userspace_request_pc)
+        dcontext->next_tag = dcontext->client_userspace_original_pc;
     /* A queued redirect has abandoned its clean-call FXRSTOR. Keep that image
      * valid so the ordinary cache entrance still restores the application state.
      */
@@ -6995,6 +7102,17 @@ dr_redirect_native_target(void *drcontext)
 }
 
 DR_API
+bool
+dr_is_fsgsbase_enabled(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    return os_fsgsbase_enabled();
+#else
+    return false;
+#endif
+}
+
+DR_API
 uint64
 dr_userspace_execution_generation(void *drcontext)
 {
@@ -7004,6 +7122,129 @@ dr_userspace_execution_generation(void *drcontext)
         return (uint64)atomic_aligned_read_int64(&dcontext->client_userspace_generation);
 #endif
     return 0;
+}
+
+DR_API
+dr_userspace_code_t *
+dr_register_userspace_code(app_pc copy, size_t size,
+                           const dr_userspace_pc_mapping_t *mappings, size_t count,
+                           uint64 generation)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (copy == NULL || size == 0 || size > POINTER_MAX - (ptr_uint_t)copy ||
+        mappings == NULL || count == 0 || generation == 0 ||
+        count > (SIZE_MAX - sizeof(dr_userspace_code_t)) / sizeof(*mappings))
+        return NULL;
+    size_t end = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (mappings[i].original_pc == NULL || mappings[i].offset < end ||
+            mappings[i].offset >= size || mappings[i].length == 0 ||
+            mappings[i].length > 15 || mappings[i].length > size - mappings[i].offset)
+            return NULL;
+        end = mappings[i].offset + mappings[i].length;
+    }
+    size_t allocation_size = sizeof(dr_userspace_code_t) + count * sizeof(*mappings);
+    dr_userspace_code_t *record =
+        heap_alloc(GLOBAL_DCONTEXT, allocation_size HEAPACCT(ACCT_CLIENT));
+    record->begin = copy;
+    record->end = copy + size;
+    record->count = count;
+    record->generation = generation;
+    record->retired_next = NULL;
+    memcpy(record->mappings, mappings, count * sizeof(*mappings));
+    d_r_write_lock(&callback_registration_lock);
+    for (dr_userspace_code_t *other = userspace_code; other != NULL;
+         other = other->next) {
+        if (copy < other->end && record->end > other->begin) {
+            d_r_write_unlock(&callback_registration_lock);
+            heap_free(GLOBAL_DCONTEXT, record, allocation_size HEAPACCT(ACCT_CLIENT));
+            return NULL;
+        }
+    }
+    if (userspace_code_handle == POINTER_MAX) {
+        d_r_write_unlock(&callback_registration_lock);
+        heap_free(GLOBAL_DCONTEXT, record, allocation_size HEAPACCT(ACCT_CLIENT));
+        return NULL;
+    }
+    record->handle = ++userspace_code_handle;
+    record->next = userspace_code;
+    __atomic_store_n(&userspace_code, record, __ATOMIC_SEQ_CST);
+    dr_userspace_code_t *handle = (dr_userspace_code_t *)record->handle;
+    d_r_write_unlock(&callback_registration_lock);
+    return handle;
+#else
+    return NULL;
+#endif
+}
+
+DR_API
+bool
+dr_unregister_userspace_code(dr_userspace_code_t *code)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (code == NULL)
+        return false;
+    bool found = false;
+    d_r_write_lock(&callback_registration_lock);
+    for (dr_userspace_code_t **link = &userspace_code; *link != NULL;
+         link = &(*link)->next) {
+        dr_userspace_code_t *record = *link;
+        if (record->handle == (ptr_uint_t)code) {
+            __atomic_store_n(link, record->next, __ATOMIC_SEQ_CST);
+            record->retired_next = userspace_code_retired;
+            userspace_code_retired = record;
+            found = true;
+            break;
+        }
+    }
+    d_r_write_unlock(&callback_registration_lock);
+    reclaim_userspace_code();
+    return found;
+#else
+    return false;
+#endif
+}
+
+DR_API
+bool
+dr_lookup_userspace_code(app_pc pc, app_pc *original_pc, uint64 *generation)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    volatile int *depth = dcontext != NULL && dcontext != GLOBAL_DCONTEXT
+        ? &dcontext->client_userspace_lookup_depth
+        : &userspace_code_bootstrap_readers;
+    __atomic_add_fetch(depth, 1, __ATOMIC_SEQ_CST);
+    bool found = false;
+    dr_userspace_code_t *record = __atomic_load_n(&userspace_code, __ATOMIC_SEQ_CST);
+    for (; record != NULL; record = __atomic_load_n(&record->next, __ATOMIC_SEQ_CST)) {
+        if (pc < record->begin || pc >= record->end)
+            continue;
+        const size_t offset = pc - record->begin;
+        size_t first = 0, last = record->count;
+        while (first < last) {
+            const size_t middle = first + (last - first) / 2;
+            if (record->mappings[middle].offset <= offset)
+                first = middle + 1;
+            else
+                last = middle;
+        }
+        if (first == 0)
+            break;
+        const dr_userspace_pc_mapping_t *mapping = &record->mappings[first - 1];
+        if (offset - mapping->offset >= mapping->length)
+            break;
+        if (original_pc != NULL)
+            *original_pc = mapping->original_pc;
+        if (generation != NULL)
+            *generation = record->generation;
+        found = true;
+        break;
+    }
+    __atomic_sub_fetch(depth, 1, __ATOMIC_SEQ_CST);
+    return found;
+#endif
+    return false;
 }
 
 DR_API
@@ -7030,14 +7271,19 @@ dr_redirect_userspace_execution(dr_mcontext_t *mcontext, uint64 generation)
            fpstate_size);
     dcontext->client_userspace_fpstate_valid = true;
     dcontext->client_userspace_request_generation = generation;
+    dcontext->client_userspace_request_pc = mcontext->pc;
+    dcontext->client_userspace_original_pc = mcontext->pc;
+    dr_lookup_userspace_code(mcontext->pc, &dcontext->client_userspace_original_pc, NULL);
     dcontext->client_userspace_target = mcontext->pc;
     if (generation != dr_userspace_execution_generation(dcontext)) {
         dcontext->client_userspace_target = NULL;
+        dcontext->client_userspace_request_pc = NULL;
         dcontext->client_userspace_fpstate_valid = false;
         return false;
     }
     if (!dr_redirect_execution(mcontext)) {
         dcontext->client_userspace_target = NULL;
+        dcontext->client_userspace_request_pc = NULL;
         dcontext->client_userspace_fpstate_valid = false;
         return false;
     }
@@ -7072,6 +7318,222 @@ dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc)
 }
 
 #if defined(LINUX) && defined(X86) && defined(X64)
+static bool
+userspace_gate_writable_range(byte *address, size_t size)
+{
+    const ptr_uint_t start = (ptr_uint_t)address;
+    dr_mem_info_t info;
+    return address != NULL && size != 0 && start <= POINTER_MAX - size &&
+        is_dynamo_address(address) && is_dynamo_address(address + size - 1) &&
+        query_memory_ex_from_os(address, &info) && TESTANY(DR_MEMPROT_WRITE, info.prot) &&
+        start >= (ptr_uint_t)info.base_pc &&
+        start - (ptr_uint_t)info.base_pc <= info.size &&
+        size <= info.size - (start - (ptr_uint_t)info.base_pc);
+}
+static bool
+userspace_gate_ranges_overlap(ptr_uint_t left, size_t left_size, ptr_uint_t right,
+                              size_t right_size)
+{
+    return left < right + right_size && right < left + left_size;
+}
+
+static bool
+userspace_bound_gate_image(byte stub[26], byte *buffer, app_pc *application_pc_slot,
+                           app_pc *runtime_entry_slot)
+{
+    static const byte encoding[26] = { 0xf3, 0x0f, 0x1e, 0xfa, 0x65, 0x48, 0x89,
+                                       0x04, 0x25, 0,    0,    0,    0,    0x48,
+                                       0x8b, 0x05, 0,    0,    0,    0,    0xff,
+                                       0x25, 0,    0,    0,    0 };
+    const ptr_uint_t code = (ptr_uint_t)buffer;
+    const ptr_uint_t slots[] = { (ptr_uint_t)application_pc_slot,
+                                 (ptr_uint_t)runtime_entry_slot };
+    const size_t next_instruction[] = { 20, sizeof(encoding) };
+    const size_t displacement_offset[] = { 16, 22 };
+    memcpy(stub, encoding, sizeof(encoding));
+    for (size_t i = 0; i < 2; ++i) {
+        const ptr_uint_t next = code + next_instruction[i];
+        int displacement;
+        if (slots[i] >= next) {
+            if (slots[i] - next > INT_MAX)
+                return false;
+            displacement = (int)(slots[i] - next);
+        } else {
+            if (next - slots[i] > (ptr_uint_t)INT_MAX + 1)
+                return false;
+            displacement = (int)(-(int64)(next - slots[i]));
+        }
+        memcpy(stub + displacement_offset[i], &displacement, sizeof(displacement));
+    }
+    const uint spill = DIRECT_STUB_SPILL_SLOT;
+    memcpy(stub + 9, &spill, sizeof(spill));
+    return true;
+}
+#endif
+
+DR_API
+bool
+dr_bind_userspace_gate_slots(app_pc application_pc, app_pc *application_pc_slot,
+                             app_pc *runtime_entry_slot)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (standalone_library || application_pc == NULL ||
+        application_pc_slot == runtime_entry_slot ||
+        (ptr_uint_t)application_pc_slot % sizeof(app_pc) != 0 ||
+        (ptr_uint_t)runtime_entry_slot % sizeof(app_pc) != 0 ||
+        TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask) ||
+        !userspace_gate_writable_range((byte *)application_pc_slot, sizeof(app_pc)) ||
+        !userspace_gate_writable_range((byte *)runtime_entry_slot, sizeof(app_pc)))
+        return false;
+    const app_pc entry = client_userspace_gate_routine();
+    if (entry == NULL)
+        return false;
+    *application_pc_slot = application_pc;
+    *runtime_entry_slot = entry;
+    return true;
+#else
+    return false;
+#endif
+}
+
+DR_API
+bool
+dr_bind_userspace_gate_slots_bulk(const app_pc *application_pcs, size_t count,
+                                  app_pc *application_pc_slots,
+                                  app_pc *runtime_entry_slot)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    const ptr_uint_t input = (ptr_uint_t)application_pcs;
+    const ptr_uint_t slots = (ptr_uint_t)application_pc_slots;
+    const ptr_uint_t runtime = (ptr_uint_t)runtime_entry_slot;
+    if (standalone_library || application_pcs == NULL || count == 0 ||
+        count > POINTER_MAX / sizeof(app_pc) || input % sizeof(app_pc) != 0 ||
+        input > POINTER_MAX - count * sizeof(app_pc) ||
+        slots > POINTER_MAX - count * sizeof(app_pc) ||
+        runtime > POINTER_MAX - sizeof(app_pc) || slots % sizeof(app_pc) != 0 ||
+        runtime % sizeof(app_pc) != 0 ||
+        TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask) ||
+        userspace_gate_ranges_overlap(slots, count * sizeof(app_pc), runtime,
+                                      sizeof(app_pc)) ||
+        userspace_gate_ranges_overlap(input, count * sizeof(app_pc), slots,
+                                      count * sizeof(app_pc)) ||
+        userspace_gate_ranges_overlap(input, count * sizeof(app_pc), runtime,
+                                      sizeof(app_pc)) ||
+        !userspace_gate_writable_range((byte *)slots, count * sizeof(app_pc)) ||
+        !userspace_gate_writable_range((byte *)runtime, sizeof(app_pc)))
+        return false;
+    const app_pc entry = client_userspace_gate_routine();
+    if (entry == NULL)
+        return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (application_pcs[i] == NULL)
+            return false;
+    }
+    /* All validation precedes writes. The caller owns these unpublished slots. */
+    memcpy(application_pc_slots, application_pcs, count * sizeof(app_pc));
+    *runtime_entry_slot = entry;
+    return true;
+#else
+    return false;
+#endif
+}
+
+DR_API
+bool
+dr_encode_userspace_bound_gates(byte *buffer, size_t size,
+                                const dr_userspace_bound_gate_t *gates, size_t count,
+                                app_pc *application_pc_slots, app_pc *runtime_entry_slot)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    const ptr_uint_t code = (ptr_uint_t)buffer;
+    const ptr_uint_t descriptors = (ptr_uint_t)gates;
+    const ptr_uint_t slots = (ptr_uint_t)application_pc_slots;
+    const ptr_uint_t runtime = (ptr_uint_t)runtime_entry_slot;
+    byte stub[26];
+    if (standalone_library || gates == NULL || count == 0 || size < sizeof(stub) ||
+        count > POINTER_MAX / sizeof(*gates) || count > POINTER_MAX / sizeof(app_pc) ||
+        code > POINTER_MAX - size || descriptors > POINTER_MAX - count * sizeof(*gates) ||
+        slots > POINTER_MAX - count * sizeof(app_pc) ||
+        runtime > POINTER_MAX - sizeof(app_pc) || slots % sizeof(app_pc) != 0 ||
+        runtime % sizeof(app_pc) != 0 ||
+        TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask) ||
+        userspace_gate_ranges_overlap(code, size, slots, count * sizeof(app_pc)) ||
+        userspace_gate_ranges_overlap(code, size, runtime, sizeof(app_pc)) ||
+        userspace_gate_ranges_overlap(slots, count * sizeof(app_pc), runtime,
+                                      sizeof(app_pc)) ||
+        userspace_gate_ranges_overlap(descriptors, count * sizeof(*gates), code, size) ||
+        userspace_gate_ranges_overlap(descriptors, count * sizeof(*gates), slots,
+                                      count * sizeof(app_pc)) ||
+        userspace_gate_ranges_overlap(descriptors, count * sizeof(*gates), runtime,
+                                      sizeof(app_pc)) ||
+        !userspace_gate_writable_range(buffer, size) ||
+        !userspace_gate_writable_range((byte *)slots, count * sizeof(app_pc)) ||
+        !userspace_gate_writable_range((byte *)runtime, sizeof(app_pc)))
+        return false;
+    const app_pc entry = client_userspace_gate_routine();
+    if (entry == NULL)
+        return false;
+    size_t previous_end = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (gates[i].application_pc == NULL || gates[i].offset < previous_end ||
+            gates[i].offset > size - sizeof(stub) ||
+            !userspace_bound_gate_image(stub, buffer + gates[i].offset,
+                                        &application_pc_slots[i], runtime_entry_slot))
+            return false;
+        previous_end = gates[i].offset + sizeof(stub);
+    }
+    /* The verified ranges and descriptors remain immutable until this returns. */
+    for (size_t i = 0; i < count; ++i) {
+        userspace_bound_gate_image(stub, buffer + gates[i].offset,
+                                   &application_pc_slots[i], runtime_entry_slot);
+        memcpy(buffer + gates[i].offset, stub, sizeof(stub));
+        application_pc_slots[i] = gates[i].application_pc;
+    }
+    *runtime_entry_slot = entry;
+    return true;
+#else
+    return false;
+#endif
+}
+
+DR_API
+size_t
+dr_encode_userspace_bound_gate(byte *buffer, size_t capacity, app_pc application_pc,
+                               app_pc *application_pc_slot, app_pc *runtime_entry_slot)
+{
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+    byte stub[26];
+    const ptr_uint_t code = (ptr_uint_t)buffer;
+    const ptr_uint_t slots[] = { (ptr_uint_t)application_pc_slot,
+                                 (ptr_uint_t)runtime_entry_slot };
+    if (standalone_library || buffer == NULL || application_pc == NULL ||
+        capacity < sizeof(stub) || code > POINTER_MAX - sizeof(stub) ||
+        application_pc_slot == NULL || runtime_entry_slot == NULL ||
+        application_pc_slot == runtime_entry_slot ||
+        TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask))
+        return 0;
+    for (size_t i = 0; i < 2; ++i) {
+        if (slots[i] % sizeof(app_pc) != 0 || slots[i] > POINTER_MAX - sizeof(app_pc) ||
+            userspace_gate_ranges_overlap(code, sizeof(stub), slots[i], sizeof(app_pc)))
+            return 0;
+    }
+    if (!userspace_bound_gate_image(stub, buffer, application_pc_slot,
+                                    runtime_entry_slot))
+        return 0;
+    if (!userspace_gate_writable_range(buffer, sizeof(stub)) ||
+        !dr_bind_userspace_gate_slots(application_pc, application_pc_slot,
+                                      runtime_entry_slot))
+        return 0;
+    /* The caller has not published this code or its private binding slots. */
+    memcpy(buffer, stub, sizeof(stub));
+    return sizeof(stub);
+#else
+    return 0;
+#endif
+}
+
+#if defined(LINUX) && defined(X86) && defined(X64)
 void
 client_userspace_gate_dispatch(dcontext_t *dcontext)
 {
@@ -7094,7 +7556,7 @@ client_userspace_gate_dispatch(dcontext_t *dcontext)
     set_last_exit(dcontext, (linkstub_t *)get_client_linkstub());
     dcontext->whereami = DR_WHERE_FCACHE;
     d_r_dispatch(dcontext);
-    ASSERT_NOT_REACHED();
+    CLIENT_ASSERT(false, "userspace gate dispatch returned");
 }
 #endif
 
