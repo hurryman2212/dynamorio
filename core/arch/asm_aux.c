@@ -43,6 +43,9 @@
 #include "../dispatch.h"
 #include "../monitor.h"
 #include "arch.h"
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    include "../unix/stdio_roles.h"
+#endif
 
 /* Helper routine for the x86.asm PUSH_DR_MCONTEXT, to fill in the xmm0-5 values
  * (or all for linux) (or ymm) only if necessary.
@@ -102,6 +105,12 @@ dynamo_start(priv_mcontext_t *mc)
         ASSERT(dcontext != NULL);
         ASSERT(dr_api_entry);
     }
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Explicit start may follow native descriptor changes. Refresh before
+     * takeover acquires synchronization locks, never in ordinary cache gates. */
+    os_stdio_refresh();
+#endif
 
     /* Signal other threads for take over.
      * This routine now calls dynamo_thread_under_dynamo() for this thread as well.

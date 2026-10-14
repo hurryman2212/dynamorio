@@ -217,6 +217,9 @@ char **our_environ;
 #endif
 #include "../module_shared.h"
 #include "os_private.h"
+#if defined(LINUX) && defined(X86) && defined(X64)
+#    include "stdio_roles.h"
+#endif
 #include "ptrace_private.h"
 #include "../synch.h"
 #include "memquery.h"
@@ -404,6 +407,8 @@ typedef struct _file_table_domain_t {
     recursive_lock_t transaction;
     uint64 identity;
     uint references;
+    uint stdio_following;
+    uint stdio_pending;
     file_t application_file;
     file_t global_log;
 #ifdef LINUX
@@ -1275,6 +1280,16 @@ d_r_os_init(void)
     }
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    bool log_to_standard_error = current_file_table()->global_log == STDERR;
+    if (!standalone_library && !os_stdio_init()) {
+        SYSLOG_INTERNAL_ERROR("unable to protect private standard streams");
+        os_terminate_with_code(NULL, TERMINATE_PROCESS, 127);
+    }
+    if (log_to_standard_error)
+        current_file_table()->global_log = STDERR;
+#endif
+
     /* Ensure initialization */
     get_dynamorio_dll_start();
 
@@ -1732,6 +1747,10 @@ os_slow_exit(void)
 #endif
 #if defined(LINUX) && defined(X86) && defined(X64)
     os_thread_suspend_service_exit();
+    bool log_to_standard_error = current_file_table()->global_log == STDERR;
+    os_stdio_exit();
+    if (log_to_standard_error)
+        current_file_table()->global_log = STDERR;
 #endif
     file_tables_exit();
 
@@ -2297,6 +2316,8 @@ file_table_copy(file_table_domain_t *source)
     if (copy->identity == 0)
         runtime_identity_failed();
     copy->references = 1;
+    copy->stdio_following = source->stdio_following;
+    copy->stdio_pending = source->stdio_pending;
     copy->application_file = source->application_file;
     copy->global_log = source->global_log;
     copy->proc_mount = source->proc_mount;
@@ -5702,6 +5723,127 @@ os_file_identity(file_t descriptor)
     return identity;
 }
 
+uint
+os_stdio_following(void)
+{
+    return __atomic_load_n(&current_file_table()->stdio_following, __ATOMIC_ACQUIRE);
+}
+
+uint
+os_stdio_pending(void)
+{
+    return __atomic_load_n(&current_file_table()->stdio_pending, __ATOMIC_ACQUIRE);
+}
+
+void
+os_stdio_stop_following(uint stream)
+{
+    ASSERT(stream <= 2);
+    if (stream > 2)
+        return;
+    file_table_domain_t *files = current_file_table();
+    __atomic_fetch_and(&files->stdio_following, ~(1u << stream), __ATOMIC_RELEASE);
+    __atomic_fetch_and(&files->stdio_pending, ~(1u << stream), __ATOMIC_RELEASE);
+}
+
+bool
+os_stdio_open_aliases(file_t aliases[3], uint enabled)
+{
+    for (uint index = 0; index < 3; ++index)
+        aliases[index] = INVALID_FILE;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    file_table_domain_t *files = file_table_transaction_begin();
+    bool success = true;
+    uint pending = 0;
+    for (uint index = 0; success && index < 3; ++index) {
+        if (!TESTANY(1u << index, enabled))
+            continue;
+        file_t source = (file_t)index;
+        bool sentinel = fcntl_syscall(source, F_GETFD, 0) == -EBADF;
+        if (sentinel) {
+            /* A real O_PATH descriptor reserves the alias against every kernel
+             * FD allocator. I/O fails with EBADF until the app opens this stream.
+             * Unlike an unused numeric reservation, no other task can steal it. */
+            source = open_syscall("/", O_PATH | O_CLOEXEC, 0);
+            pending |= 1u << index;
+        }
+        if (source < 0) {
+            success = false;
+            break;
+        }
+        file_t alias = fd_priv_dup(source);
+        if (alias < 0)
+            alias = fcntl_syscall(source, F_DUPFD_CLOEXEC, 3);
+        if (sentinel)
+            close_syscall(source);
+        if (alias < 0) {
+            success = false;
+            break;
+        }
+        fd_table_add(alias, 0);
+        aliases[index] = alias;
+    }
+    if (success) {
+        files->stdio_following = enabled;
+        files->stdio_pending = pending;
+    } else {
+        for (uint index = 0; index < 3; ++index) {
+            if (aliases[index] != INVALID_FILE) {
+                fd_table_remove(aliases[index]);
+                close_syscall(aliases[index]);
+                aliases[index] = INVALID_FILE;
+            }
+        }
+    }
+    file_table_transaction_end(files);
+    return success;
+#else
+    return false;
+#endif
+}
+
+bool
+os_stdio_bind_alias(file_t source, file_t alias)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    file_table_domain_t *files = file_table_transaction_begin();
+    bool success = source >= 0 && source <= 2 && alias > 2 &&
+        dynamorio_syscall(SYS_dup3, 3, source, alias, O_CLOEXEC) == alias;
+    if (success)
+        __atomic_fetch_and(&files->stdio_pending, ~(1u << source), __ATOMIC_RELEASE);
+    file_table_transaction_end(files);
+    return success;
+#else
+    return false;
+#endif
+}
+
+bool
+os_stdio_refresh_alias(file_t source, file_t alias)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (source < 0 || source > 2 || alias <= 2)
+        return false;
+    file_table_domain_t *files = file_table_transaction_begin();
+    bool closed = fcntl_syscall(source, F_GETFD, 0) == -EBADF;
+    file_t replacement = closed ? open_syscall("/", O_PATH | O_CLOEXEC, 0) : source;
+    bool success = replacement >= 0 &&
+        dynamorio_syscall(SYS_dup3, 3, replacement, alias, O_CLOEXEC) == alias;
+    if (closed && replacement >= 0)
+        close_syscall(replacement);
+    if (success) {
+        if (closed)
+            __atomic_fetch_or(&files->stdio_pending, 1u << source, __ATOMIC_RELEASE);
+        else
+            __atomic_fetch_and(&files->stdio_pending, ~(1u << source), __ATOMIC_RELEASE);
+    }
+    file_table_transaction_end(files);
+    return success;
+#else
+    return false;
+#endif
+}
+
 bool
 os_thread_suspend_open_resources(file_t sockets[2], file_t *pidfd, file_t *ackfd)
 {
@@ -6634,6 +6776,10 @@ os_normalized_sysnum(int num_raw, instr_t *gateway, dcontext_t *dcontext)
 static bool
 ignorable_system_call_normalized(int num)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (os_stdio_tracks_syscall(num))
+        return false;
+#endif
     switch (num) {
 #if defined(SYS_exit_group)
     case SYS_exit_group:
@@ -8300,16 +8446,17 @@ cleanup_after_vfork_execve(dcontext_t *dcontext)
 
 /* XXX: Discover libc type at runtime and use appropriate stdfile_t variant
  * instead of depending on build-time preprocessor defines. */
+#if !defined(LINUX) || !defined(X86) || !defined(X64)
 static void
 set_stdfile_fileno(stdfile_t **stdfile, file_t old_fd, file_t file_no)
 {
-#ifdef STDFILE_FILENO
-#    ifdef ANDROID64
+#    ifdef STDFILE_FILENO
+#        ifdef ANDROID64
     fcntl_syscall(old_fd, F_DUPFD, file_no);
-#    else
+#        else
     (*stdfile)->STDFILE_FILENO = file_no;
-#    endif
-#else
+#        endif
+#    else
     /* i#1973: musl libc support (and potentially other non-glibcs) */
     /* only called by handle_close_pre(), so warning is specific to that. */
     SYSLOG_INTERNAL_WARNING_ONCE(
@@ -8317,8 +8464,10 @@ set_stdfile_fileno(stdfile_t **stdfile, file_t old_fd, file_t file_no)
         "this platform. Client usage of stdio.h stdin, stdout, or stderr may "
         "no longer work as expected, because the app is closing the UNIX fds "
         "backing these.");
-#endif
+#    endif
 }
+
+#endif
 
 /* returns whether to execute syscall */
 static bool
@@ -8341,6 +8490,9 @@ handle_close_generic_pre(dcontext_t *dcontext, file_t fd, bool set_return_val)
         return false; /* do not execute syscall */
     }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_stdio_fd_closing(fd);
+#else
     /* Xref PR 258731 - duplicate STDOUT/STDERR when app closes them so we (or
      * a client) can continue to use them for logging. */
     if (DYNAMO_OPTION(dup_stdout_on_close) && fd == STDOUT) {
@@ -8391,6 +8543,7 @@ handle_close_generic_pre(dcontext_t *dcontext, file_t fd, bool set_return_val)
             set_stdfile_fileno(privmod_stdin, fd, our_stdin);
         }
     }
+#endif
     return true;
 }
 
@@ -10138,6 +10291,9 @@ pre_system_call(dcontext_t *dcontext)
                 DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
             } else {
                 duplicated = true;
+#    if defined(LINUX) && defined(X86) && defined(X64)
+                os_stdio_fd_replaced(newfd);
+#    endif
                 set_success_return_val(dcontext, result);
             }
             execute_syscall = false;
@@ -10467,6 +10623,12 @@ pre_system_call(dcontext_t *dcontext)
 
     } /* end switch */
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (!execute_syscall)
+        os_stdio_post_syscall(dcontext, dcontext->sys_num,
+                              syscall_successful(mc, dcontext->sys_num),
+                              MCXT_SYSCALL_RES(mc));
+#endif
     dcontext->whereami = old_whereami;
     return execute_syscall;
 }
@@ -10966,6 +11128,10 @@ post_system_call(dcontext_t *dcontext)
 
     LOG(THREAD, LOG_SYSCALLS, 2, "post syscall: sysnum=" PFX ", result=" PFX " (%d)\n",
         sysnum, MCXT_SYSCALL_RES(mc), (int)MCXT_SYSCALL_RES(mc));
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_stdio_post_syscall(dcontext, sysnum, success, result);
+#endif
 
     switch (sysnum) {
 
