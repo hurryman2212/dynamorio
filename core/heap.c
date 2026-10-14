@@ -2928,7 +2928,8 @@ get_guarded_real_memory(size_t reserve_size, size_t commit_size, uint prot, bool
     STATS_ADD_PEAK(guard_pages, 2);
 
     p += guard_size;
-    extend_commitment(p, commit_size, prot, true /* initial commit */, which);
+    if (commit_size != 0)
+        extend_commitment(p, commit_size, prot, true /* initial commit */, which);
 
     return p;
 }
@@ -4279,19 +4280,42 @@ common_heap_alloc(thread_units_t *tu, size_t size HEAPACCT(which_heap_t which))
     }
     if (tu->free_list[bucket] != NULL) {
         if (bucket == BLOCK_TYPES - 1) {
-            /* variable-length blocks, try to find one big enough */
-            size_t sz;
-            heap_pc next = tu->free_list[bucket];
-            heap_pc prev;
-            do {
-                prev = p;
-                p = next;
-                /* aligned_size is written right _before_ next pointer */
-                sz = VARIABLE_SIZE(next);
-                next = *((heap_pc *)p);
-            } while (aligned_size > sz && next != NULL);
-            if (aligned_size <= sz) {
+            /* Prefer the smallest sufficient block. Otherwise repeated large
+             * allocation/free cycles would keep splitting large blocks ahead
+             * of reusable small tails on this LIFO list.
+             */
+            size_t sz = 0;
+            heap_pc prev = NULL, candidate_prev = NULL;
+            for (heap_pc candidate = tu->free_list[bucket]; candidate != NULL;
+                 candidate = *((heap_pc *)candidate)) {
+                size_t candidate_size = VARIABLE_SIZE(candidate);
+                if (candidate_size >= aligned_size &&
+                    (p == NULL || candidate_size < sz)) {
+                    p = candidate;
+                    prev = candidate_prev;
+                    sz = candidate_size;
+                    if (sz == aligned_size)
+                        break;
+                }
+                candidate_prev = candidate;
+            }
+            if (p != NULL) {
+                heap_pc next = *((heap_pc *)p);
                 ASSERT(ALIGNED(next, HEAP_ALIGNMENT));
+                /* Retain a usable variable-size tail instead of assigning an
+                 * arbitrarily large free block to a small persistent object.
+                 * Never put a fixed-bucket-sized remainder on this list: free
+                 * dispatches by requested size and requires a variable header.
+                 */
+                if (sz - aligned_size >=
+                    HEADER_SIZE + BLOCK_SIZES[bucket - 1] + HEAP_ALIGNMENT) {
+                    heap_pc tail = p + aligned_size + HEADER_SIZE;
+                    VARIABLE_SIZE(tail) = sz - aligned_size - HEADER_SIZE;
+                    *((heap_pc *)tail) = next;
+                    next = tail;
+                    VARIABLE_SIZE(p) = aligned_size;
+                    sz = aligned_size;
+                }
                 /* found one, extract from free list */
                 if (p == tu->free_list[bucket])
                     tu->free_list[bucket] = next;
