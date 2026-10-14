@@ -1338,6 +1338,17 @@ signal_thread_inherit(dcontext_t *dcontext, void *clone_record)
         }
 #endif
 
+#ifdef LINUX
+        /* Real children inherit the creator's logical mask, including signals
+         * kept unblocked in the kernel for DR. Fake takeover records have no
+         * dstack and must retain the existing task's own kernel mask instead.
+         */
+        if (record->dstack != NULL) {
+            info->app_sigblocked = record->info.app_sigblocked;
+            info->inherit_app_sigblocked = true;
+        }
+#endif
+
         /* Handlers are either inherited or shared. */
         if (TESTANY(CLONE_SIGHAND, record->clone_flags)) {
             /* Need to share table of handlers! */
@@ -2615,7 +2626,22 @@ signal_swap_mask(dcontext_t *dcontext, bool to_app)
                 ATOMIC_INC(int, info->sighand->threads_unmasked[i]);
         }
         d_r_mutex_lock(&info->sigblocked_lock);
+#ifdef LINUX
+        kernel_sigset_t inherited = info->app_sigblocked;
+#endif
         unblock_all_signals(&info->app_sigblocked);
+#ifdef LINUX
+        if (info->inherit_app_sigblocked && !IS_CLIENT_THREAD(dcontext)) {
+            for (int i = 1; i <= MAX_SIGNUM; ++i) {
+                if (EMULATE_SIGMASK(info, i) && kernel_sigismember(&inherited, i))
+                    kernel_sigaddset(&info->app_sigblocked, i);
+            }
+        }
+        /* Client threads retain their existing inherited-mask reset, and later
+         * native re-entry must import the task's current kernel mask normally.
+         */
+        info->inherit_app_sigblocked = false;
+#endif
         d_r_mutex_unlock(&info->sigblocked_lock);
         for (int i = 1; i <= MAX_SIGNUM; i++) {
             if (!EMULATE_SIGMASK(info, i))
