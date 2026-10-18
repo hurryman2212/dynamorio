@@ -215,7 +215,8 @@ typedef struct _kernel_sigcontext_t {
     unsigned short cs;
     unsigned short gs;
     unsigned short fs;
-    unsigned short __pad0;
+    /* Linux 4.3 and later restore SS from this formerly reserved field. */
+    unsigned short ss;
     unsigned long err;
     unsigned long trapno;
     unsigned long oldmask;
