@@ -3487,17 +3487,22 @@ thread_set_self_context(void *cxt, bool is_detach_external)
 #ifdef DR_HOST_NOT_TARGET
     ASSERT_NOT_REACHED();
 #elif defined(X86)
-    asm("mov  %0, %%" ASM_XSP : : "m"(xsp_for_sigreturn));
 #    ifdef MACOS
+    asm("mov  %0, %%" ASM_XSP : : "m"(xsp_for_sigreturn));
     ASSERT_NOT_IMPLEMENTED(false && "need to pass 2 params to SYS_sigreturn");
     asm("jmp _dynamorio_sigreturn");
 #    else
     /* i#2632: recent clang for 32-bit annoyingly won't do the right thing for
-     * "jmp dynamorio_sigreturn" and leaves relocs so we ensure it's PIC:
+     * "jmp dynamorio_sigreturn" and leaves relocs so we ensure it's PIC.
+     * Evaluate both operands before changing the stack. A C local initialized
+     * after that change can spill into the new signal frame and overwrite
+     * uc_flags, unexpectedly enabling strict restoration of an invalid SS.
      */
     void (*asm_jmp_tgt)(void) = dynamorio_sigreturn;
-    asm("mov  %0, %%" ASM_XCX : : "m"(asm_jmp_tgt));
-    asm("jmp  *%" ASM_XCX);
+    asm volatile("mov %0, %%" ASM_XSP "\n\tjmp *%1"
+                 :
+                 : "r"(xsp_for_sigreturn), "r"(asm_jmp_tgt)
+                 : "memory");
 #    endif /* MACOS/LINUX */
 #elif defined(AARCH64)
     asm("mov  " ASM_XSP ", %0" : : "r"(xsp_for_sigreturn));
@@ -3526,11 +3531,17 @@ thread_set_segment_registers(sigcontext_t *sc)
                          : "=m"(sc->SC_FIELD(cs))
                          :
                          : "eax");
-#    ifndef X64
+#    if defined(LINUX) || !defined(X64)
+    /* A synthesized Linux x64 frame has no saved signal context to supply SS.
+     * Provide its actual selector so strict restoration, when requested, does
+     * not resume with an invalid stack segment.
+     */
     __asm__ __volatile__("mov %%ss, %%ax; mov %%ax, %0"
                          : "=m"(sc->SC_FIELD(ss))
                          :
                          : "eax");
+#    endif
+#    ifndef X64
     __asm__ __volatile__("mov %%ds, %%ax; mov %%ax, %0"
                          : "=m"(sc->SC_FIELD(ds))
                          :
