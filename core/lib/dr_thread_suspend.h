@@ -5,8 +5,9 @@
 
 #include <stdint.h>
 
+#include "dr_service_contract.h" /* IWYU pragma: export */
+
 #define DR_THREAD_SUSPEND_MAGIC UINT64_C(0x3150535553524444)
-#define DR_THREAD_SUSPEND_VERSION 2
 #define DR_THREAD_SUSPEND_PAYLOAD_SIZE 128
 #define DR_THREAD_SUSPEND_REGISTER_FILES 3
 /* Linux x86-64 SI_QUEUE si_value holds the notification ticket. The registered
@@ -87,7 +88,8 @@ enum {
  * A kernel delivery acknowledgement is not a DR suspension acknowledgement. */
 typedef struct {
     uint64_t magic;
-    uint32_t version, operation;
+    char contract[65];
+    uint32_t operation;
     uint64_t sequence;
     uint64_t realm, task;
     uint64_t runtime_id, runtime_group;
@@ -100,7 +102,8 @@ typedef struct {
  * and task handles. Every other reply echoes the request's realm and task. */
 typedef struct {
     uint64_t magic;
-    uint32_t version, status;
+    char contract[65];
+    uint32_t status;
     uint64_t sequence, realm, task;
     int32_t system_error;
     uint32_t reserved;

@@ -1348,6 +1348,7 @@ dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/aarch64/instr_create_api.h
                  dr_ir_macros_aarch64.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_ir_utils.h dr_ir_utils.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_tools.h dr_tools.h)
+include(${PROJECT_SOURCE_DIR}/make/service_contract.cmake)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_exec_resources.h
                  dr_exec_resources.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_thread_suspend.h

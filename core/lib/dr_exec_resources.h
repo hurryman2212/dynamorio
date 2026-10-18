@@ -1,13 +1,14 @@
 /* Standalone early-exec FD service wire format. No runtime pointers or DR
  * private types are part of this interface. All fields use the native byte
- * order of the same-ISA exec family; the version and ELF class are validated. */
+ * order of the same-ISA exec family; the contract hash and ELF class are validated. */
 #ifndef DR_EXEC_RESOURCES_H
 #define DR_EXEC_RESOURCES_H
 
 #include <stdint.h>
 
+#include "dr_service_contract.h" /* IWYU pragma: export */
+
 #define DR_EXEC_RESOURCE_MAGIC UINT64_C(0x3152435352584544)
-#define DR_EXEC_RESOURCE_VERSION 1
 /* Includes runtime, private dependencies, target and proc root. Plus the
  * manifest/reply descriptors this remains below Linux SCM_MAX_FD (253). */
 #define DR_EXEC_RESOURCE_LIMIT 128
@@ -33,7 +34,8 @@ enum {
 
 typedef struct {
     uint64_t magic;
-    uint32_t version, operation;
+    char contract[65];
+    uint32_t operation;
     uint64_t exec_nonce;
     uint32_t resource_count, reserved;
     uint64_t manifest_size;
@@ -41,7 +43,8 @@ typedef struct {
 
 typedef struct {
     uint64_t magic;
-    uint32_t version, status;
+    char contract[65];
+    uint32_t status;
     uint64_t exec_nonce;
     uint32_t resource_count, reserved;
     uint64_t manifest_size;
@@ -49,7 +52,8 @@ typedef struct {
 
 typedef struct {
     uint64_t magic;
-    uint32_t version, resource_count;
+    char contract[65];
+    uint32_t resource_count;
     uint64_t total_size, records_offset, strings_offset, reserved;
 } dr_exec_manifest_t;
 

@@ -8,13 +8,13 @@
 #include <elf.h>
 #include <linux/magic.h>
 #include <linux/memfd.h>
-#include <errno.h>
+#include <errno.h> /* IWYU pragma: keep: GCC uses these constants directly. */
 #include <stdlib.h>
 #include "../globals.h"
 #include "../module_shared.h"
 #include "../utils.h"
 #include "os_private.h"
-#include "include/syscall.h"
+#include "include/syscall.h" /* IWYU pragma: keep: GCC requires raw SYS_* definitions. */
 #include "exec_resources.h"
 
 #ifndef O_PATH
@@ -168,9 +168,10 @@ validate_manifest(byte *data, size_t size, file_t *files, uint count)
         return false;
     dr_exec_manifest_t *header = (dr_exec_manifest_t *)data;
     if (header->magic != DR_EXEC_RESOURCE_MAGIC ||
-        header->version != DR_EXEC_RESOURCE_VERSION || header->reserved != 0 ||
-        header->resource_count != count || header->total_size != size ||
-        header->records_offset != sizeof(*header) ||
+        memcmp(header->contract, DR_EXEC_RESOURCE_CONTRACT_HASH,
+               sizeof(header->contract)) != 0 ||
+        header->reserved != 0 || header->resource_count != count ||
+        header->total_size != size || header->records_offset != sizeof(*header) ||
         header->strings_offset !=
             sizeof(*header) + count * sizeof(dr_exec_resource_record_t) ||
         header->strings_offset > size)
@@ -310,8 +311,9 @@ exchange(const dr_exec_resource_request_t *request, const file_t *send_files,
             offset += stride;
         }
         valid = valid && reply->magic == DR_EXEC_RESOURCE_MAGIC &&
-            reply->version == DR_EXEC_RESOURCE_VERSION && reply->reserved == 0 &&
-            reply->exec_nonce == request->exec_nonce &&
+            memcmp(reply->contract, DR_EXEC_RESOURCE_CONTRACT_HASH,
+                   sizeof(reply->contract)) == 0 &&
+            reply->reserved == 0 && reply->exec_nonce == request->exec_nonce &&
             reply->status == DR_EXEC_RESOURCE_OK;
     }
     os_close(sockets[0]);
@@ -337,7 +339,7 @@ os_exec_resources_bootstrap(void)
         return false;
     service_file = broker;
     dr_exec_resource_request_t request = { DR_EXEC_RESOURCE_MAGIC,
-                                           DR_EXEC_RESOURCE_VERSION,
+                                           DR_EXEC_RESOURCE_CONTRACT_HASH,
                                            DR_EXEC_RESOURCE_GET,
                                            nonce,
                                            0,
@@ -557,7 +559,8 @@ os_exec_resources_register(uint64 nonce, file_t target, const char *path,
         memset(mapping, 0, size);
         dr_exec_manifest_t *header = (void *)mapping;
         header->magic = DR_EXEC_RESOURCE_MAGIC;
-        header->version = DR_EXEC_RESOURCE_VERSION;
+        memcpy(header->contract, DR_EXEC_RESOURCE_CONTRACT_HASH,
+               sizeof(header->contract));
         header->resource_count = count;
         header->total_size = size;
         header->records_offset = sizeof(*header);
@@ -589,7 +592,7 @@ os_exec_resources_register(uint64 nonce, file_t target, const char *path,
     if (valid) {
         files[0] = manifest;
         dr_exec_resource_request_t request = { DR_EXEC_RESOURCE_MAGIC,
-                                               DR_EXEC_RESOURCE_VERSION,
+                                               DR_EXEC_RESOURCE_CONTRACT_HASH,
                                                DR_EXEC_RESOURCE_REGISTER,
                                                nonce,
                                                count,
