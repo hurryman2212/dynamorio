@@ -1,6 +1,6 @@
 /* The suspension path cannot enter client code, allocate, or acquire an FD-table
  * lock: its target may own those locks. Registration prepares all resources. */
-#include <errno.h>
+#include <errno.h> /* IWYU pragma: keep: GCC uses these constants directly. */
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -9,7 +9,7 @@
 #include "../globals.h"
 #include "../utils.h"
 #include "os_private.h"
-#include "include/syscall.h"
+#include "include/syscall.h" /* IWYU pragma: keep: GCC requires raw SYS_* definitions. */
 #include "thread_suspend.h"
 
 /* Bound a dead or wedged broker independently of the target's suspend ACK. */
@@ -103,9 +103,10 @@ suspend_exchange(file_t destination, file_t channel,
         if (result == sizeof(*reply)) {
             bool valid = !TESTANY(MSG_TRUNC | MSG_CTRUNC, message.msg_flags) &&
                 reply->magic == DR_THREAD_SUSPEND_MAGIC &&
-                reply->version == DR_THREAD_SUSPEND_VERSION && reply->sequence != 0 &&
-                reply->reserved == 0 && reply->status <= DR_THREAD_SUSPEND_UNKNOWN &&
-                reply->system_error >= 0 &&
+                memcmp(reply->contract, DR_THREAD_SUSPEND_CONTRACT_HASH,
+                       sizeof(reply->contract)) == 0 &&
+                reply->sequence != 0 && reply->reserved == 0 &&
+                reply->status <= DR_THREAD_SUSPEND_UNKNOWN && reply->system_error >= 0 &&
                 ((reply->status != DR_THREAD_SUSPEND_OK &&
                   reply->status < DR_THREAD_SUSPEND_LIVE) ||
                  reply->system_error == 0);
@@ -181,7 +182,7 @@ os_thread_suspend_register(dcontext_t *dcontext)
     dr_thread_suspend_request_t request = { 0 };
     dr_thread_suspend_reply_t reply;
     request.magic = DR_THREAD_SUSPEND_MAGIC;
-    request.version = DR_THREAD_SUSPEND_VERSION;
+    memcpy(request.contract, DR_THREAD_SUSPEND_CONTRACT_HASH, sizeof(request.contract));
     request.operation = DR_THREAD_SUSPEND_REGISTER;
     request.sequence = ++state->sequence;
     request.realm = suspend_realm;
@@ -241,7 +242,7 @@ os_thread_suspend_relay(thread_record_t *target, int signum)
     dr_thread_suspend_request_t request = { 0 };
     dr_thread_suspend_reply_t reply;
     request.magic = DR_THREAD_SUSPEND_MAGIC;
-    request.version = DR_THREAD_SUSPEND_VERSION;
+    memcpy(request.contract, DR_THREAD_SUSPEND_CONTRACT_HASH, sizeof(request.contract));
     request.operation = DR_THREAD_SUSPEND_SEND;
     request.sequence = ++caller->sequence;
     request.realm = peer->realm;
@@ -310,7 +311,7 @@ suspend_control(dcontext_t *dcontext, uint operation)
     dr_thread_suspend_request_t request = { 0 };
     dr_thread_suspend_reply_t reply;
     request.magic = DR_THREAD_SUSPEND_MAGIC;
-    request.version = DR_THREAD_SUSPEND_VERSION;
+    memcpy(request.contract, DR_THREAD_SUSPEND_CONTRACT_HASH, sizeof(request.contract));
     request.operation = operation;
     request.sequence = ++state->sequence;
     request.realm = state->realm;
@@ -381,7 +382,7 @@ suspend_peer_control(dcontext_t *target, uint operation)
     dr_thread_suspend_request_t request = { 0 };
     dr_thread_suspend_reply_t reply;
     request.magic = DR_THREAD_SUSPEND_MAGIC;
-    request.version = DR_THREAD_SUSPEND_VERSION;
+    memcpy(request.contract, DR_THREAD_SUSPEND_CONTRACT_HASH, sizeof(request.contract));
     request.operation = operation;
     request.sequence = ++caller->sequence;
     request.realm = peer->realm;
