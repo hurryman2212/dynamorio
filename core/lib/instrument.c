@@ -4984,6 +4984,23 @@ dr_get_dr_segment_base(DR_PARAM_IN reg_id_t seg)
     else
         return NULL;
 #else
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    if (seg == SEG_GS && !standalone_library && !os_fsgsbase_enabled()) {
+        /* A valid current dcontext identifies the installed DR TLS page. Clone
+         * bootstrap and temporarily-native copies have invalid TLS magic and
+         * must retain the actual-base query below instead of using their parent's
+         * saved base. Avoid repeated syscalls when FSGSBASE is unavailable;
+         * otherwise query the hardware directly.
+         */
+        dcontext_t *dcontext = get_thread_private_dcontext();
+        if (dcontext != NULL && dcontext != GLOBAL_DCONTEXT &&
+            dcontext->os_field != NULL) {
+            byte *base = os_get_dr_tls_base(dcontext);
+            if (base != NULL)
+                return base;
+        }
+    }
+#    endif
     return get_segment_base(seg);
 #endif
 }
