@@ -2945,6 +2945,55 @@ mangle_seg_ref(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
     bool spill = true;
     reg_id_t scratch_reg = REG_XAX, seg = REG_NULL;
 
+#    if defined(LINUX) && defined(X64)
+    const int opcode = instr_get_opcode(instr);
+    if (!instr_get_x86_mode(instr) && (opcode == OP_rdfsbase || opcode == OP_rdgsbase)) {
+        /* Private FS and runtime GS are not application-visible. Preserve #UD
+         * when the kernel has not enabled FSGSBASE; otherwise a plain load has
+         * the same flags and 32/64-bit destination semantics as the base read.
+         */
+        seg = opcode == OP_rdfsbase ? SEG_FS : SEG_GS;
+        if (!os_fsgsbase_enabled() ||
+            (seg == LIB_SEG_TLS && !INTERNAL_OPTION(private_loader)))
+            return;
+        opnd_t dst = instr_get_dst(instr, 0);
+        instr_set_opcode(instr, OP_mov_ld);
+        instr_set_num_opnds(dcontext, instr, 1, 1);
+        instr_set_dst(instr, 0, dst);
+        instr_set_src(
+            instr, 0,
+            opnd_create_sized_tls_slot(os_tls_offset(os_get_app_tls_base_offset(seg)),
+                                       opnd_get_size(dst)));
+        return;
+    }
+    if (!instr_get_x86_mode(instr) && opcode == OP_push &&
+        opnd_is_reg(instr_get_src(instr, 0))) {
+        seg = opnd_get_reg(instr_get_src(instr, 0));
+        if ((seg == SEG_FS || seg == SEG_GS) &&
+            (seg != LIB_SEG_TLS || INTERNAL_OPTION(private_loader))) {
+            /* Long-mode PUSH FS/GS zero-extends the application selector for
+             * its 64-bit stack slot; the operand-size prefix instead pushes
+             * two bytes. Keep the real push for stack fault translation.
+             */
+            const opnd_size_t size = opnd_get_size(instr_get_dst(instr, 1));
+            ASSERT(size == OPSZ_8 || size == OPSZ_2);
+            PRE(ilist, instr, instr_create_save_to_tls(dcontext, REG_XAX, TLS_XAX_SLOT));
+            PRE(ilist, instr,
+                INSTR_CREATE_movzx(
+                    dcontext, opnd_create_reg(REG_XAX),
+                    opnd_create_sized_tls_slot(
+                        os_tls_offset(os_get_app_tls_reg_offset(seg)), OPSZ_2)));
+            instr_set_src(instr, 0, opnd_create_reg(size == OPSZ_2 ? REG_AX : REG_XAX));
+            instr_set_our_mangling(instr, true);
+            PRE(ilist, next_instr,
+                instr_set_translation_mangling_epilogue(
+                    dcontext, ilist,
+                    instr_create_restore_from_tls(dcontext, REG_XAX, TLS_XAX_SLOT)));
+            return;
+        }
+    }
+#    endif
+
     /* exit cti won't be seg ref */
     if (instr_is_exit_cti(instr))
         return;
