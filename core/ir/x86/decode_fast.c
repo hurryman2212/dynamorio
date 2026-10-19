@@ -1746,6 +1746,18 @@ decode_cti(void *drcontext, byte *pc, instr_t *instr)
         instr_set_rip_rel_pos(instr, rip_rel_pos);
         return (start_pc + sz);
     }
+#    if defined(LINUX) && defined(X64)
+    /* Base reads and selector pushes also expose application FS/GS state.
+     * Fully decode them so mangling cannot skip an otherwise opaque instruction.
+     */
+    if (INTERNAL_OPTION(mangle_app_seg) && byte0 == 0x0f &&
+        (byte1 == 0xa0 || byte1 == 0xa8 ||
+         (byte1 == 0xae && (pc[2] & 0xc0) == 0xc0 && ((pc[2] >> 3) & 7) <= 1))) {
+        if (decode(dcontext, start_pc, instr) == NULL)
+            return NULL;
+        return start_pc + sz;
+    }
+#    endif
 #endif
 
     /* i#698: we must intercept floating point instruction pointer saves.
