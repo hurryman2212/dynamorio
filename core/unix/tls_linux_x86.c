@@ -42,10 +42,9 @@
 
 #include "../globals.h"
 #include "tls.h"
-#include "include/syscall.h" /* our own local copy */
+#include "include/syscall.h" /* IWYU pragma: keep */
 
 #ifdef X86
-#    include "instr.h" /* for SEG_ constants */
 #    include "os_private.h"
 #endif
 
@@ -398,6 +397,32 @@ choose_gdt_slots(os_local_state_t *os_tls)
     }
 }
 
+#ifdef X64
+/* Keep the raw syscall result for initialization and teardown callers which
+ * handle failure themselves.  No TLS data may be accessed after changing GS.
+ */
+static int
+tls_set_arch_prctl_base(uint seg, byte *base)
+{
+    /* ARCH_SET_* clears the selector and rejects non-user addresses.  Keep
+     * its behavior for descriptor-based TLS and unusual bases, including
+     * invalid inputs.  Ordinary 48-bit user bases with a zero selector can
+     * be switched entirely in user mode.  Reserve Linux's final guard page
+     * below 2^47; high five-level-paging addresses retain the syscall path.
+     */
+    if (os_fsgsbase_enabled() && read_thread_register(seg) == 0 &&
+        (ptr_uint_t)base < (((ptr_uint_t)1 << 47) - 4096)) {
+        if (seg == SEG_FS)
+            __asm__ volatile("wrfsbase %0" : : "r"(base) : "memory");
+        else
+            __asm__ volatile("wrgsbase %0" : : "r"(base) : "memory");
+        return 0;
+    }
+    return dynamorio_syscall(SYS_arch_prctl, 2, seg == SEG_FS ? ARCH_SET_FS : ARCH_SET_GS,
+                             base);
+}
+#endif
+
 void
 tls_thread_init(os_local_state_t *os_tls, byte *segment)
 {
@@ -431,12 +456,18 @@ tls_thread_init(os_local_state_t *os_tls, byte *segment)
     int index = -1;
     int res;
 #ifdef X64
-    /* First choice is gdt, which means arch_prctl.  Since this may fail
-     * on some kernels, we require -heap_in_lower_4GB so we can fall back
-     * on modify_ldt.
+    /* Prefer base-register instructions once Linux advertises their use.
+     * Legacy kernels still need the arch_prctl capability and WSL checks,
+     * with descriptor-based TLS available if the syscall is unsupported.
      */
+    const bool fsgsbase = os_fsgsbase_enabled();
     byte *cur_gs;
-    res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_GET_GS, &cur_gs);
+    if (fsgsbase) {
+        cur_gs = tls_get_fs_gs_segment_base(SEG_GS);
+        res = 0;
+    } else {
+        res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_GET_GS, &cur_gs);
+    }
     if (res >= 0) {
         LOG(GLOBAL, LOG_THREADS, 1, "os_tls_init: cur gs base is " PFX "\n", cur_gs);
         /* If we're a non-initial thread, gs will be set to the parent thread's value */
@@ -444,13 +475,19 @@ tls_thread_init(os_local_state_t *os_tls, byte *segment)
             is_dynamo_address(cur_gs) || os_runtime_identity_is_bootstrap(cur_gs) ||
             /* By resolving i#107, we can handle gs conflicts between app and dr. */
             INTERNAL_OPTION(mangle_app_seg)) {
-            res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_SET_GS, segment);
+            res = tls_set_arch_prctl_base(SEG_GS, segment);
             if (res >= 0) {
                 os_tls->tls_type = TLS_TYPE_ARCH_PRCTL;
-                LOG(GLOBAL, LOG_THREADS, 1,
-                    "os_tls_init: arch_prctl successful for base " PFX "\n", segment);
-                res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_GET_GS, &cur_gs);
-                if (res >= 0 && cur_gs != segment && !on_WSL) {
+                LOG(GLOBAL, LOG_THREADS, 1, "os_tls_init: GS base installed at " PFX "\n",
+                    segment);
+                /* Only the legacy syscall path needs a round trip to detect
+                 * broken ARCH_GET_GS emulation. A successful WRGSBASE needs
+                 * neither this syscall nor a second base-register read.
+                 */
+                if (!fsgsbase) {
+                    res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_GET_GS, &cur_gs);
+                }
+                if (!fsgsbase && res >= 0 && cur_gs != segment && !on_WSL) {
                     /* XXX i#1896: on WSL, ARCH_GET_GS is broken and does not return
                      * the true value.  (Plus, fs and gs start out equal to ss (0x2b)
                      * and are not set by ARCH_SET_*).  i#2089's safe read TLS
@@ -479,8 +516,8 @@ tls_thread_init(os_local_state_t *os_tls, byte *segment)
                     tls_using_msr = true;
                 }
                 if (INTERNAL_OPTION(private_loader)) {
-                    res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_SET_FS,
-                                            os_tls->os_seg_info.priv_lib_tls_base);
+                    res = tls_set_arch_prctl_base(SEG_FS,
+                                                  os_tls->os_seg_info.priv_lib_tls_base);
                     /* Assuming set fs must be successful if set gs succeeded. */
                     ASSERT(res >= 0);
                 }
@@ -613,7 +650,7 @@ tls_thread_preinit(void)
         ASSERT_BUG_NUM(3356, tls_global_type == TLS_TYPE_ARCH_PRCTL);
         return false;
     }
-    int res = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_SET_GS, NON_ZERO_UNINIT_GSBASE);
+    int res = tls_set_arch_prctl_base(SEG_GS, (byte *)NON_ZERO_UNINIT_GSBASE);
     LOG(GLOBAL, LOG_THREADS, 1,
         "%s: set non-zero pre-init gs base for thread " TIDFMT "\n", __FUNCTION__,
         get_sys_thread_id());
@@ -645,7 +682,7 @@ tls_thread_free(tls_type_t tls_type, int index)
             /* i#3356: We need a non-zero value for AMD */
             (proc_get_vendor() == VENDOR_AMD) ? (byte *)NON_ZERO_UNINIT_GSBASE : NULL;
         DEBUG_DECLARE(int res =)
-        dynamorio_syscall(SYS_arch_prctl, 2, ARCH_SET_GS, restore_base);
+        tls_set_arch_prctl_base(SEG_GS, restore_base);
         ASSERT(res >= 0);
         /* syscall re-sets gs register so caller must re-clear it */
     }
@@ -659,11 +696,6 @@ byte *
 tls_get_fs_gs_segment_base(uint seg)
 {
 #ifdef X86
-    uint selector = read_thread_register(seg);
-    uint index = SELECTOR_INDEX(selector);
-    LOG(THREAD_GET, LOG_THREADS, 4, "%s selector %x index %d ldt %d\n", __func__,
-        selector, index, TESTANY(SELECTOR_IS_LDT, selector));
-
     if (seg != SEG_FS && seg != SEG_GS)
         return (byte *)POINTER_MAX;
 
@@ -677,6 +709,11 @@ tls_get_fs_gs_segment_base(uint seg)
         return base;
     }
 #    endif
+
+    uint selector = read_thread_register(seg);
+    uint index = SELECTOR_INDEX(selector);
+    LOG(THREAD_GET, LOG_THREADS, 4, "%s selector %x index %d ldt %d\n", __func__,
+        selector, index, TESTANY(SELECTOR_IS_LDT, selector));
 
     if (TESTANY(SELECTOR_IS_LDT, selector)) {
         LOG(THREAD_GET, LOG_THREADS, 4, "selector is LDT\n");
@@ -759,23 +796,7 @@ tls_set_fs_gs_segment_base(tls_type_t tls_type, uint seg,
     switch (tls_type) {
 #    ifdef X64
     case TLS_TYPE_ARCH_PRCTL: {
-        /* ARCH_SET_* clears the selector and rejects non-user addresses.  Keep
-         * its behavior for descriptor-based TLS and unusual bases, including
-         * invalid inputs.  Ordinary 48-bit user bases with a zero selector can
-         * be switched entirely in user mode.  Reserve Linux's final guard page
-         * below 2^47; high five-level-paging addresses retain the syscall path.
-         */
-        if (os_fsgsbase_enabled() && read_thread_register(seg) == 0 &&
-            (ptr_uint_t)base < (((ptr_uint_t)1 << 47) - 4096)) {
-            if (seg == SEG_FS)
-                __asm__ volatile("wrfsbase %0" : : "r"(base) : "memory");
-            else
-                __asm__ volatile("wrgsbase %0" : : "r"(base) : "memory");
-            res = 0;
-            break;
-        }
-        int prctl_code = (seg == SEG_FS ? ARCH_SET_FS : ARCH_SET_GS);
-        res = dynamorio_syscall(SYS_arch_prctl, 2, prctl_code, base);
+        res = tls_set_arch_prctl_base(seg, base);
         ASSERT(res >= 0);
         break;
     }
@@ -896,9 +917,8 @@ os_set_dr_seg(dcontext_t *dcontext, reg_id_t seg)
 {
     int res;
     os_thread_data_t *ostd = dcontext->os_field;
-    res = dynamorio_syscall(SYS_arch_prctl, 2, seg == SEG_GS ? ARCH_SET_GS : ARCH_SET_FS,
-                            seg == SEG_GS ? ostd->priv_alt_tls_base
-                                          : ostd->priv_lib_tls_base);
+    res = tls_set_arch_prctl_base(
+        seg, seg == SEG_GS ? ostd->priv_alt_tls_base : ostd->priv_lib_tls_base);
     ASSERT(res >= 0);
 }
 
