@@ -7480,7 +7480,8 @@ dr_redirect_userspace_execution(dr_mcontext_t *mcontext, uint64 generation)
 
 DR_API
 size_t
-dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc)
+dr_encode_userspace_gate_at(byte *buffer, size_t capacity, app_pc application_pc,
+                            app_pc execution_pc)
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     /* ENDBR64; MOV GS:[spill],RAX; MOVABS RAX,app_pc; JMP [RIP]; entry-pointer. */
@@ -7488,8 +7489,8 @@ dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc)
                     0,    0,    0,    0x48, 0xb8, 0,    0,    0,    0,    0,
                     0,    0,    0,    0xff, 0x25, 0,    0,    0,    0,    0,
                     0,    0,    0,    0,    0,    0,    0 };
-    if (buffer == NULL || application_pc == NULL || capacity < sizeof(stub) ||
-        !is_dynamo_address(buffer) ||
+    if (buffer == NULL || application_pc == NULL || execution_pc == NULL ||
+        capacity < sizeof(stub) || !is_dynamo_address(buffer) ||
         TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask))
         return 0;
     uint spill = DIRECT_STUB_SPILL_SLOT;
@@ -7497,11 +7498,26 @@ dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc)
     memcpy(stub + 9, &spill, sizeof(spill));
     memcpy(stub + 15, &application_pc, sizeof(application_pc));
     memcpy(stub + 29, &entry, sizeof(entry));
+    const int64 displacement =
+        (int64)(ptr_int_t)entry - ((int64)(ptr_int_t)execution_pc + 28);
+    if (displacement >= INT_MIN && displacement <= INT_MAX) {
+        const int relative = (int)displacement;
+        stub[23] = 0xe9;
+        memcpy(stub + 24, &relative, sizeof(relative));
+        memset(stub + 28, 0x90, sizeof(stub) - 28);
+    }
     memcpy(buffer, stub, sizeof(stub));
     return sizeof(stub);
 #else
     return 0;
 #endif
+}
+
+DR_API
+size_t
+dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc)
+{
+    return dr_encode_userspace_gate_at(buffer, capacity, application_pc, buffer);
 }
 
 #if defined(LINUX) && defined(X86) && defined(X64)

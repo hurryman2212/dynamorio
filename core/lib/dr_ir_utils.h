@@ -1122,6 +1122,18 @@ dr_encode_userspace_gate(byte *buffer, size_t capacity, app_pc application_pc);
 
 DR_API
 /**
+ * Staging form of dr_encode_userspace_gate(). Encodes into writable DR-owned
+ * \p buffer for execution at \p execution_pc. The caller publishes the returned
+ * bytes at that exact address before allowing entry. Selects a direct relative
+ * jump to the runtime when reachable, otherwise retains the existing indirect
+ * gateway. The encoded size remains unchanged for both forms.
+ */
+size_t
+dr_encode_userspace_gate_at(byte *buffer, size_t capacity, app_pc application_pc,
+                            app_pc execution_pc);
+
+DR_API
+/**
  * Encodes a Linux x86-64 userspace gateway using separate address-binding slots.
  * It has the same entry requirements, state preservation, and signal semantics as
  * dr_encode_userspace_gate(), but embeds neither the original application PC nor
