@@ -1128,6 +1128,15 @@ struct _dcontext_t {
     volatile int64 client_userspace_generation;
     /* Nested signal lookups share this thread's read-side critical section. */
     volatile int client_userspace_lookup_depth;
+    /* Scalar keys, never registry pointers: retirement cannot leave dangling
+     * cache entries. The registry epoch invalidates address reuse globally.
+     */
+    struct {
+        app_pc return_pc;
+        app_pc original_pc;
+        uint64 epoch;
+        bool copied;
+    } client_userspace_call_cache[64];
     bool client_userspace_threads_suspended;
     uint64 client_userspace_request_generation;
     /* Keep the original continuation even if cancellation retires its mapping

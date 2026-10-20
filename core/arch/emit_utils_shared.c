@@ -2739,6 +2739,143 @@ emit_client_userspace_gate(dcontext_t *dcontext, generated_code_t *code, byte *p
     instrlist_clear(dcontext, &ilist);
     return vmcode_get_executable_addr(pc);
 }
+
+size_t
+encode_client_userspace_call_probe(byte *buffer, size_t capacity, app_pc execution_pc)
+{
+    dcontext_t *dcontext = GLOBAL_DCONTEXT;
+    generated_code_t *code = get_shared_gencode(dcontext, GENCODE_X64);
+    const bool absolute = false;
+    instrlist_t ilist;
+    instrlist_init(&ilist);
+    instr_t *fallback = INSTR_CREATE_label(dcontext);
+    APP(&ilist, INSTR_CREATE_endbr64(dcontext));
+    APP(&ilist, SAVE_TO_TLS(dcontext, REG_XAX, DIRECT_STUB_SPILL_SLOT));
+    /* CALL supplies the lookup key without a per-site MOVABS. Keep the pushed
+     * stack slot until RET; the C observer receives the pre-CALL application SP.
+     */
+    APP(&ilist,
+        INSTR_CREATE_mov_ld(dcontext, opnd_create_reg(REG_XAX),
+                            OPND_CREATE_MEMPTR(REG_XSP, 0)));
+    append_prepare_fcache_return(dcontext, code, &ilist, false, true);
+    APP(&ilist, SAVE_TO_DC(dcontext, REG_XAX, NEXT_TAG_OFFSET));
+    append_save_gpr(dcontext, &ilist, false, false, code, NULL, false);
+    APP(&ilist, RESTORE_FROM_DC(dcontext, REG_XSP, DSTACK_OFFSET));
+    append_save_clear_xflags(dcontext, &ilist, false);
+    append_save_simd_reg(dcontext, &ilist, false);
+    APP(&ilist,
+        INSTR_CREATE_lea(
+            dcontext, opnd_create_reg(REG_XAX),
+            OPND_CREATE_MEM_lea(REG_DCTXT, DR_REG_NULL, 0,
+                                offsetof(dcontext_t, client_userspace_fpstate) + 15)));
+    APP(&ilist,
+        INSTR_CREATE_and(dcontext, opnd_create_reg(REG_XAX), OPND_CREATE_INT8(-16)));
+    dr_insert_save_fpstate(dcontext, &ilist, NULL,
+                           opnd_create_base_disp(REG_XAX, DR_REG_NULL, 0, 0, OPSZ_512));
+    dr_insert_call_ex(dcontext, &ilist, NULL, execution_pc,
+                      (void *)client_userspace_call_observe, 1,
+                      opnd_create_reg(REG_DCTXT));
+    APP(&ilist, RESTORE_FROM_TLS(dcontext, REG_DCTXT, TLS_DCONTEXT_SLOT));
+    APP(&ilist,
+        INSTR_CREATE_test(dcontext, opnd_create_reg(DR_REG_AL),
+                          opnd_create_reg(DR_REG_AL)));
+    APP(&ilist, INSTR_CREATE_jcc(dcontext, OP_jz, opnd_create_instr(fallback)));
+    APP(&ilist,
+        INSTR_CREATE_lea(
+            dcontext, opnd_create_reg(REG_XAX),
+            OPND_CREATE_MEM_lea(REG_DCTXT, DR_REG_NULL, 0,
+                                offsetof(dcontext_t, client_userspace_fpstate) + 15)));
+    APP(&ilist,
+        INSTR_CREATE_and(dcontext, opnd_create_reg(REG_XAX), OPND_CREATE_INT8(-16)));
+    dr_insert_restore_fpstate(
+        dcontext, &ilist, NULL,
+        opnd_create_base_disp(REG_XAX, DR_REG_NULL, 0, 0, OPSZ_512));
+    append_restore_simd_reg(dcontext, &ilist, false);
+    append_restore_xflags(dcontext, &ilist, false);
+    append_restore_gpr(dcontext, &ilist, false);
+    APP(&ilist, INSTR_CREATE_ret(dcontext));
+    APP(&ilist, fallback);
+    /* Normal completion balances the probe with RET. A cancelled continuation
+     * must instead discard that one shadow-stack entry before entering DR.
+     * RDSSP leaves a zero destination unchanged when shadow stacks are disabled.
+     */
+    int features[4];
+    our_cpuid(features, 7, 0);
+    if (TESTANY(1U << 7, features[2])) {
+        instr_t *no_shadow = INSTR_CREATE_label(dcontext);
+        APP(&ilist,
+            INSTR_CREATE_xor(dcontext, opnd_create_reg(REG_XAX),
+                             opnd_create_reg(REG_XAX)));
+        APP(&ilist, INSTR_CREATE_rdssp(dcontext, opnd_create_reg(REG_XAX)));
+        APP(&ilist,
+            INSTR_CREATE_test(dcontext, opnd_create_reg(REG_XAX),
+                              opnd_create_reg(REG_XAX)));
+        APP(&ilist, INSTR_CREATE_jcc(dcontext, OP_jz, opnd_create_instr(no_shadow)));
+        APP(&ilist,
+            INSTR_CREATE_mov_imm(dcontext, opnd_create_reg(REG_XAX),
+                                 OPND_CREATE_INTPTR(1)));
+        APP(&ilist, INSTR_CREATE_incssp(dcontext, opnd_create_reg(REG_XAX)));
+        APP(&ilist, no_shadow);
+    }
+    /* All state is saved, so a non-returning indirect helper is safe when the
+     * regional probe cannot directly reach the runtime's C implementation.
+     */
+    /* The returning observer restored the aligned dstack. Supply the ordinary
+     * SysV return-address slot for this non-returning C tail entry. REG_DCTXT
+     * is RDI here and was reloaded after the observer clobbered caller saves.
+     */
+    ASSERT(REG_DCTXT == REG_XDI);
+    APP(&ilist, INSTR_CREATE_push_imm(dcontext, OPND_CREATE_INT8(0)));
+    const app_pc fallback_target = (app_pc)client_userspace_call_fallback;
+    const int64 fallback_distance =
+        (int64)(ptr_int_t)fallback_target - (int64)(ptr_int_t)execution_pc;
+    if (fallback_distance >= INT_MIN + 4096 && fallback_distance <= INT_MAX - 4096) {
+        APP(&ilist, INSTR_CREATE_jmp(dcontext, opnd_create_pc(fallback_target)));
+    } else {
+        APP(&ilist,
+            INSTR_CREATE_mov_imm(dcontext, opnd_create_reg(REG_XAX),
+                                 OPND_CREATE_INTPTR(fallback_target)));
+        APP(&ilist, INSTR_CREATE_jmp_ind(dcontext, opnd_create_reg(REG_XAX)));
+    }
+    /* SIMD save/restore uses a runtime AVX-512 activation byte. A regional
+     * probe can be far from that byte: all GPRs are saved at these two checks,
+     * so address it through a temporary instead of an out-of-range RIP load.
+     */
+    bool valid = true;
+    for (instr_t *in = instrlist_first(&ilist); in != NULL; in = instr_get_next(in)) {
+        for (int index = 0; index < instr_num_srcs(in); ++index) {
+            opnd_t operand = instr_get_src(in, index);
+            if ((!opnd_is_abs_addr(operand) && !opnd_is_rel_addr(operand)) ||
+                opnd_get_segment(operand) != DR_REG_NULL)
+                continue;
+            const app_pc address = opnd_get_addr(operand);
+            const int64 distance =
+                (int64)(ptr_int_t)address - (int64)(ptr_int_t)execution_pc;
+            if (distance >= INT_MIN + 4096 && distance <= INT_MAX - 4096)
+                continue;
+            if (instr_reads_from_reg(in, REG_XAX, DR_QUERY_DEFAULT) ||
+                instr_writes_to_reg(in, REG_XAX, DR_QUERY_DEFAULT)) {
+                valid = false;
+                break;
+            }
+            PRE(&ilist, in,
+                INSTR_CREATE_mov_imm(dcontext, opnd_create_reg(REG_XAX),
+                                     OPND_CREATE_INTPTR(address)));
+            instr_set_src(in, index,
+                          opnd_create_base_disp(REG_XAX, DR_REG_NULL, 0, 0,
+                                                opnd_get_size(operand)));
+        }
+    }
+    size_t size = 0;
+    for (instr_t *in = instrlist_first(&ilist); in != NULL; in = instr_get_next(in))
+        size += instr_length(dcontext, in);
+    byte *end = NULL;
+    if (valid && size <= capacity)
+        end =
+            instrlist_encode_to_copy(dcontext, &ilist, buffer, execution_pc, NULL, true);
+    instrlist_clear(dcontext, &ilist);
+    return end == NULL ? 0 : end - buffer;
+}
 #endif
 
 byte *
