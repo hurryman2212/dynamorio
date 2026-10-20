@@ -922,6 +922,45 @@ os_set_dr_seg(dcontext_t *dcontext, reg_id_t seg)
     ASSERT(res >= 0);
 }
 
+int
+tls_handle_app_set_gs(dcontext_t *dcontext, reg_t base)
+{
+    os_local_state_t *os_tls = get_os_tls();
+    os_thread_data_t *ostd = dcontext->os_field;
+    uint64 blocked = UINT64_MAX, previous = 0;
+    int result = dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &blocked,
+                                   &previous, sizeof(blocked));
+    if (result < 0)
+        return result;
+    /* The ordinary syscall exit stub itself reads DR's GS. Execute this rare
+     * application request here and restore private GS before reentering it.
+     * Keep the actual syscall's address validation and error semantics.
+     */
+    result = dynamorio_syscall(SYS_arch_prctl, 2, ARCH_SET_GS, base);
+    if (result == 0) {
+        const uint selector = read_thread_register(SEG_GS);
+        int restored = tls_set_arch_prctl_base(SEG_GS, ostd->priv_alt_tls_base);
+        if (restored < 0) {
+            /* No runtime helper is safe while its segment is unavailable. */
+            dynamorio_syscall(SYS_exit_group, 1, 1);
+            for (;;)
+                __asm__ volatile("pause");
+        }
+        os_tls->app_alt_tls_reg = selector;
+        os_tls->app_alt_tls_base = (void *)base;
+        our_modify_ldt_t *desc = ostd->app_thread_areas;
+        desc[GS_TLS].entry_number = tls_min_index() + GS_TLS;
+        dynamorio_syscall(SYS_get_thread_area, 1, &desc[GS_TLS]);
+    }
+    if (dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &previous, NULL,
+                          sizeof(previous)) != 0) {
+        dynamorio_syscall(SYS_exit_group, 1, 1);
+        for (;;)
+            __asm__ volatile("pause");
+    }
+    return result;
+}
+
 void
 tls_handle_post_arch_prctl(dcontext_t *dcontext, int code, reg_t base)
 {
