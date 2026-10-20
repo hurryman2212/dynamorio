@@ -83,6 +83,11 @@ os_thread_exit(dcontext_t *dcontext, bool other_thread);
 /* must only be called for the executing thread */
 void
 os_thread_under_dynamo(dcontext_t *dcontext);
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Check actual per-thread SHSTK state only at native takeover/activation boundaries. */
+void
+os_check_app_shadow_stack(dcontext_t *dcontext);
+#endif
 /* must only be called for the executing thread */
 void
 os_thread_not_under_dynamo(dcontext_t *dcontext, bool restore_sigblocked);

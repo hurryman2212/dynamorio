@@ -47,22 +47,20 @@
 #include "../globals.h"
 #include "../link.h"
 #include "../fragment.h"
-#include "../fcache.h"
-#include "../emit.h"
 
 #include "arch.h"
 #include "instr.h"
-#include "instr_create_shared.h"
-#include "instrlist.h"
-#include "instrument.h" /* for dr_insert_call() */
+#include "instr_create_shared.h" /* IWYU pragma: keep */ /* IR constructors. */
+#include "instrlist.h" /* IWYU pragma: keep */ /* IR list ownership and encoding. */
+#include "instrument.h"                        /* for dr_insert_call() */
 #include "proc.h"
-#include "decode.h"
-#include "decode_fast.h"
-#include "x86/decode_private.h"
+#include "decode.h" /* IWYU pragma: keep */      /* decode() in platform paths. */
+#include "decode_fast.h" /* IWYU pragma: keep */ /* decode_cti() on x86. */
 #ifdef DEBUG
 #    include "disassemble.h"
+#    include "../fcache.h" /* PAD_FRAGMENT_JMPS() in alignment assertions */
 #endif
-#include "limits_wrapper.h" /* for UCHAR_MAX */
+#include "limits_wrapper.h" /* IWYU pragma: keep */ /* INT/USHRT limits. */
 #include "../perscache.h"
 
 #ifdef VMX86_SERVER
@@ -401,8 +399,9 @@ is_exit_cti_patchable(dcontext_t *dcontext, instr_t *inst, uint frag_flags)
         /* whether has an inline stub or not, cti is always
          * patched if -no_indirect_stubs
          */
-        if (!DYNAMO_OPTION(indirect_stubs))
+        if (!DYNAMO_OPTION(indirect_stubs)) {
             return true;
+        }
 #ifdef WINDOWS
         if (target != shared_syscall_routine(dcontext)) {
 #endif
@@ -3159,8 +3158,8 @@ emit_coarse_exit_prefix(dcontext_t *dcontext, byte *pc, coarse_info_t *info)
 void
 patch_coarse_exit_prefix(dcontext_t *dcontext, coarse_info_t *info)
 {
-    ptr_uint_t *pc =
-        (ptr_uint_t *)(info->trace_head_return_prefix - JMP_LONG_LENGTH - sizeof(info));
+    ptr_uint_t *pc = (ptr_uint_t *)(info->trace_head_return_prefix - JMP_LONG_LENGTH -
+                                    sizeof(ptr_uint_t));
     *pc = (ptr_uint_t)info;
 }
 
@@ -5797,6 +5796,37 @@ emit_special_ibl_xfer(dcontext_t *dcontext, byte *pc, generated_code_t *code, ui
     } else {
         APP(&ilist, SAVE_TO_DC(dcontext, SCRATCH_REG2, SCRATCH_REG2_OFFS));
     }
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (index == NATIVE_PLT_IBL_IDX || index == NATIVE_RET_IBL_IDX) {
+        int features[4];
+        our_cpuid(features, 7, 0);
+        if (TESTANY(1U << 7, features[2])) {
+            instr_t *inactive = INSTR_CREATE_label(dcontext);
+            /* A native syscall can enable SHSTK without our syscall handler.
+             * RCX is already spilled and its IBL target is not loaded yet, so
+             * testing here preserves app flags without additional register swaps.
+             */
+            APP(&ilist,
+                INSTR_CREATE_mov_imm(dcontext, opnd_create_reg(DR_REG_ECX),
+                                     OPND_CREATE_INT32(0)));
+            APP(&ilist, INSTR_CREATE_rdssp(dcontext, opnd_create_reg(DR_REG_RCX)));
+            APP(&ilist, INSTR_CREATE_jecxz(dcontext, opnd_create_instr(inactive)));
+            /* Reject before any translated application instruction. The active
+             * path never returns and need not restore application registers.
+             */
+            insert_shared_get_dcontext(dcontext, &ilist, NULL, true);
+            APP(&ilist,
+                instr_create_restore_from_dc_via_reg(dcontext, REG_NULL, REG_XSP,
+                                                     DSTACK_OFFSET));
+            dr_insert_call_noreturn(dcontext, &ilist, NULL,
+                                    (void *)os_check_app_shadow_stack, 1,
+                                    opnd_create_reg(REG_DCTXT));
+            APP(&ilist, INSTR_CREATE_ud2a(dcontext));
+            APP(&ilist, inactive);
+        }
+    }
+#endif
 
     APP(&ilist, XINST_CREATE_load(dcontext, opnd_create_reg(SCRATCH_REG2), tgt));
 

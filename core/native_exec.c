@@ -46,12 +46,10 @@
 #include "../vmareas.h"
 #include "../module_shared.h"
 #include "arch_exports.h"
-#include "instr.h"
-#include "instrlist.h"
-#include "decode_fast.h"
-#include "monitor.h"
+#ifdef DEBUG
+#    include "monitor.h" /* is_building_trace() in the native-entry assertion */
+#endif
 
-#define PRE instrlist_preinsert
 /* list of native_exec module regions
  */
 vm_area_vector_t *native_exec_areas;
@@ -347,6 +345,10 @@ back_from_native_common(dcontext_t *dcontext, priv_mcontext_t *mc, app_pc target
      */
     if (IF_WINDOWS_ELSE(true, !DYNAMO_OPTION(native_exec_opt)))
         dynamo_thread_under_dynamo(dcontext);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    else
+        os_check_app_shadow_stack(dcontext);
+#endif
     /* XXX: setting same var that set_asynch_interception is! */
     dcontext->thread_record->under_dynamo_control = true;
 

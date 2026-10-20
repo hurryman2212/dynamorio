@@ -74,7 +74,6 @@
 #include <fcntl.h>
 #include "../globals.h"
 #include "../hashtable.h"
-#include "../native_exec.h"
 #include <unistd.h> /* for write and usleep and _exit */
 #include <limits.h>
 
@@ -198,9 +197,9 @@ char **our_environ;
 /* we define __set_errno below */
 
 /* must be prior to <link.h> => <elf.h> => INT*_{MIN,MAX} */
-#include "instr.h" /* for get_app_segment_base() */
+#include "instr.h" /* IWYU pragma: keep */ /* x86 segment instruction operands. */
 
-#include "decode_fast.h" /* decode_cti: maybe os_handle_mov_seg should be ifdef X86? */
+#include "decode_fast.h" /* IWYU pragma: keep */ /* os_handle_mov_seg() on x86. */
 
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -212,7 +211,7 @@ char **our_environ;
 #    include "../rct.h"
 #endif
 #ifdef LINUX
-#    include "include/syscall.h" /* our own local copy */
+#    include "include/syscall.h" /* IWYU pragma: keep */ /* Linux syscall ABI. */
 #    include "include/clone3.h"
 #    include "include/close_range.h"
 #else
@@ -359,6 +358,9 @@ static char **app_argv = NULL;
 static bool kernel_thread_groups;
 
 static bool kernel_64bit;
+#if defined(LINUX) && defined(X86) && defined(X64)
+static bool shadow_stack_supported;
+#endif
 
 pid_t pid_cached;
 
@@ -1135,6 +1137,11 @@ fcntl_syscall(int fd, int cmd, long arg)
 void
 d_r_os_init(void)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    int features[4];
+    our_cpuid(features, 7, 0);
+    shadow_stack_supported = TESTANY(1U << 7, features[2]);
+#endif
 #ifdef LINUX
     file_t inherited_procfs_root = INVALID_FILE;
     __atomic_store_n(&thread_creation_closed, false, __ATOMIC_SEQ_CST);
@@ -4132,10 +4139,38 @@ os_swap_context(dcontext_t *dcontext, bool to_app, dr_state_flags_t flags)
         os_swap_dr_tls(dcontext, to_app);
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+void
+os_check_app_shadow_stack(dcontext_t *dcontext)
+{
+    ptr_uint_t ssp = 0;
+    if (!shadow_stack_supported)
+        return;
+    /* RDSSP leaves the zero destination unchanged while SHSTK is disabled.
+     * CPUID and ELF properties indicate support, not this thread's state.
+     */
+    __asm__ __volatile__("rdsspq %0" : "+r"(ssp));
+    if (ssp != 0) {
+        /* Translated application CALL/RET currently use PUSH/POP and IBL.
+         * Continuing would bypass hardware return-address validation even
+         * though ARCH_SHSTK_STATUS still reports protection as enabled.
+         */
+        print_file(STDERR,
+                   "Error: DynamoRIO does not support tracing with active CET "
+                   "shadow stacks; application return-address protection cannot "
+                   "be preserved.\n");
+        os_terminate_with_code(dcontext, TERMINATE_PROCESS, FATAL_ERROR_EXIT_CODE);
+    }
+}
+#endif
+
 void
 os_thread_under_dynamo(dcontext_t *dcontext)
 {
     os_swap_context(dcontext, false /*to dr*/, DR_STATE_GO_NATIVE);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    os_check_app_shadow_stack(dcontext);
+#endif
     signal_swap_mask(dcontext, false /*to dr*/);
     start_itimer(dcontext);
 }
@@ -12010,6 +12045,12 @@ post_system_call(dcontext_t *dcontext)
 #endif
 #if defined(LINUX) && defined(X86) && defined(X64)
     case SYS_arch_prctl: {
+        /* Check a successful request before executing the next application
+         * instruction. Failed/unknown requests retain the kernel's errno;
+         * never fake a failure that lets the loader silently drop protection.
+         */
+        if (success && dcontext->sys_param0 == 0x5001 /* ARCH_SHSTK_ENABLE */)
+            os_check_app_shadow_stack(dcontext);
         if (success && INTERNAL_OPTION(mangle_app_seg)) {
             tls_handle_post_arch_prctl(dcontext, dcontext->sys_param0,
                                        dcontext->sys_param1);
