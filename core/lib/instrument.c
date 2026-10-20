@@ -42,25 +42,28 @@
 
 #include "../globals.h" /* just to disable warning C4206 about an empty file */
 
+/* Keep internal declarations and macros across DR build configurations: generated
+ * public declarations can hide their uses from include-cleaner in this file.
+ */
 #include "instrument.h"
 #include "instr.h"
-#include "instr_create_shared.h"
-#include "instrlist.h"
+#include "instr_create_shared.h" /* IWYU pragma: keep */
+#include "instrlist.h"           /* IWYU pragma: keep */
 #include "decode.h"
-#include "disassemble.h"
+#include "disassemble.h" /* IWYU pragma: keep */
 #include "dr_project_wide_defines.h"
 #include "dr_tools.h"
-#include "ir_utils.h"
+#include "ir_utils.h" /* IWYU pragma: keep */
 #include "../fragment.h"
 #include "../fragment_shared.h"
 #include "../fcache.h"
-#include "../emit.h"
+#include "../emit.h" /* IWYU pragma: keep */
 #include "../link.h"
 #include "../monitor.h"     /* for mark_trace_head */
-#include "stdarg_wrapper.h" /* for varargs */
+#include "stdarg_wrapper.h" /* IWYU pragma: keep */
 #include "../nudge.h"       /* for nudge_internal() */
 #include "../synch.h"
-#include "../annotations.h"
+#include "../annotations.h" /* IWYU pragma: keep */
 #include "../translate.h"
 #if defined(UNIX) && !defined(LINUX_KERNEL)
 #    include <sys/time.h>       /* ITIMER_* */
@@ -7575,6 +7578,32 @@ dr_userspace_gate_entry(void)
 
 DR_API
 bool
+dr_userspace_call_probe_direct_range(app_pc *lowest, app_pc *highest)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (standalone_library || lowest == NULL || highest == NULL ||
+        TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask))
+        return false;
+    const ptr_int_t helpers[] = { (ptr_int_t)client_userspace_call_observe,
+                                  (ptr_int_t)client_userspace_call_fallback };
+    ptr_int_t lower = 4096, upper = INTPTR_MAX - 4096;
+    for (size_t i = 0; i < BUFFER_SIZE_ELEMENTS(helpers); ++i) {
+        /* Match the encoder's conservative whole-body rel32 margin. */
+        lower = MAX(lower, helpers[i] - ((ptr_int_t)INT_MAX - 4096));
+        upper = MIN(upper, helpers[i] - ((ptr_int_t)INT_MIN + 4096));
+    }
+    if (lower > upper)
+        return false;
+    *lowest = (app_pc)lower;
+    *highest = (app_pc)upper;
+    return true;
+#else
+    return false;
+#endif
+}
+
+DR_API
+bool
 dr_register_userspace_call_probe(dr_userspace_call_probe_cb_t callback)
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
@@ -7666,7 +7695,7 @@ userspace_gate_ranges_overlap(ptr_uint_t left, size_t left_size, ptr_uint_t righ
 
 static bool
 userspace_bound_gate_image(byte stub[26], byte *buffer, app_pc *application_pc_slot,
-                           app_pc *runtime_entry_slot)
+                           app_pc *runtime_entry_slot, app_pc relay)
 {
     static const byte encoding[26] = { 0xf3, 0x0f, 0x1e, 0xfa, 0x65, 0x48, 0x89,
                                        0x04, 0x25, 0,    0,    0,    0,    0x48,
@@ -7694,6 +7723,15 @@ userspace_bound_gate_image(byte stub[26], byte *buffer, app_pc *application_pc_s
     }
     const uint spill = DIRECT_STUB_SPILL_SLOT;
     memcpy(stub + 9, &spill, sizeof(spill));
+    if (relay != NULL) {
+        const int64 distance = (int64)(ptr_int_t)relay - (int64)(code + 25);
+        if (distance < INT_MIN || distance > INT_MAX)
+            return false;
+        const int displacement = (int)distance;
+        stub[20] = 0xe9;
+        memcpy(stub + 21, &displacement, sizeof(displacement));
+        stub[25] = 0x90;
+    }
     return true;
 }
 #endif
@@ -7765,11 +7803,11 @@ dr_bind_userspace_gate_slots_bulk(const app_pc *application_pcs, size_t count,
 #endif
 }
 
-DR_API
-bool
-dr_encode_userspace_bound_gates(byte *buffer, size_t size,
-                                const dr_userspace_bound_gate_t *gates, size_t count,
-                                app_pc *application_pc_slots, app_pc *runtime_entry_slot)
+static bool
+encode_userspace_bound_gates(byte *buffer, size_t size,
+                             const dr_userspace_bound_gate_t *gates, size_t count,
+                             app_pc *application_pc_slots, app_pc *runtime_entry_slot,
+                             app_pc relay)
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     const ptr_uint_t code = (ptr_uint_t)buffer;
@@ -7805,14 +7843,15 @@ dr_encode_userspace_bound_gates(byte *buffer, size_t size,
         if (gates[i].application_pc == NULL || gates[i].offset < previous_end ||
             gates[i].offset > size - sizeof(stub) ||
             !userspace_bound_gate_image(stub, buffer + gates[i].offset,
-                                        &application_pc_slots[i], runtime_entry_slot))
+                                        &application_pc_slots[i], runtime_entry_slot,
+                                        relay))
             return false;
         previous_end = gates[i].offset + sizeof(stub);
     }
     /* The verified ranges and descriptors remain immutable until this returns. */
     for (size_t i = 0; i < count; ++i) {
         userspace_bound_gate_image(stub, buffer + gates[i].offset,
-                                   &application_pc_slots[i], runtime_entry_slot);
+                                   &application_pc_slots[i], runtime_entry_slot, relay);
         memcpy(buffer + gates[i].offset, stub, sizeof(stub));
         application_pc_slots[i] = gates[i].application_pc;
     }
@@ -7821,6 +7860,28 @@ dr_encode_userspace_bound_gates(byte *buffer, size_t size,
 #else
     return false;
 #endif
+}
+
+DR_API
+bool
+dr_encode_userspace_bound_gates(byte *buffer, size_t size,
+                                const dr_userspace_bound_gate_t *gates, size_t count,
+                                app_pc *application_pc_slots, app_pc *runtime_entry_slot)
+{
+    return encode_userspace_bound_gates(buffer, size, gates, count, application_pc_slots,
+                                        runtime_entry_slot, NULL);
+}
+
+DR_API
+bool
+dr_encode_userspace_bound_gates_direct(byte *buffer, size_t size,
+                                       const dr_userspace_bound_gate_t *gates,
+                                       size_t count, app_pc *application_pc_slots,
+                                       app_pc *runtime_entry_slot, app_pc relay)
+{
+    return relay != NULL &&
+        encode_userspace_bound_gates(buffer, size, gates, count, application_pc_slots,
+                                     runtime_entry_slot, relay);
 }
 
 DR_API
@@ -7845,8 +7906,8 @@ dr_encode_userspace_bound_gate(byte *buffer, size_t capacity, app_pc application
             userspace_gate_ranges_overlap(code, sizeof(stub), slots[i], sizeof(app_pc)))
             return 0;
     }
-    if (!userspace_bound_gate_image(stub, buffer, application_pc_slot,
-                                    runtime_entry_slot))
+    if (!userspace_bound_gate_image(stub, buffer, application_pc_slot, runtime_entry_slot,
+                                    NULL))
         return 0;
     if (!userspace_gate_writable_range(buffer, sizeof(stub)) ||
         !dr_bind_userspace_gate_slots(application_pc, application_pc_slot,

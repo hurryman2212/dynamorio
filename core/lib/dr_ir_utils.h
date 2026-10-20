@@ -989,6 +989,20 @@ dr_encode_userspace_bound_gates(byte *buffer, size_t size,
 
 DR_API
 /**
+ * Encodes the same fixed-size bound gates, with direct JMPs to \p relay instead
+ * of indirect runtime-slot loads. The caller supplies a private relay that
+ * forwards the saved-RAX/original-PC gateway state to dr_userspace_gate_entry().
+ * Every gate must reach the relay with rel32. All other batch validation and
+ * publication rules are identical to dr_encode_userspace_bound_gates().
+ */
+bool
+dr_encode_userspace_bound_gates_direct(byte *buffer, size_t size,
+                                       const dr_userspace_bound_gate_t *gates,
+                                       size_t count, app_pc *application_pc_slots,
+                                       app_pc *runtime_entry_slot, app_pc relay);
+
+DR_API
+/**
  * Batch form of dr_bind_userspace_gate_slots(), with no code emission. Copies
  * \p count non-NULL original PCs into consecutive writable DR-owned private
  * slots and sets the common runtime entry. Source/output arrays and runtime
@@ -1141,6 +1155,15 @@ DR_API
  */
 app_pc
 dr_userspace_gate_entry(void);
+
+DR_API
+/**
+ * Returns the inclusive range of regional CALL-probe start addresses from which
+ * both runtime C helpers can be reached directly. The range reserves room for
+ * the complete probe body. Other allocation constraints still apply.
+ */
+bool
+dr_userspace_call_probe_direct_range(app_pc *lowest, app_pc *highest);
 
 /** Observation callback for a returning managed-userspace CALL probe.
  * The supplied context uses the original application PC and stack pointer.
