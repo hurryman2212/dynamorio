@@ -1096,6 +1096,10 @@ typedef enum {
     /** A client JMP gateway re-entered the code cache from managed userspace execution.
      */
     DR_XFER_CLIENT_USERSPACE_GATE,
+    /** A returning CALL probe selected DR after its optional observation callback.
+     * The context is restored to the original PC and pre-probe stack pointer.
+     */
+    DR_XFER_CLIENT_USERSPACE_CALL_FALLBACK,
 } dr_kernel_xfer_type_t;
 
 /** Data structure passed for dr_register_kernel_xfer_event(). */

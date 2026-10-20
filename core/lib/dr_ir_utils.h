@@ -1134,6 +1134,55 @@ dr_encode_userspace_gate_at(byte *buffer, size_t capacity, app_pc application_pc
 
 DR_API
 /**
+ * Returns the common Linux x86-64 userspace gateway entry. Clients may use this
+ * address to choose a stub allocation reachable by both relative jumps. Returns
+ * NULL when managed userspace gateways are unavailable. The entry is owned by
+ * DynamoRIO and remains valid for the runtime lifetime.
+ */
+app_pc
+dr_userspace_gate_entry(void);
+
+/** Observation callback for a returning managed-userspace CALL probe.
+ * The supplied context uses the original application PC and stack pointer.
+ * Return true only after observing the instruction and verifying its native
+ * continuation remains eligible. Return false to resume through DR.
+ * Do not redirect execution or retain the context pointer from this callback.
+ */
+typedef bool (*dr_userspace_call_probe_cb_t)(void *drcontext, dr_mcontext_t *mcontext);
+
+DR_API
+/** Registers the returning CALL observer before application execution starts.
+ * Passing NULL removes it after all managed application execution has stopped.
+ */
+bool
+dr_register_userspace_call_probe(dr_userspace_call_probe_cb_t callback);
+
+DR_API
+/**
+ * Emits a complete shared CALL probe body for execution at \p execution_pc.
+ * All callers must prove the pushed return-address slot is writable and dead.
+ * A copied call must return to an instruction registered with
+ * dr_register_userspace_code(). The probe identifies that original instruction
+ * by its return address, observes it, and normally restores state and RETs.
+ * Signal delivery, cancellation or observer rejection takes the DR fallback.
+ * The caller owns the unpublished DR allocation and its quiescent lifetime.
+ */
+size_t
+dr_encode_userspace_call_probe(byte *buffer, size_t capacity, app_pc execution_pc);
+
+DR_API
+/**
+ * Registers an original-address CALL gate's return-address lookup. Unlike a
+ * copied-code mapping this does not translate normal execution at return_pc.
+ * The gate always resumes through DR to replay preserved original instructions.
+ * Retire with dr_unregister_userspace_code() only after gate removal and
+ * cancellation of every suspended managed execution.
+ */
+dr_userspace_code_t *
+dr_register_userspace_call_site(app_pc return_pc, app_pc original_pc);
+
+DR_API
+/**
  * Encodes a Linux x86-64 userspace gateway using separate address-binding slots.
  * It has the same entry requirements, state preservation, and signal semantics as
  * dr_encode_userspace_gate(), but embeds neither the original application PC nor

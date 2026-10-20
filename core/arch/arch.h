@@ -1110,6 +1110,8 @@ byte *
 emit_client_userspace_gate(dcontext_t *dcontext, generated_code_t *code, byte *pc);
 cache_pc
 client_userspace_gate_routine(void);
+size_t
+encode_client_userspace_call_probe(byte *buffer, size_t capacity, app_pc execution_pc);
 #endif
 fcache_enter_func_t
 fcache_enter_shared_routine(dcontext_t *dcontext);

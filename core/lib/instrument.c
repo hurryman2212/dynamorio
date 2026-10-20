@@ -137,6 +137,7 @@ struct _dr_userspace_code_t {
     app_pc end;
     size_t count;
     uint64 generation;
+    bool call_site;
     dr_userspace_pc_mapping_t mappings[];
 };
 
@@ -148,6 +149,8 @@ struct _dr_userspace_code_t {
 DECLARE_CXTSWPROT_VAR(static dr_userspace_code_t *userspace_code, NULL);
 DECLARE_CXTSWPROT_VAR(static dr_userspace_code_t *userspace_code_retired, NULL);
 DECLARE_CXTSWPROT_VAR(static ptr_uint_t userspace_code_handle, 0);
+DECLARE_CXTSWPROT_VAR(static dr_userspace_call_probe_cb_t userspace_call_probe, NULL);
+static uint64 userspace_code_epoch = 1;
 /* Bootstrap/standalone lookups without a real dcontext remain supported. */
 static volatile int userspace_code_bootstrap_readers;
 
@@ -7311,11 +7314,10 @@ dr_userspace_execution_generation(void *drcontext)
     return 0;
 }
 
-DR_API
-dr_userspace_code_t *
-dr_register_userspace_code(app_pc copy, size_t size,
-                           const dr_userspace_pc_mapping_t *mappings, size_t count,
-                           uint64 generation)
+static dr_userspace_code_t *
+register_userspace_code(app_pc copy, size_t size,
+                        const dr_userspace_pc_mapping_t *mappings, size_t count,
+                        uint64 generation, bool call_site)
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     if (copy == NULL || size == 0 || size > POINTER_MAX - (ptr_uint_t)copy ||
@@ -7337,12 +7339,14 @@ dr_register_userspace_code(app_pc copy, size_t size,
     record->end = copy + size;
     record->count = count;
     record->generation = generation;
+    record->call_site = call_site;
     record->retired_next = NULL;
     memcpy(record->mappings, mappings, count * sizeof(*mappings));
     d_r_write_lock(&callback_registration_lock);
     for (dr_userspace_code_t *other = userspace_code; other != NULL;
          other = other->next) {
-        if (copy < other->end && record->end > other->begin) {
+        if (call_site == other->call_site && copy < other->end &&
+            record->end > other->begin) {
             d_r_write_unlock(&callback_registration_lock);
             heap_free(GLOBAL_DCONTEXT, record, allocation_size HEAPACCT(ACCT_CLIENT));
             return NULL;
@@ -7356,12 +7360,32 @@ dr_register_userspace_code(app_pc copy, size_t size,
     record->handle = ++userspace_code_handle;
     record->next = userspace_code;
     __atomic_store_n(&userspace_code, record, __ATOMIC_SEQ_CST);
+    /* Zero permanently disables caches on wrap, rather than reusing an epoch. */
+    if (__atomic_load_n(&userspace_code_epoch, __ATOMIC_RELAXED) != 0)
+        __atomic_add_fetch(&userspace_code_epoch, 1, __ATOMIC_RELEASE);
     dr_userspace_code_t *handle = (dr_userspace_code_t *)record->handle;
     d_r_write_unlock(&callback_registration_lock);
     return handle;
 #else
     return NULL;
 #endif
+}
+
+DR_API
+dr_userspace_code_t *
+dr_register_userspace_code(app_pc copy, size_t size,
+                           const dr_userspace_pc_mapping_t *mappings, size_t count,
+                           uint64 generation)
+{
+    return register_userspace_code(copy, size, mappings, count, generation, false);
+}
+
+DR_API
+dr_userspace_code_t *
+dr_register_userspace_call_site(app_pc return_pc, app_pc original_pc)
+{
+    const dr_userspace_pc_mapping_t mapping = { 0, 1, original_pc };
+    return register_userspace_code(return_pc, 1, &mapping, 1, 1, true);
 }
 
 DR_API
@@ -7380,6 +7404,8 @@ dr_unregister_userspace_code(dr_userspace_code_t *code)
             __atomic_store_n(link, record->next, __ATOMIC_SEQ_CST);
             record->retired_next = userspace_code_retired;
             userspace_code_retired = record;
+            if (__atomic_load_n(&userspace_code_epoch, __ATOMIC_RELAXED) != 0)
+                __atomic_add_fetch(&userspace_code_epoch, 1, __ATOMIC_RELEASE);
             found = true;
             break;
         }
@@ -7392,9 +7418,8 @@ dr_unregister_userspace_code(dr_userspace_code_t *code)
 #endif
 }
 
-DR_API
-bool
-dr_lookup_userspace_code(app_pc pc, app_pc *original_pc, uint64 *generation)
+static bool
+lookup_userspace_code(app_pc pc, app_pc *original_pc, uint64 *generation, bool call_site)
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     dcontext_t *dcontext = get_thread_private_dcontext();
@@ -7405,7 +7430,7 @@ dr_lookup_userspace_code(app_pc pc, app_pc *original_pc, uint64 *generation)
     bool found = false;
     dr_userspace_code_t *record = __atomic_load_n(&userspace_code, __ATOMIC_SEQ_CST);
     for (; record != NULL; record = __atomic_load_n(&record->next, __ATOMIC_SEQ_CST)) {
-        if (pc < record->begin || pc >= record->end)
+        if (call_site != record->call_site || pc < record->begin || pc >= record->end)
             continue;
         const size_t offset = pc - record->begin;
         size_t first = 0, last = record->count;
@@ -7433,6 +7458,63 @@ dr_lookup_userspace_code(app_pc pc, app_pc *original_pc, uint64 *generation)
 #endif
     return false;
 }
+
+DR_API
+bool
+dr_lookup_userspace_code(app_pc pc, app_pc *original_pc, uint64 *generation)
+{
+    return lookup_userspace_code(pc, original_pc, generation, false);
+}
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+static bool
+lookup_userspace_call(dcontext_t *dcontext, app_pc pc, app_pc *original, bool *copied)
+{
+    const size_t index = ((ptr_uint_t)pc ^ ((ptr_uint_t)pc >> 11)) %
+        BUFFER_SIZE_ELEMENTS(dcontext->client_userspace_call_cache);
+    const uint64 epoch = __atomic_load_n(&userspace_code_epoch, __ATOMIC_ACQUIRE);
+    if (epoch != 0 && dcontext->client_userspace_call_cache[index].epoch == epoch &&
+        dcontext->client_userspace_call_cache[index].return_pc == pc) {
+        *original = dcontext->client_userspace_call_cache[index].original_pc;
+        *copied = dcontext->client_userspace_call_cache[index].copied;
+        return true;
+    }
+    bool found = false;
+    __atomic_add_fetch(&dcontext->client_userspace_lookup_depth, 1, __ATOMIC_SEQ_CST);
+    for (dr_userspace_code_t *record = __atomic_load_n(&userspace_code, __ATOMIC_SEQ_CST);
+         record != NULL; record = __atomic_load_n(&record->next, __ATOMIC_SEQ_CST)) {
+        if (pc < record->begin || pc >= record->end)
+            continue;
+        const size_t offset = pc - record->begin;
+        size_t first = 0, last = record->count;
+        while (first < last) {
+            const size_t middle = first + (last - first) / 2;
+            if (record->mappings[middle].offset <= offset)
+                first = middle + 1;
+            else
+                last = middle;
+        }
+        if (first == 0 ||
+            offset - record->mappings[first - 1].offset >=
+                record->mappings[first - 1].length)
+            continue;
+        *original = record->mappings[first - 1].original_pc;
+        *copied = !record->call_site;
+        found = true;
+        if (record->call_site)
+            break;
+    }
+    __atomic_sub_fetch(&dcontext->client_userspace_lookup_depth, 1, __ATOMIC_SEQ_CST);
+    if (found && epoch != 0 &&
+        epoch == __atomic_load_n(&userspace_code_epoch, __ATOMIC_ACQUIRE)) {
+        dcontext->client_userspace_call_cache[index].return_pc = pc;
+        dcontext->client_userspace_call_cache[index].original_pc = *original;
+        dcontext->client_userspace_call_cache[index].copied = *copied;
+        dcontext->client_userspace_call_cache[index].epoch = epoch;
+    }
+    return found;
+}
+#endif
 
 DR_API
 bool
@@ -7476,6 +7558,48 @@ dr_redirect_userspace_execution(dr_mcontext_t *mcontext, uint64 generation)
     }
 #endif
     return false;
+}
+
+DR_API
+app_pc
+dr_userspace_gate_entry(void)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (standalone_library || TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask))
+        return NULL;
+    return client_userspace_gate_routine();
+#else
+    return NULL;
+#endif
+}
+
+DR_API
+bool
+dr_register_userspace_call_probe(dr_userspace_call_probe_cb_t callback)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (standalone_library || TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask))
+        return false;
+    __atomic_store_n(&userspace_call_probe, callback, __ATOMIC_RELEASE);
+    return true;
+#else
+    return false;
+#endif
+}
+
+DR_API
+size_t
+dr_encode_userspace_call_probe(byte *buffer, size_t capacity, app_pc execution_pc)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (standalone_library || buffer == NULL || execution_pc == NULL ||
+        !is_dynamo_address(buffer) ||
+        TESTANY(SELFPROT_DCONTEXT, dynamo_options.protect_mask))
+        return 0;
+    return encode_client_userspace_call_probe(buffer, capacity, execution_pc);
+#else
+    return 0;
+#endif
 }
 
 DR_API
@@ -7737,6 +7861,75 @@ dr_encode_userspace_bound_gate(byte *buffer, size_t capacity, app_pc application
 }
 
 #if defined(LINUX) && defined(X86) && defined(X64)
+bool
+client_userspace_call_observe(dcontext_t *dcontext)
+{
+    os_swap_context(dcontext, false, DR_STATE_ALL);
+    ENTERING_DR();
+    dcontext->client_userspace_active = false;
+    dcontext->client_userspace_fpstate_valid = true;
+    priv_mcontext_t *mc = get_mcontext(dcontext);
+    const app_pc continuation = dcontext->next_tag;
+    app_pc original = NULL;
+    const uint64 generation =
+        (uint64)atomic_aligned_read_int64(&dcontext->client_userspace_generation);
+    const reg_t probe_sp = mc->xsp;
+    mc->xsp += sizeof(app_pc);
+    bool copied = false;
+    if (!lookup_userspace_call(dcontext, continuation, &original, &copied)) {
+        CLIENT_ASSERT(false, "CALL probe return address has no registered continuation");
+        dr_abort();
+    }
+    mc->pc = original;
+    dcontext->next_tag = original;
+    dcontext->client_userspace_original_pc = original;
+    dr_userspace_call_probe_cb_t callback =
+        __atomic_load_n(&userspace_call_probe, __ATOMIC_ACQUIRE);
+    dr_mcontext_t observed = { sizeof(observed), DR_MC_ALL };
+    bool resume = false;
+    if (callback != NULL && priv_mcontext_to_dr_mcontext(&observed, mc)) {
+        dcontext->client_data->cur_mc = mc;
+        resume = callback(dcontext, &observed);
+        dcontext->client_data->cur_mc = NULL;
+        dr_mcontext_to_priv_mcontext(mc, &observed);
+    }
+    resume = copied && resume && mc->pc == original &&
+        mc->xsp == probe_sp + sizeof(app_pc) && dcontext->signals_pending == 0 &&
+        generation ==
+            (uint64)atomic_aligned_read_int64(&dcontext->client_userspace_generation);
+    if (!resume)
+        return false;
+    dcontext->client_userspace_active = true;
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (generation !=
+        (uint64)atomic_aligned_read_int64(&dcontext->client_userspace_generation)) {
+        dcontext->client_userspace_active = false;
+        return false;
+    }
+    mc->xsp = probe_sp;
+    dcontext->client_userspace_request_pc = NULL;
+    dcontext->client_userspace_fpstate_valid = false;
+    dcontext->asynch_target = original;
+    EXITING_DR();
+    os_swap_context(dcontext, true, DR_STATE_ALL);
+    return true;
+}
+
+void
+client_userspace_call_fallback(dcontext_t *dcontext)
+{
+    priv_mcontext_t *mc = get_mcontext(dcontext);
+    dr_mcontext_t source = { sizeof(source), DR_MC_ALL };
+    priv_mcontext_to_dr_mcontext(&source, mc);
+    instrument_kernel_xfer(dcontext, DR_XFER_CLIENT_USERSPACE_CALL_FALLBACK, osc_empty,
+                           &source, NULL, mc->pc, mc->xsp, osc_empty, mc, 0);
+    dcontext->next_tag = mc->pc;
+    set_last_exit(dcontext, (linkstub_t *)get_client_linkstub());
+    dcontext->whereami = DR_WHERE_FCACHE;
+    d_r_dispatch(dcontext);
+    CLIENT_ASSERT(false, "CALL probe fallback returned");
+}
+
 void
 client_userspace_gate_dispatch(dcontext_t *dcontext)
 {

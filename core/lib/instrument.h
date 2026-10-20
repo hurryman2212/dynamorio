@@ -163,6 +163,10 @@ instrument_kernel_xfer(dcontext_t *dcontext, dr_kernel_xfer_type_t type,
 /* Entered on dstack with all application state captured by the userspace gateway. */
 void
 client_userspace_gate_dispatch(dcontext_t *dcontext);
+bool
+client_userspace_call_observe(dcontext_t *dcontext);
+void
+client_userspace_call_fallback(dcontext_t *dcontext);
 #endif
 
 void
