@@ -10854,9 +10854,16 @@ pre_system_call(dcontext_t *dcontext)
 
 #    if defined(X86) && defined(X64)
     case SYS_arch_prctl: {
-        /* we handle arch_prctl in post_syscall */
         dcontext->sys_param0 = sys_param(dcontext, 0);
         dcontext->sys_param1 = sys_param(dcontext, 1);
+        if (dcontext->sys_param0 == ARCH_SET_GS && INTERNAL_OPTION(mangle_app_seg)) {
+            const int result = tls_handle_app_set_gs(dcontext, dcontext->sys_param1);
+            if (result < 0)
+                set_failure_return_val(dcontext, -result);
+            else
+                set_success_return_val(dcontext, result);
+            execute_syscall = false;
+        }
         break;
     }
 #    endif
