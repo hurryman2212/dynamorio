@@ -45,9 +45,9 @@
 #include "../fcache.h"
 #include "arch.h"
 #include "instr.h"
-#include "instr_create_shared.h"
-#include "instrlist.h"
-#include "instrument.h" /* for dr_insert_call() */
+#include "instr_create_shared.h" /* IWYU pragma: keep (instruction constructors) */
+#include "instrlist.h"           /* IWYU pragma: keep (instruction API) */
+#include "instrument.h"          /* IWYU pragma: keep (dr_insert_call) */
 
 #include "decode_private.h"
 
@@ -343,7 +343,7 @@ insert_jmp_to_ibl(byte *pc, fragment_t *f, linkstub_t *l, cache_pc exit_target,
          */
     } else {
         *((ptr_uint_t *)pc) = (ptr_uint_t)l;
-        pc += sizeof(l);
+        pc += sizeof(ptr_uint_t);
     }
     pc = vmcode_get_executable_addr(pc);
 
@@ -375,6 +375,23 @@ nop_pad_ilist(dcontext_t *dcontext, fragment_t *f, instrlist_t *ilist, bool emit
     for (inst = instrlist_first(ilist); inst != NULL; inst = instr_get_next(inst)) {
         /* don't support non exit cti patchable instructions yet */
         ASSERT_NOT_IMPLEMENTED(!TESTANY(INSTR_HOT_PATCHABLE, inst->flags));
+        instr_t *next = instr_get_next(inst);
+        uint length;
+        if (emitting && instr_ok_to_emit(inst) && next != NULL &&
+            next->offset >= inst->offset) {
+            /* The emitter's sizing pass already encoded meta instructions to
+             * find their lengths. Both offsets still refer to that unpadded
+             * list: read the difference before replacing the current offset.
+             * Inserted NOPs are handled below and never enter this traversal.
+             */
+            length = next->offset - inst->offset;
+            ASSERT(length == instr_length(dcontext, inst));
+        } else {
+            /* Reconstruction has no sizing pass; the final instruction has no
+             * following coordinate. Preserve both ordinary length queries.
+             */
+            length = instr_length(dcontext, inst);
+        }
         if (instr_is_exit_cti(inst)) {
             /* see if we need to be able to patch this instruction */
             if (is_exit_cti_patchable(dcontext, inst, f->flags)) {
@@ -395,8 +412,7 @@ nop_pad_ilist(dcontext_t *dcontext, fragment_t *f, instrlist_t *ilist, bool emit
                      * mangles to two patchable exits and is still safe since
                      * they are less then a cache line apart) */
                     if (PAD_JMPS_SHIFT_START(f->flags) &&
-                        offset + instr_length(dcontext, inst) - first_patch_offset <
-                            PAD_JMPS_ALIGNMENT) {
+                        offset + length - first_patch_offset < PAD_JMPS_ALIGNMENT) {
                         ASSERT(start_shift == 0); /* should only shift once */
                         start_shift = nop_length;
                         /* adjust the starting_pc, all previously checked
@@ -444,7 +460,7 @@ nop_pad_ilist(dcontext_t *dcontext, fragment_t *f, instrlist_t *ilist, bool emit
         }
         if (emitting)
             inst->offset = offset; /* used by instr_encode */
-        offset += instr_length(dcontext, inst);
+        offset += length;
     }
     return start_shift;
 }
@@ -682,7 +698,7 @@ insert_exit_stub_other_flags(dcontext_t *dcontext, fragment_t *f, linkstub_t *l,
             *(vmcode_get_writable_addr(pc)) = MOV_IMM2XAX_OPCODE;
             pc++;
             *((ptr_uint_t *)vmcode_get_writable_addr(pc)) = (ptr_uint_t)l;
-            pc += sizeof(l);
+            pc += sizeof(ptr_uint_t);
 
 #ifdef X64
         }
@@ -861,8 +877,9 @@ unlink_indirect_exit(dcontext_t *dcontext, fragment_t *f, linkstub_t *l)
     ASSERT(linkstub_owned_by_fragment(dcontext, f, l));
     ASSERT(LINKSTUB_INDIRECT(l->flags));
     /* target is always the same, so if it's already unlinked, this is a nop */
-    if (!TESTANY(LINK_LINKED, l->flags))
+    if (!TESTANY(LINK_LINKED, l->flags)) {
         return;
+    }
 
 #ifdef WINDOWS
     if (!is_shared_syscall_routine(dcontext, target_tag)) {

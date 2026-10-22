@@ -45,16 +45,15 @@
 #include "fragment_shared.h"
 #include "fcache.h"
 #include "proc.h"
-#include "instrlist.h"
+#include "instrlist.h" /* IWYU pragma: keep (instruction API) */
 #include "emit.h"
-#include "instrlist.h"
 #include "instr.h"
-#include "instr_create_shared.h"
-#include "monitor.h"
-#include "translate.h"
+#include "instr_create_shared.h" /* IWYU pragma: keep (other ISAs) */
+#include "monitor.h"             /* IWYU pragma: keep (debug lock assertions) */
+#include "translate.h"           /* IWYU pragma: keep (internal recreate checks) */
 
 #ifdef DEBUG
-#    include "decode_fast.h" /* for decode_next_pc for stress_recreate_pc */
+#    include "decode_fast.h" /* IWYU pragma: keep (internal stress_recreate_pc) */
 #endif
 
 #define STATS_FCACHE_ADD(flags, stat, val)                  \
@@ -415,7 +414,7 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
 
     /* 1st walk through instr list:
      * -- determine body size and number of exit stubs required;
-     * -- if not padding jmps sets offsets as well
+     * -- save offsets for encoding or the later jump-padding pass
      */
     ASSERT(instrlist_first(ilist) != NULL);
     isa_mode = instr_get_isa_mode(instrlist_first(ilist));
@@ -443,10 +442,10 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
          */
         IF_X64(CLIENT_ASSERT(instr_get_isa_mode(inst) == isa_mode,
                              "single fragment cannot mix x86 and x64 modes"));
-        if (!PAD_FRAGMENT_JMPS(flags)) {
-            /* We're going to skip the 2nd pass; save the offset for instr_encode. */
-            inst->offset = offset;
-        }
+        /* Padding can reuse these lengths before replacing each offset with
+         * its final coordinate. Without padding these are already final.
+         */
+        inst->offset = offset;
         if (instr_ok_to_emit(inst))
             offset += instr_length(dcontext, inst);
         ASSERT_NOT_IMPLEMENTED(!TESTANY(INSTR_HOT_PATCHABLE, inst->flags));
