@@ -1764,11 +1764,15 @@ shared_encode_template(dcontext_t *dcontext, byte *original_pc, const byte *orig
         shared_instruction_t *node = &nodes[i];
         byte *original = (byte *)original_copy + node->original;
         byte *body = mapping + node->body;
-        instr_reset(dcontext, &decoded);
-        decode_from_copy(dcontext, original, original_pc + node->original, &decoded);
         if (node->kind == SHARED_COPY) {
             memcpy(body, original, node->length);
             continue;
+        }
+        /* COPY bytes and compact private jumps need no decoded operands. The
+         * node plan has already been validated against the original emission. */
+        if (!compact_bindings || node->kind != SHARED_PRIVATE) {
+            instr_reset(dcontext, &decoded);
+            decode_from_copy(dcontext, original, original_pc + node->original, &decoded);
         }
         if (node->kind == SHARED_PRIVATE || node->kind == SHARED_EXIT)
             node->island += island_base;
@@ -2101,7 +2105,7 @@ shared_publish(dcontext_t *dcontext, fragment_t *fragment, instrlist_t *ilist,
     if (saved_nodes == NULL) {
         for (instr_t *inst = instrlist_first(ilist); inst != NULL;
              inst = instr_get_next(inst)) {
-            if (!instr_ok_to_emit(inst) || instr_length(dcontext, inst) == 0)
+            if (!instr_ok_to_emit(inst) || instr_is_label(inst))
                 continue;
             if (!instr_is_ubr(inst) && !instr_is_cbr(inst)) {
                 for (int i = 0; i < instr_num_srcs(inst); ++i) {
@@ -2141,9 +2145,36 @@ shared_publish(dcontext_t *dcontext, fragment_t *fragment, instrlist_t *ilist,
         uint index = 0;
         for (instr_t *inst = instrlist_first(ilist); inst != NULL;
              inst = instr_get_next(inst)) {
-            uint length = instr_ok_to_emit(inst) ? instr_length(dcontext, inst) : 0;
-            if (length == 0)
+            if (!instr_ok_to_emit(inst) || instr_is_label(inst))
                 continue;
+            /* The ordinary emitter already assigned final offsets, including
+             * branch-alignment NOPs. Asking instr_length again re-encodes meta
+             * instructions into temporary reachable allocations. Reuse those
+             * coordinates; shared_prepare_nodes still decodes and validates
+             * every instruction against the bytes actually emitted below.
+             */
+            if (original_offset < fragment->prefix_size ||
+                inst->offset != original_offset - fragment->prefix_size ||
+                original_offset >= fragment->size)
+                goto free_nodes;
+            instr_t *next = instr_get_next(inst);
+            while (next != NULL && (!instr_ok_to_emit(next) || instr_is_label(next)))
+                next = instr_get_next(next);
+            uint length;
+            if (next != NULL) {
+                if (next->offset <= inst->offset)
+                    goto free_nodes;
+                length = next->offset - inst->offset;
+            } else {
+                /* The first exit stub can have alignment padding after the
+                 * last ilist instruction. Keep the ordinary length query for
+                 * this one instruction instead of using the stub's offset.
+                 */
+                length = instr_length(dcontext, inst);
+            }
+            if (length == 0 || length > fragment->size - original_offset)
+                goto free_nodes;
+            ASSERT(length == instr_length(dcontext, inst));
             shared_instruction_t *node = &nodes[index++];
             node->original = (ushort)original_offset;
             node->length = (ushort)length;
