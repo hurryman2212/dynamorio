@@ -45,12 +45,8 @@
 
 #include "arch.h"
 #include "instr.h"
-#include "instr_create_shared.h"
 #include "decode.h"
-#include "decode_fast.h"
-#include "../fcache.h"
 #include "proc.h"
-#include "instrument.h"
 
 #if defined(DEBUG) || defined(INTERNAL)
 #    include "disassemble.h"
@@ -3473,8 +3469,18 @@ dr_mcontext_to_priv_mcontext(priv_mcontext_t *dst, dr_mcontext_t *src)
     /* We assume fields from xdi onward are identical. */
     if (src->size > sizeof(dr_mcontext_t))
         return false;
+#ifdef X86
+    /* Public padding is not evidence of a captured upper-register state. Leave
+     * an existing private capture intact for integer/control-only edits.
+     */
+    if (TESTANY(DR_MC_MULTIMEDIA, src->flags))
+        dst->padding[0] = SIMD_UPPER_UNKNOWN;
+#endif
     if (TESTALL(DR_MC_ALL, src->flags) && src->size == sizeof(dr_mcontext_t)) {
         *dst = *(priv_mcontext_t *)(&MCXT_FIRST_REG_FIELD(src));
+#ifdef X86
+        dst->padding[0] = SIMD_UPPER_UNKNOWN;
+#endif
     } else {
         if (TESTANY(DR_MC_INTEGER, src->flags)) {
             /* xsp is in the middle of the mcxt, so we save dst->xsp here and
@@ -3675,6 +3681,11 @@ priv_mcontext_to_dr_mcontext(dr_mcontext_t *dst, priv_mcontext_t *src)
 #endif
         }
     }
+    /* Do not export private provenance as client-writable input state. */
+#ifdef X86
+    if (dst->size > offsetof(dr_mcontext_t, padding))
+        dst->padding[0] = SIMD_UPPER_UNKNOWN;
+#endif
     return true;
 }
 
@@ -3696,6 +3707,9 @@ dr_mcontext_init(dr_mcontext_t *mc)
 {
     mc->size = sizeof(dr_mcontext_t);
     mc->flags = DR_MC_ALL;
+#ifdef X86
+    mc->padding[0] = SIMD_UPPER_UNKNOWN;
+#endif
 }
 
 /* dumps the context */

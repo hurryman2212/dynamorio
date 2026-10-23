@@ -39,9 +39,9 @@
  * asm_aux.c - auxiliary C routines to assembly routines in <arch>.asm
  */
 #include "../globals.h"
-#include "../fragment.h"
+#include "../fragment.h" // IWYU pragma: keep
 #include "../dispatch.h"
-#include "../monitor.h"
+#include "../monitor.h" // IWYU pragma: keep
 #include "arch.h"
 #if defined(LINUX) && defined(X86) && defined(X64)
 #    include "../unix/stdio_roles.h"
@@ -54,6 +54,15 @@ void
 get_simd_vals(priv_mcontext_t *mc)
 {
 #ifdef X86
+    mc->padding[0] = SIMD_UPPER_UNKNOWN;
+#    if defined(LINUX) && defined(X64)
+    if (proc_xstate_inuse_enabled() && proc_num_simd_sse_avx_saved() == 16) {
+        uint low, high;
+        asm volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(1));
+        mc->padding[0] = TESTANY(XCR0_AVX | XCR0_ZMM_HI256, low) ? SIMD_UPPER_ACTIVE
+                                                                 : SIMD_UPPER_CLEAN;
+    }
+#    endif
     if (preserve_xmm_caller_saved()) {
         ASSERT(proc_has_feature(FEATURE_SSE));
         if (d_r_is_avx512_code_in_use()) {

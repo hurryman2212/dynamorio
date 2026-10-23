@@ -6190,8 +6190,9 @@ emit_clean_call_restore(dcontext_t *dcontext, byte *pc, generated_code_t *code)
 #endif
 
     /* emit code */
-    pc = instrlist_encode_to_copy(dcontext, &ilist, vmcode_get_writable_addr(pc), pc,
-                                  NULL, IF_X86_ELSE(ZMM_ENABLED(), false));
+    pc = instrlist_encode_to_copy(
+        dcontext, &ilist, vmcode_get_writable_addr(pc), pc, NULL,
+        IF_X86_ELSE(ZMM_ENABLED() || proc_xstate_inuse_enabled(), false));
     ASSERT(pc != NULL);
     pc = vmcode_get_executable_addr(pc);
     instrlist_clear(dcontext, &ilist);

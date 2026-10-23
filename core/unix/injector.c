@@ -41,15 +41,15 @@
 #include "../config.h" /* for get_config_val_other_app */
 #include "../globals.h"
 #ifdef LINUX
-#    include "include/syscall.h" /* for SYS_ptrace */
+#    include "include/syscall.h" /* for SYS_ptrace */ // IWYU pragma: keep
 #else
 #    include <sys/syscall.h>
 #endif
-#include "instrument.h"
-#include "instr.h"
-#include "instr_create_shared.h"
-#include "decode.h"
-#include "disassemble.h"
+#include "instrument.h" /* instrlist_insert_mov_* declarations. */ // IWYU pragma: keep
+#include "instr.h" /* Instruction and list APIs for injection code. */ // IWYU pragma: keep
+#include "instr_create_shared.h" /* INSTR_CREATE_* and XINST_CREATE_* macros. */ // IWYU pragma: keep
+#include "decode.h" /* instrlist_encode_to_copy declarations. */  // IWYU pragma: keep
+#include "disassemble.h" /* instrlist_disassemble diagnostics. */ // IWYU pragma: keep
 #include "os_private.h"
 #include "module.h"
 #include "module_private.h"
@@ -1654,6 +1654,7 @@ user_regs_to_mc(priv_mcontext_t *mc, struct USER_REGS_TYPE *regs)
 #    if defined(DR_HOST_NOT_TARGET)
     ASSERT_NOT_IMPLEMENTED(false);
 #    elif defined(X86)
+    mc->padding[0] = SIMD_UPPER_UNKNOWN;
 #        ifdef X64
     mc->rip = (app_pc)regs->rip;
     mc->rax = regs->rax;

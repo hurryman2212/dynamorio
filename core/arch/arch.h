@@ -105,6 +105,7 @@ mixed_mode_enabled(void)
 #        define R14_OFFSET ((MC_OFFS) + (offsetof(priv_mcontext_t, r14)))
 #        define R15_OFFSET ((MC_OFFS) + (offsetof(priv_mcontext_t, r15)))
 #    endif /* X64 */
+#    define SIMD_UPPER_STATE_OFFSET ((MC_OFFS) + (offsetof(priv_mcontext_t, padding)))
 #    define SIMD_OFFSET ((MC_OFFS) + (offsetof(priv_mcontext_t, simd)))
 #    define OPMASK_OFFSET ((MC_OFFS) + (offsetof(priv_mcontext_t, opmask)))
 #    define XFLAGS_OFFSET ((MC_OFFS) + (offsetof(priv_mcontext_t, xflags)))
@@ -1865,6 +1866,17 @@ append_call_exit_dr_hook(dcontext_t *dcontext, instrlist_t *ilist, bool absolute
                          bool shared);
 void
 append_restore_xflags(dcontext_t *dcontext, instrlist_t *ilist, bool absolute);
+#ifdef X86
+void
+insert_save_simd_upper_state(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
+                             opnd_t marker, bool complete);
+void
+insert_check_simd_upper_state(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
+                              opnd_t marker, opnd_t first_simd, uint width);
+void
+insert_restore_simd_upper_state(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
+                                opnd_t marker);
+#endif
 void
 append_restore_simd_reg(dcontext_t *dcontext, instrlist_t *ilist, bool absolute);
 void

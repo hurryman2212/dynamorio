@@ -4073,6 +4073,10 @@ dr_app_recurlock_lock(void *reclock, dr_mcontext_t *mc)
 {
     CLIENT_ASSERT(mc->flags == DR_MC_ALL, "mcontext must be for DR_MC_ALL");
 
+#ifdef X86
+    if (mc->size > offsetof(dr_mcontext_t, padding))
+        mc->padding[0] = SIMD_UPPER_UNKNOWN;
+#endif
     acquire_recursive_app_lock((recursive_lock_t *)reclock,
                                dr_mcontext_as_priv_mcontext(mc));
 }
@@ -7156,6 +7160,64 @@ dr_get_mcontext(void *drcontext, dr_mcontext_t *dmc)
     return dr_get_mcontext_priv(dcontext, dmc, NULL);
 }
 
+#ifdef X86
+/* The caller supplies provenance from a private capture, never public padding.
+ * CLEAN already proves that these original upper lanes were zero. A context
+ * edit may retain that proof only while all supplied valid upper lanes are zero.
+ */
+static byte
+client_simd_upper_state(byte captured, const dr_mcontext_t *context)
+{
+#    if defined(LINUX) && defined(X64)
+    if (captured == SIMD_UPPER_ACTIVE)
+        return SIMD_UPPER_ACTIVE;
+    if (captured != SIMD_UPPER_CLEAN)
+        return SIMD_UPPER_UNKNOWN;
+    if (!TESTANY(DR_MC_MULTIMEDIA, context->flags))
+        return SIMD_UPPER_CLEAN;
+    if (context->size != sizeof(*context))
+        return SIMD_UPPER_UNKNOWN;
+    const uint lanes = d_r_is_avx512_code_in_use() ? ZMM_REG_SIZE / sizeof(reg_t)
+                                                   : YMM_REG_SIZE / sizeof(reg_t);
+    for (uint reg = 0; reg < 16; ++reg) {
+        for (uint lane = XMM_REG_SIZE / sizeof(reg_t); lane < lanes; ++lane) {
+            if (context->simd[reg].reg[lane] != 0)
+                return SIMD_UPPER_ACTIVE;
+        }
+    }
+    return SIMD_UPPER_CLEAN;
+#    else
+    return SIMD_UPPER_UNKNOWN;
+#    endif
+}
+#endif
+
+static bool
+set_client_mcontext(dcontext_t *dcontext, priv_mcontext_t *state, dr_mcontext_t *context)
+{
+#ifdef X86
+    /* cur_mc can instead alias a public signal/exception callback object. Such
+     * an object cannot provide private capture provenance even if padding matches.
+     */
+#    if defined(LINUX) && defined(X64)
+    const bool private_capture = state == get_mcontext(dcontext) ||
+        state == get_priv_mcontext_from_dstack(dcontext);
+    const byte upper_state = private_capture
+        ? client_simd_upper_state(state->padding[0], context)
+        : SIMD_UPPER_UNKNOWN;
+#    else
+    const byte upper_state = SIMD_UPPER_UNKNOWN;
+#    endif
+#endif
+    if (!dr_mcontext_to_priv_mcontext(state, context))
+        return false;
+#ifdef X86
+    if (TESTANY(DR_MC_MULTIMEDIA, context->flags))
+        state->padding[0] = upper_state;
+#endif
+    return true;
+}
+
 DR_API bool
 dr_set_mcontext(void *drcontext, dr_mcontext_t *context)
 {
@@ -7173,12 +7235,12 @@ dr_set_mcontext(void *drcontext, dr_mcontext_t *context)
     /* PR 207947: support mcontext access from syscall events */
     if (dcontext->client_data->mcontext_in_dcontext ||
         dcontext->client_data->in_pre_syscall || dcontext->client_data->in_post_syscall) {
-        if (!dr_mcontext_to_priv_mcontext(get_mcontext(dcontext), context))
+        if (!set_client_mcontext(dcontext, get_mcontext(dcontext), context))
             return false;
         return true;
     }
     if (dcontext->client_data->cur_mc != NULL) {
-        return dr_mcontext_to_priv_mcontext(dcontext->client_data->cur_mc, context);
+        return set_client_mcontext(dcontext, dcontext->client_data->cur_mc, context);
     }
 #ifndef LINUX_KERNEL
     if (!is_os_cxt_ptr_null(dcontext->client_data->os_cxt)) {
@@ -7209,7 +7271,7 @@ dr_set_mcontext(void *drcontext, dr_mcontext_t *context)
 #    endif
     }
 #endif
-    if (!dr_mcontext_to_priv_mcontext(state, context))
+    if (!set_client_mcontext(dcontext, state, context))
         return false;
 #if defined(AARCHXX) || defined(RISCV64)
     if (TESTANY(DR_MC_INTEGER, context->flags)) {
@@ -7242,6 +7304,25 @@ dr_redirect_execution(dr_mcontext_t *mcontext)
                   "dr_mcontext_t.size field not set properly");
     CLIENT_ASSERT(mcontext->flags == DR_MC_ALL, "dr_mcontext_t.flags must be DR_MC_ALL");
 
+#ifdef X86
+    byte upper_state = SIMD_UPPER_UNKNOWN;
+#    if defined(LINUX) && defined(X64) && !defined(LINUX_KERNEL)
+    priv_mcontext_t *captured = dcontext->client_data->cur_mc;
+    if (captured == NULL && !dcontext->client_data->suspended &&
+        is_os_cxt_ptr_null(dcontext->client_data->os_cxt)) {
+        captured = (dcontext->client_data->mcontext_in_dcontext ||
+                    dcontext->client_data->in_pre_syscall ||
+                    dcontext->client_data->in_post_syscall)
+            ? get_mcontext(dcontext)
+            : get_priv_mcontext_from_dstack(dcontext);
+    }
+    if (captured == get_mcontext(dcontext) ||
+        captured == get_priv_mcontext_from_dstack(dcontext))
+        upper_state = captured->padding[0];
+#    endif
+    mcontext->padding[0] = SIMD_UPPER_UNKNOWN;
+#endif
+
     /* PR 352429: squash current trace.
      * XXX: will clients use this so much that this will be a perf issue?
      * samples/cbr doesn't hit this even at -trace_threshold 1
@@ -7269,6 +7350,12 @@ dr_redirect_execution(dr_mcontext_t *mcontext)
                                    dr_mcontext_as_priv_mcontext(mcontext), 0))
             dcontext->next_tag = canonicalize_pc_target(dcontext, mcontext->pc);
     }
+#endif
+#ifdef X86
+    /* Kernel-transfer callbacks can edit the target directly. Check their final
+     * upper values against the separately retained original capture state.
+     */
+    mcontext->padding[0] = client_simd_upper_state(upper_state, mcontext);
 #endif
     transfer_to_dispatch(dcontext, dr_mcontext_as_priv_mcontext(mcontext),
                          true /*full_DR_state*/);
@@ -7949,10 +8036,12 @@ client_userspace_call_observe(dcontext_t *dcontext)
     dr_mcontext_t observed = { sizeof(observed), DR_MC_ALL };
     bool resume = false;
     if (callback != NULL && priv_mcontext_to_dr_mcontext(&observed, mc)) {
+        const byte upper_state = mc->padding[0];
         dcontext->client_data->cur_mc = mc;
         resume = callback(dcontext, &observed);
         dcontext->client_data->cur_mc = NULL;
         dr_mcontext_to_priv_mcontext(mc, &observed);
+        mc->padding[0] = client_simd_upper_state(upper_state, &observed);
     }
     resume = copied && resume && mc->pc == original &&
         mc->xsp == probe_sp + sizeof(app_pc) && dcontext->signals_pending == 0 &&

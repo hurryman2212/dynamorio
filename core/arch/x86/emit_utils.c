@@ -1350,6 +1350,12 @@ append_restore_simd_reg(dcontext_t *dcontext, instrlist_t *ilist, bool absolute)
         APP(ilist,
             INSTR_CREATE_jcc(dcontext, OP_jnz, opnd_create_instr(pre_avx512_restore)));
     }
+    opnd_t upper_state =
+        OPND_DC_FIELD(absolute, dcontext, OPSZ_1, SIMD_UPPER_STATE_OFFSET);
+    opnd_t first_simd = OPND_DC_FIELD(absolute, dcontext, OPSZ_16, SIMD_OFFSET);
+    if (YMM_ENABLED())
+        insert_check_simd_upper_state(dcontext, ilist, NULL, upper_state, first_simd,
+                                      YMM_REG_SIZE);
     for (i = 0; i < proc_num_simd_sse_avx_saved(); i++) {
         APP(ilist,
             instr_create_1dst_1src(dcontext, opcode,
@@ -1360,6 +1366,8 @@ append_restore_simd_reg(dcontext_t *dcontext, instrlist_t *ilist, bool absolute)
     if (ZMM_ENABLED()) {
         APP(ilist, INSTR_CREATE_jmp(dcontext, opnd_create_instr(post_restore)));
         APP(ilist, pre_avx512_restore /*label*/);
+        insert_check_simd_upper_state(dcontext, ilist, NULL, upper_state, first_simd,
+                                      ZMM_REG_SIZE);
         uint opcode_avx512 = move_mm_avx512_reg_opcode(true /*align64*/);
         for (i = 0; i < proc_num_simd_registers(); i++) {
             APP(ilist,
@@ -1380,6 +1388,8 @@ append_restore_simd_reg(dcontext_t *dcontext, instrlist_t *ilist, bool absolute)
         }
         APP(ilist, post_restore /*label*/);
     }
+    if (YMM_ENABLED())
+        insert_restore_simd_upper_state(dcontext, ilist, NULL, upper_state);
 }
 
 /* append instructions to restore general purpose registers
@@ -1578,6 +1588,10 @@ append_save_simd_reg(dcontext_t *dcontext, instrlist_t *ilist, bool absolute)
 {
     /* No processor will support AVX-512 but no SSE/AVX. */
     ASSERT(preserve_xmm_caller_saved() || !ZMM_ENABLED());
+    insert_save_simd_upper_state(
+        dcontext, ilist, NULL,
+        OPND_DC_FIELD(absolute, dcontext, OPSZ_1, SIMD_UPPER_STATE_OFFSET),
+        preserve_xmm_caller_saved());
     if (!preserve_xmm_caller_saved())
         return;
     /* PR 264138: we must preserve xmm0-5 if on a 64-bit kernel.
