@@ -46,6 +46,9 @@
 #include "../vmareas.h"
 #include "../module_shared.h"
 #include "arch_exports.h"
+#ifdef DEBUG
+#    include "monitor.h" /* is_building_trace() in the native-entry assertion */
+#endif
 
 /* list of native_exec module regions
  */

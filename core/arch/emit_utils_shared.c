@@ -58,6 +58,7 @@
 #include "decode_fast.h" /* IWYU pragma: keep */ /* decode_cti() on x86. */
 #ifdef DEBUG
 #    include "disassemble.h"
+#    include "../fcache.h" /* PAD_FRAGMENT_JMPS() in alignment assertions */
 #endif
 #include "limits_wrapper.h" /* IWYU pragma: keep */ /* INT/USHRT limits. */
 #include "../perscache.h"
@@ -398,8 +399,9 @@ is_exit_cti_patchable(dcontext_t *dcontext, instr_t *inst, uint frag_flags)
         /* whether has an inline stub or not, cti is always
          * patched if -no_indirect_stubs
          */
-        if (!DYNAMO_OPTION(indirect_stubs))
+        if (!DYNAMO_OPTION(indirect_stubs)) {
             return true;
+        }
 #ifdef WINDOWS
         if (target != shared_syscall_routine(dcontext)) {
 #endif
@@ -3156,8 +3158,8 @@ emit_coarse_exit_prefix(dcontext_t *dcontext, byte *pc, coarse_info_t *info)
 void
 patch_coarse_exit_prefix(dcontext_t *dcontext, coarse_info_t *info)
 {
-    ptr_uint_t *pc =
-        (ptr_uint_t *)(info->trace_head_return_prefix - JMP_LONG_LENGTH - sizeof(info));
+    ptr_uint_t *pc = (ptr_uint_t *)(info->trace_head_return_prefix - JMP_LONG_LENGTH -
+                                    sizeof(ptr_uint_t));
     *pc = (ptr_uint_t)info;
 }
 
