@@ -39,19 +39,19 @@
 /* file "mangle.c" */
 
 #include "../globals.h"
-#include "../link.h"
+#include "../link.h" // IWYU pragma: keep
 #include "../fragment.h"
 #include "arch.h"
 #include "instr.h"
-#include "instr_create_shared.h"
-#include "instrlist.h"
+#include "instr_create_shared.h" // IWYU pragma: keep
+#include "instrlist.h"           // IWYU pragma: keep
 #include "decode.h"
-#include "decode_fast.h"
+#include "decode_fast.h" // IWYU pragma: keep
 #include "decode_private.h"
-#include "disassemble.h"
-#include "../hashtable.h"
-#include "instrument.h" /* for dr_insert_call */
-#include "../fcache.h"  /* for in_fcache */
+#include "disassemble.h"  // IWYU pragma: keep
+#include "../hashtable.h" // IWYU pragma: keep
+#include "instrument.h"   /* for dr_insert_call */
+#include "../fcache.h"    /* for in_fcache */
 #include "../translate.h"
 
 #ifdef RCT_IND_BRANCH
@@ -128,6 +128,108 @@ insert_clear_eflags(dcontext_t *dcontext, clean_call_info_t *cci, instrlist_t *i
     }
 }
 
+/* The marker occupies initialized private mcontext padding. Capture runs after
+ * flags are saved and before any client code can dirty otherwise-init upper state.
+ * Preserve even internal scratch values (e.g. the fcache exit linkstub in XAX).
+ */
+void
+insert_save_simd_upper_state(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
+                             opnd_t marker, bool complete)
+{
+#if defined(LINUX) && defined(X64)
+    if (!proc_xstate_inuse_enabled() || proc_num_simd_sse_avx_saved() != 16 ||
+        !proc_has_feature(FEATURE_SSE41))
+        return;
+    PRE(ilist, where,
+        INSTR_CREATE_mov_st(dcontext, marker, OPND_CREATE_INT8(SIMD_UPPER_UNKNOWN)));
+    if (!complete)
+        return;
+    PRE(ilist, where, INSTR_CREATE_push(dcontext, opnd_create_reg(REG_XAX)));
+    PRE(ilist, where, INSTR_CREATE_push(dcontext, opnd_create_reg(REG_XCX)));
+    PRE(ilist, where, INSTR_CREATE_push(dcontext, opnd_create_reg(REG_XDX)));
+    if (opnd_is_base_disp(marker) && opnd_get_base(marker) == REG_XSP)
+        opnd_set_disp(&marker, opnd_get_disp(marker) + 3 * XSP_SZ);
+    PRE(ilist, where,
+        INSTR_CREATE_mov_imm(dcontext, opnd_create_reg(REG_ECX), OPND_CREATE_INT32(1)));
+    PRE(ilist, where, INSTR_CREATE_xgetbv(dcontext));
+    PRE(ilist, where,
+        INSTR_CREATE_test(dcontext, opnd_create_reg(REG_EAX),
+                          OPND_CREATE_INT32(XCR0_AVX | XCR0_ZMM_HI256)));
+    PRE(ilist, where, INSTR_CREATE_setcc(dcontext, OP_setz, opnd_create_reg(REG_AL)));
+    PRE(ilist, where,
+        INSTR_CREATE_add(dcontext, opnd_create_reg(REG_AL),
+                         OPND_CREATE_INT8(SIMD_UPPER_ACTIVE)));
+    PRE(ilist, where, INSTR_CREATE_mov_st(dcontext, marker, opnd_create_reg(REG_AL)));
+    PRE(ilist, where, INSTR_CREATE_pop(dcontext, opnd_create_reg(REG_XDX)));
+    PRE(ilist, where, INSTR_CREATE_pop(dcontext, opnd_create_reg(REG_XCX)));
+    PRE(ilist, where, INSTR_CREATE_pop(dcontext, opnd_create_reg(REG_XAX)));
+#endif
+}
+
+/* A context edit may have added live upper data after capture. Validate the exact
+ * saved low-16 upper lanes before allowing VZEROUPPER, without clobbering GPRs.
+ * XMM0 is temporary here and is restored by the immediately following SIMD loads.
+ * Partial SIMD saves never receive CLEAN, so their unsaved registers stay intact.
+ */
+void
+insert_check_simd_upper_state(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
+                              opnd_t marker, opnd_t first_simd, uint width)
+{
+#if defined(LINUX) && defined(X64)
+    if (!proc_xstate_inuse_enabled() || proc_num_simd_sse_avx_saved() != 16 ||
+        !proc_has_feature(FEATURE_SSE41))
+        return;
+    instr_t *done = INSTR_CREATE_label(dcontext);
+    PRE(ilist, where,
+        INSTR_CREATE_cmp(dcontext, marker, OPND_CREATE_INT8(SIMD_UPPER_CLEAN)));
+    PRE(ilist, where, INSTR_CREATE_jcc(dcontext, OP_jnz, opnd_create_instr(done)));
+    PRE(ilist, where,
+        INSTR_CREATE_pxor(dcontext, opnd_create_reg(REG_XMM0),
+                          opnd_create_reg(REG_XMM0)));
+    for (uint i = 0; i < 16; ++i) {
+        for (uint upper = 16; upper < width; upper += 16) {
+            opnd_t lane = first_simd;
+            if (opnd_is_abs_addr(lane))
+                lane = opnd_create_abs_addr((byte *)opnd_get_addr(lane) +
+                                                i * MCXT_SIMD_SLOT_SIZE + upper,
+                                            OPSZ_16);
+            else
+                opnd_set_disp(&lane,
+                              opnd_get_disp(lane) + i * MCXT_SIMD_SLOT_SIZE + upper);
+            opnd_set_size(&lane, OPSZ_16);
+            /* VEX integer memory operands permit unaligned context slots. */
+            PRE(ilist, where,
+                INSTR_CREATE_vpor(dcontext, opnd_create_reg(REG_XMM0),
+                                  opnd_create_reg(REG_XMM0), lane));
+        }
+    }
+    PRE(ilist, where,
+        INSTR_CREATE_ptest(dcontext, opnd_create_reg(REG_XMM0),
+                           opnd_create_reg(REG_XMM0)));
+    PRE(ilist, where, INSTR_CREATE_jcc(dcontext, OP_jz, opnd_create_instr(done)));
+    PRE(ilist, where,
+        INSTR_CREATE_mov_st(dcontext, marker, OPND_CREATE_INT8(SIMD_UPPER_ACTIVE)));
+    PRE(ilist, where, done);
+#endif
+}
+
+void
+insert_restore_simd_upper_state(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
+                                opnd_t marker)
+{
+#if defined(LINUX) && defined(X64)
+    if (!proc_xstate_inuse_enabled() || proc_num_simd_sse_avx_saved() != 16 ||
+        !proc_has_feature(FEATURE_SSE41))
+        return;
+    instr_t *done = INSTR_CREATE_label(dcontext);
+    PRE(ilist, where,
+        INSTR_CREATE_cmp(dcontext, marker, OPND_CREATE_INT8(SIMD_UPPER_CLEAN)));
+    PRE(ilist, where, INSTR_CREATE_jcc(dcontext, OP_jnz, opnd_create_instr(done)));
+    PRE(ilist, where, INSTR_CREATE_vzeroupper(dcontext));
+    PRE(ilist, where, done);
+#endif
+}
+
 /* Pushes not only the GPRs but also xmm/ymm, xip, and xflags, in
  * priv_mcontext_t order.
  * The current stack pointer alignment should be passed.  Use 1 if
@@ -177,6 +279,16 @@ insert_push_all_registers(dcontext_t *dcontext, clean_call_info_t *cci,
     } else {
         ASSERT(offs_beyond_xmm == 2 * XSP_SZ || !cci->preserve_mcontext);
         /* for cci->preserve_mcontext we added to the lea above so we ignore push_pc */
+    }
+
+    if (clean_call_needs_simd(cci)) {
+        bool complete = !cci->skip_save_flags;
+        for (int i = 0; i < proc_num_simd_sse_avx_saved(); ++i)
+            complete = complete && !cci->simd_skip[i];
+        insert_save_simd_upper_state(
+            dcontext, ilist, instr,
+            opnd_create_base_disp(REG_XSP, REG_NULL, 0, offs_beyond_xmm, OPSZ_1),
+            complete);
     }
 
     /* No processor will support AVX-512 but no SSE/AVX. */
@@ -374,6 +486,13 @@ insert_pop_all_registers(dcontext_t *dcontext, clean_call_info_t *cci, instrlist
         ASSERT(proc_has_feature(FEATURE_SSE));
         ASSERT(proc_num_simd_saved() == proc_num_simd_registers() ||
                proc_num_simd_saved() == proc_num_simd_sse_avx_registers());
+        bool complete = !cci->skip_save_flags;
+        for (int i = 0; i < proc_num_simd_sse_avx_saved(); ++i)
+            complete = complete && !cci->simd_skip[i];
+        opnd_t upper_state =
+            opnd_create_base_disp(REG_XSP, REG_NULL, 0, offs_beyond_xmm, OPSZ_1);
+        opnd_t first_simd = opnd_create_base_disp(
+            REG_XSP, REG_NULL, 0, offs_beyond_xmm + PRE_XMM_PADDING, OPSZ_16);
         instr_t *post_pop = NULL;
         instr_t *pre_avx512_pop = NULL;
         if (ZMM_ENABLED()) {
@@ -388,6 +507,9 @@ insert_pop_all_registers(dcontext_t *dcontext, clean_call_info_t *cci, instrlist
             PRE(ilist, instr,
                 INSTR_CREATE_jcc(dcontext, OP_jnz, opnd_create_instr(pre_avx512_pop)));
         }
+        if (complete && YMM_ENABLED())
+            insert_check_simd_upper_state(dcontext, ilist, instr, upper_state, first_simd,
+                                          YMM_REG_SIZE);
         for (i = 0; i < proc_num_simd_sse_avx_saved(); i++) {
             if (!cci->simd_skip[i]) {
                 PRE(ilist, instr,
@@ -402,6 +524,9 @@ insert_pop_all_registers(dcontext_t *dcontext, clean_call_info_t *cci, instrlist
         if (ZMM_ENABLED()) {
             PRE(ilist, instr, INSTR_CREATE_jmp(dcontext, opnd_create_instr(post_pop)));
             PRE(ilist, instr, pre_avx512_pop /*label*/);
+            if (complete)
+                insert_check_simd_upper_state(dcontext, ilist, instr, upper_state,
+                                              first_simd, ZMM_REG_SIZE);
             uint opcode_avx512 = move_mm_avx512_reg_opcode(ALIGNED(alignment, 64));
             for (i = 0; i < proc_num_simd_registers(); i++) {
                 if (!cci->simd_skip[i]) {
@@ -432,6 +557,8 @@ insert_pop_all_registers(dcontext_t *dcontext, clean_call_info_t *cci, instrlist
             }
             PRE(ilist, instr, post_pop /*label*/);
         }
+        if (complete && YMM_ENABLED())
+            insert_restore_simd_upper_state(dcontext, ilist, instr, upper_state);
     }
 
     if (!cci->skip_save_flags) {

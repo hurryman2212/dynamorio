@@ -42,10 +42,6 @@
 #include "encode_api.h"
 #include "opnd.h"
 #include "arch.h"
-/* XXX i#1551: refactor this file and avoid this x86-specific include in base arch/ */
-#ifndef AARCH64
-#    include "x86/decode_private.h"
-#endif
 
 #if defined(DEBUG) && !defined(STANDALONE_DECODER)
 /* case 10450: give messages to clients */
@@ -2281,8 +2277,10 @@ reg_set_value_ex_priv(reg_id_t reg, priv_mcontext_t *mc, byte *val_buf)
     } else if (reg >= DR_REG_START_XMM && reg <= DR_REG_STOP_XMM) {
         memcpy(&(simd[reg - DR_REG_START_XMM]), val_buf, XMM_REG_SIZE);
     } else if (reg >= DR_REG_START_YMM && reg <= DR_REG_STOP_YMM) {
+        mc->padding[0] = SIMD_UPPER_UNKNOWN;
         memcpy(&(simd[reg - DR_REG_START_YMM]), val_buf, YMM_REG_SIZE);
     } else if (reg >= DR_REG_START_ZMM && reg <= DR_REG_STOP_ZMM) {
+        mc->padding[0] = SIMD_UPPER_UNKNOWN;
         memcpy(&(simd[reg - DR_REG_START_ZMM]), val_buf, ZMM_REG_SIZE);
     } else {
         /* Note, we can reach here for MMX register */

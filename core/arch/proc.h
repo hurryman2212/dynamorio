@@ -62,6 +62,12 @@ enum {
     XCR0_FP = 0x1,
 };
 
+#ifdef X86
+/* Whether XGETBV(1) is available for preserving upper-register init state. */
+bool
+proc_xstate_inuse_enabled(void);
+#endif
+
 /* information about a processor */
 typedef struct _cpu_info_t {
     /* XXX i#1551: x86 and arm use different description of cpu models

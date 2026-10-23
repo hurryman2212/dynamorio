@@ -39,7 +39,7 @@
  * signal.c - dynamorio signal handler
  */
 
-#include <errno.h>
+#include <errno.h> /* EINTR and other syscall error constants. */ // IWYU pragma: keep
 #undef errno
 
 #include "signal_private.h" /* pulls in globals.h for us, in right order */
@@ -50,7 +50,6 @@
 #include "include/siginfo.h"
 #ifdef LINUX
 #    include "include/sigcontext.h"
-#    include "include/signalfd.h"
 #    include "include/clone3.h"
 #    include "../globals.h" /* after our sigcontext.h, to preclude bits/sigcontext.h */
 #elif defined(MACOS)
@@ -72,20 +71,19 @@
 #include "../fcache.h"
 #include "../perfctr.h"
 #include "arch.h"
-#include "../monitor.h"  /* for trace_abort */
-#include "../link.h"     /* for linking interrupted fragment_t */
-#include "instr.h"       /* to find target of SIGSEGV */
-#include "decode.h"      /* to find target of SIGSEGV */
-#include "decode_fast.h" /* to handle self-mod code */
+#include "../monitor.h" /* for trace_abort */
+#include "../link.h"    /* for linking interrupted fragment_t */
+#include "instr.h"      /* to find target of SIGSEGV */
+#include "decode.h"     /* to find target of SIGSEGV */
 #include "../synch.h"
 #include "../nudge.h"
-#include "disassemble.h"
+#include "disassemble.h" /* DEBUG disassemble_with_bytes. */ // IWYU pragma: keep
 #include "ksynch.h"
 #include "tls.h" /* tls_reinstate_selector */
 #include "../translate.h"
 
 #ifdef LINUX
-#    include "include/syscall.h"
+#    include "include/syscall.h" /* Architecture SYS_* definitions. */ // IWYU pragma: keep
 #else
 #    include <sys/syscall.h>
 #    ifdef MACOS
@@ -3025,6 +3023,11 @@ sigcontext_to_mcontext(priv_mcontext_t *mc, sig_full_cxt_t *sc_full,
     sigcontext_t *sc = sc_full->sc;
     ASSERT(mc != NULL && sc != NULL);
 #ifdef X86
+    /* Multimedia imports include the padding, even for legacy/null fpstate.
+     * A short public integer-only context need not contain that storage.
+     */
+    if (TESTANY(DR_MC_MULTIMEDIA, flags))
+        mc->padding[0] = SIMD_UPPER_UNKNOWN;
     if (TESTANY(DR_MC_INTEGER, flags)) {
         mc->xax = sc->SC_XAX;
         mc->xbx = sc->SC_XBX;
@@ -5000,6 +5003,7 @@ find_next_fragment_from_gencode(dcontext_t *dcontext, sigcontext_t *sc)
             decode_cti(dcontext, pc, &instr);
             if (instr_is_ibl_hit_jump(&instr)) {
                 priv_mcontext_t mc;
+                IF_X86(mc.padding[0] = SIMD_UPPER_UNKNOWN;)
                 sig_full_cxt_t sc_full = { sc, NULL /*not provided*/ };
                 sigcontext_to_mcontext(&mc, &sc_full, DR_MC_INTEGER | DR_MC_CONTROL);
                 byte *target;

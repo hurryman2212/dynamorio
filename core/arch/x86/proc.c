@@ -41,10 +41,10 @@
 
 #include "../globals.h"
 #include "proc.h"
-#include "instr.h"               /* for dr_insert_{save,restore}_fpstate */
-#include "instrument.h"          /* for dr_insert_{save,restore}_fpstate */
-#include "instr_create_shared.h" /* for dr_insert_{save,restore}_fpstate */
-#include "decode.h"              /* for dr_insert_{save,restore}_fpstate */
+#include "instr.h" /* for dr_insert_{save,restore}_fpstate */      // IWYU pragma: keep
+#include "instrument.h" /* for dr_insert_{save,restore}_fpstate */ // IWYU pragma: keep
+#include "instr_create_shared.h" /* for dr_insert_{save,restore}_fpstate */ // IWYU pragma: keep
+#include "decode.h" /* for dr_insert_{save,restore}_fpstate */
 
 #ifdef DEBUG
 /* case 10450: give messages to clients */
@@ -69,6 +69,7 @@
 
 static bool avx_enabled;
 static bool avx512_enabled;
+static bool xstate_inuse_enabled;
 
 static int num_simd_saved;
 static int num_simd_registers;
@@ -435,6 +436,9 @@ proc_init_arch(void)
             LOG(GLOBAL, LOG_TOP, 2, "\txgetbv => 0x%08x%08x\n", bv_high, bv_low);
             if (TESTALL(XCR0_AVX | XCR0_SSE, bv_low)) {
                 avx_enabled = true;
+                int xstate_features[4];
+                our_cpuid(xstate_features, 0xd, 1);
+                xstate_inuse_enabled = TESTANY(1U << 2, xstate_features[0]);
                 LOG(GLOBAL, LOG_TOP, 1, "\tProcessor and OS fully support AVX\n");
             } else {
                 LOG(GLOBAL, LOG_TOP, 1, "\tOS does NOT support AVX\n");
@@ -694,6 +698,12 @@ bool
 proc_avx_enabled(void)
 {
     return avx_enabled;
+}
+
+bool
+proc_xstate_inuse_enabled(void)
+{
+    return xstate_inuse_enabled;
 }
 
 bool

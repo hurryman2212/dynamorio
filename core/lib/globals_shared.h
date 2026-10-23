@@ -1099,6 +1099,19 @@ enum {
  * so we have no alignment declarations there at the moment either.
  */
 
+#ifdef X86
+/* padding[0] in priv_mcontext_t is private state, not public mcontext input.
+ * UNKNOWN must be assigned by every constructor that does not capture XINUSE.
+ * CLEAN means XINUSE's low-register AVX and AVX-512 upper components were init.
+ * It never authorizes clearing nonzero values subsequently written to the context.
+ */
+enum {
+    SIMD_UPPER_UNKNOWN = 0,
+    SIMD_UPPER_ACTIVE = 1,
+    SIMD_UPPER_CLEAN = 2,
+};
+#endif
+
 /* Internal machine context structure */
 typedef struct _priv_mcontext_t {
 #include "mcxtx_api.h" // IWYU pragma: export
