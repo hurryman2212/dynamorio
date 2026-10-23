@@ -9,12 +9,8 @@
 #include "fcache.h"
 #include "heap.h"
 #include "link.h"
-#include "instr.h"
-#include "instrlist.h"
-#include "instr_create_shared.h"
-#include "decode.h"
+#include "instr_create_shared.h" /* IWYU pragma: keep: architecture creation macros */
 #include "fragment_shared.h"
-#include "synch.h"
 
 /* Registration happens before application threads run. Callback targets are
  * never part of an immutable shared-code object.
@@ -1121,7 +1117,7 @@ shared_operand_targets_fragment(opnd_t operand, const fragment_t *fragment)
 }
 
 static bool
-shared_operand_private(opnd_t operand, bool copy_immediates)
+shared_operand_private(opnd_t operand, bool copy_immediates, bool simd_controls)
 {
     /* Literal arithmetic operands stay in the exact canonical byte sequence:
      * differing values cannot match its digest or final byte comparison. Do
@@ -1133,8 +1129,15 @@ shared_operand_private(opnd_t operand, bool copy_immediates)
                                            (opnd_get_segment(operand) == DR_SEG_FS ||
                                             opnd_get_segment(operand) == DR_SEG_GS),
                                        false);
-    return (opnd_is_immed(operand) && !copy_immediates) || opnd_is_pc(operand) ||
-        opnd_is_instr(operand) || opnd_is_rel_addr(operand) ||
+    /* Decoded SIMD imm8 operands select lanes, shuffles, masks, rounding or
+     * shift counts. They are encoded control bits, never process addresses.
+     * Keep this operand-specific: symbolic, wider and address-bearing operands
+     * must still use private bindings, regardless of the instruction category.
+     */
+    bool control =
+        simd_controls && opnd_is_immed_int(operand) && opnd_get_size(operand) == OPSZ_1;
+    return (opnd_is_immed(operand) && !copy_immediates && !control) ||
+        opnd_is_pc(operand) || opnd_is_instr(operand) || opnd_is_rel_addr(operand) ||
         (opnd_is_abs_addr(operand) && !thread_relative) ||
         (opnd_is_base_disp(operand) && opnd_get_base(operand) == DR_REG_NULL &&
          opnd_get_index(operand) == DR_REG_NULL &&
@@ -1149,6 +1152,7 @@ shared_instruction_kind(instr_t *decoded, const fragment_t *fragment)
         return -1;
     bool local = instr_is_cti(decoded);
     bool copy_immediates = false;
+    bool simd_controls = TESTANY(DR_INSTR_CATEGORY_SIMD, instr_get_category(decoded));
     switch (instr_get_opcode(decoded)) {
     case OP_add:
     case OP_adc:
@@ -1175,13 +1179,13 @@ shared_instruction_kind(instr_t *decoded, const fragment_t *fragment)
         opnd_t operand = instr_get_src(decoded, i);
         if (shared_operand_targets_fragment(operand, fragment))
             return -1;
-        local |= shared_operand_private(operand, copy_immediates);
+        local |= shared_operand_private(operand, copy_immediates, simd_controls);
     }
     for (int i = 0; i < instr_num_dsts(decoded); ++i) {
         opnd_t operand = instr_get_dst(decoded, i);
         if (shared_operand_targets_fragment(operand, fragment))
             return -1;
-        local |= shared_operand_private(operand, copy_immediates);
+        local |= shared_operand_private(operand, copy_immediates, simd_controls);
     }
     return local ? SHARED_PRIVATE : SHARED_COPY;
 }
