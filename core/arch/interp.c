@@ -49,13 +49,13 @@
 #include "../monitor.h" /* for trace_abort and monitor_data_t */
 #include "arch.h"
 #include "instr.h"
-#include "instr_create_shared.h"
+#include "instr_create_shared.h" /* IWYU pragma: keep */
 #include "instrlist.h"
 #include "decode.h"
-#include "decode_fast.h"
+#include "decode_fast.h" /* IWYU pragma: keep */
 #include "disassemble.h"
 #include "instrument.h"
-#include "../hotpatch.h"
+#include "../hotpatch.h" /* IWYU pragma: keep */
 #ifdef RETURN_AFTER_CALL
 #    include "../rct.h"
 #endif
@@ -5445,10 +5445,19 @@ recreate_fragment_ilist(dcontext_t *dcontext, byte *pc,
 
     if ((f->flags & FRAG_IS_TRACE) == 0) {
         /* easy case: just a bb */
-        ilist = recreate_bb_ilist(dcontext, (byte *)f->tag, (byte *)f->tag,
-                                  NULL /*default stop*/, 0 /*no pre flags*/, &flags, NULL,
-                                  true /*check vm area*/, mangle, NULL, call_client,
-                                  false /*not for_trace*/);
+        /* Prepared blocks may end before the ordinary decoder's next CTI.
+         * Recreate that same bound so duplicated copies retain their emitted
+         * offsets during signal and suspension state reconstruction.
+         */
+        app_pc stop_pc =
+            !TESTANY(FRAG_FAKE | FRAG_IS_FUTURE | FRAG_COARSE_GRAIN, f->flags) &&
+                f->client_prepare_size != 0
+            ? (app_pc)f->tag + f->client_prepare_size
+            : NULL;
+        ilist =
+            recreate_bb_ilist(dcontext, (byte *)f->tag, (byte *)f->tag, stop_pc,
+                              0 /*no pre flags*/, &flags, NULL, true /*check vm area*/,
+                              mangle, NULL, call_client, false /*not for_trace*/);
         ASSERT(ilist != NULL);
         if (ilist == NULL) /* a race */
             goto recreate_fragment_done;
