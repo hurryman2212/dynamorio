@@ -12,7 +12,9 @@ foreach(
   lib/dr_events.h
   unix/exec_resources.c
   unix/thread_suspend.c
-  unix/signal.c)
+  unix/signal.c
+  unix/os.c
+  unix/os_private.h)
   set(INPUT_PATH "${PROJECT_SOURCE_DIR}/core/${INPUT}")
   file(SHA256 "${INPUT_PATH}" DIGEST)
   string(APPEND DR_SERVICE_CONTENT "${INPUT}:${DIGEST}\n")

@@ -2682,6 +2682,49 @@ check_signals_pending(dcontext_t *dcontext, thread_sig_info_t *info)
     }
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Merge only after a successful kernel call: it owns size/address validation
+ * and any partial write on failure. Short sets expose only their requested
+ * bytes; a zero-sized call must not access the application's pointer.
+ */
+int
+handle_post_sigpending(dcontext_t *dcontext, kernel_sigset_t *set, size_t sigsetsize)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    kernel_sigset_t pending, previous, observed;
+    if (sigsetsize > sizeof(pending))
+        return EINVAL;
+    if (sigsetsize == 0)
+        return 0;
+    ASSERT(_NSIG_WORDS == 1);
+    kernel_sigemptyset(&pending);
+    /* Only this thread owns these queue heads. During post-syscall processing
+     * signal handlers can append, but application delivery/removal waits for
+     * dispatch. Compare masks, not queue counts: duplicate RT arrivals cannot
+     * prolong the scan. No queue node is dereferenced or changed, and no signal
+     * is blocked merely to take this snapshot.
+     */
+    do {
+        previous = pending;
+        kernel_sigemptyset(&pending);
+        for (int sig = 1; sig <= (int)(sigsetsize * 8); ++sig) {
+            if (kernel_sigismember(&info->app_sigblocked, sig) &&
+                __atomic_load_n(&info->sigpending[sig], __ATOMIC_RELAXED) != NULL)
+                kernel_sigaddset(&pending, sig);
+        }
+    } while (pending.sig[0] != previous.sig[0]);
+    if (pending.sig[0] == 0)
+        return 0;
+    kernel_sigemptyset(&observed);
+    if (!d_r_safe_read(set, sigsetsize, &observed))
+        return EFAULT;
+    if ((observed.sig[0] | pending.sig[0]) == observed.sig[0])
+        return 0;
+    observed.sig[0] |= pending.sig[0];
+    return safe_write_ex(set, sigsetsize, &observed, NULL) ? 0 : EFAULT;
+}
+#endif
+
 /* Returns whether to execute the syscall */
 bool
 handle_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *app_set,

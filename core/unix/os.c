@@ -10361,6 +10361,12 @@ pre_system_call(dcontext_t *dcontext)
 #    endif
 #endif
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    case SYS_rt_sigpending:
+        dcontext->sys_param0 = sys_param(dcontext, 0);
+        dcontext->sys_param1 = sys_param(dcontext, 1);
+        break;
+#endif
 #if defined(LINUX) && !defined(X64)
     case SYS_sigpending: /* 73 */
 #    ifndef ARM
@@ -10376,7 +10382,10 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_rt_sigqueueinfo: /* 178 */
     case SYS_rt_tgsigqueueinfo:
 #endif
-    case IF_MACOS_ELSE(SYS_sigpending, SYS_rt_sigpending): { /* 176 */
+#if !defined(LINUX) || !defined(X86) || !defined(X64)
+    case IF_MACOS_ELSE(SYS_sigpending, SYS_rt_sigpending): /* 176 */
+#endif
+    {
         /* XXX i#92: handle all of these syscalls! */
         LOG(THREAD, LOG_ASYNCH | LOG_SYSCALLS, 1,
             "WARNING: unhandled signal system call %d\n", dcontext->sys_num);
@@ -12019,6 +12028,17 @@ post_system_call(dcontext_t *dcontext)
         }
         break;
     }
+#if defined(LINUX) && defined(X86) && defined(X64)
+    case SYS_rt_sigpending:
+        if (success) {
+            int status =
+                handle_post_sigpending(dcontext, (kernel_sigset_t *)dcontext->sys_param0,
+                                       (size_t)dcontext->sys_param1);
+            if (status != 0)
+                set_failure_return_val(dcontext, status);
+        }
+        break;
+#endif
 #if defined(LINUX) && !defined(X64)
     case SYS_sigreturn: /* 119 */
 #endif
