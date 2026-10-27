@@ -5,8 +5,14 @@ file(SHA256 "${CMAKE_CURRENT_LIST_FILE}" DR_SERVICE_GENERATOR_DIGEST)
 set(DR_SERVICE_CONTENT
     "${CMAKE_C_COMPILER_ID}:${CMAKE_C_COMPILER_VERSION}:${CMAKE_C_COMPILER_TARGET}:${CMAKE_SYSTEM_NAME}:${CMAKE_SYSTEM_PROCESSOR}:${CMAKE_SIZEOF_VOID_P}:${CMAKE_C_BYTE_ORDER}:${CMAKE_BUILD_TYPE}\n${CMAKE_C_FLAGS}\n${CMAKE_C_FLAGS_${DR_SERVICE_CONFIG}}\nmake/service_contract.cmake:${DR_SERVICE_GENERATOR_DIGEST}\n"
 )
-foreach(INPUT lib/dr_exec_resources.h lib/dr_thread_suspend.h
-              unix/exec_resources.c unix/thread_suspend.c)
+foreach(
+  INPUT
+  lib/dr_exec_resources.h
+  lib/dr_thread_suspend.h
+  lib/dr_events.h
+  unix/exec_resources.c
+  unix/thread_suspend.c
+  unix/signal.c)
   set(INPUT_PATH "${PROJECT_SOURCE_DIR}/core/${INPUT}")
   file(SHA256 "${INPUT_PATH}" DIGEST)
   string(APPEND DR_SERVICE_CONTENT "${INPUT}:${DIGEST}\n")

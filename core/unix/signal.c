@@ -4387,11 +4387,19 @@ dr_get_signal_siginfo(const dr_siginfo_t *info, void *buffer, size_t buffer_size
 static dr_signal_action_t
 send_signal_to_client(dcontext_t *dcontext, int sig, sigframe_rt_t *frame,
                       sigcontext_t *raw_sc, byte *access_address, bool blocked,
-                      fragment_t *fragment)
+                      fragment_t *fragment, bool *request_userspace_reentry)
 {
     kernel_ucontext_t *uc = get_ucontext_from_rt_frame(frame);
     dr_siginfo_t si;
     dr_signal_action_t action;
+    bool userspace = false;
+    *request_userspace_reentry = false;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    userspace = (raw_sc != NULL && dcontext->client_userspace_active &&
+                 dr_lookup_userspace_code((app_pc)raw_sc->SC_XIP, NULL, NULL)) ||
+        (dcontext->client_userspace_target != NULL &&
+         dr_lookup_userspace_code(dcontext->client_userspace_target, NULL, NULL));
+#endif
     /* XXX #1615: we need a full ucontext to store pre-xl8 simd values.
      * Right now we share the same simd values with post-xl8.
      */
@@ -4403,6 +4411,7 @@ send_signal_to_client(dcontext_t *dcontext, int sig, sigframe_rt_t *frame,
     LOG(THREAD, LOG_ASYNCH, 2, "sending signal to client\n");
     si.sig = sig;
     si.drcontext = (void *)dcontext;
+    si.request_userspace_reentry = false;
     /* It's safe to allocate since we do not send signals that interrupt DR.
      * With priv_mcontext_t x2 that's a little big for stack alloc.
      */
@@ -4455,6 +4464,7 @@ send_signal_to_client(dcontext_t *dcontext, int sig, sigframe_rt_t *frame,
      * will not leak si
      */
     action = instrument_signal(dcontext, &si);
+    *request_userspace_reentry = userspace && si.request_userspace_reentry;
     if (action == DR_SIGNAL_DELIVER || action == DR_SIGNAL_REDIRECT) {
         /* propagate client changes */
         CLIENT_ASSERT(si.mcontext->flags == DR_MC_ALL,
@@ -4473,11 +4483,35 @@ send_signal_to_client(dcontext_t *dcontext, int sig, sigframe_rt_t *frame,
     return action;
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* The signal has already been ignored, suppressed, or queued. Preserve its
+ * disposition and register edits, changing only the route back to application
+ * code. Raw PC edits must follow the signal API's original/registered-address
+ * constraint. The request is callback-local so nested signals cannot reuse it.
+ */
+static void
+reenter_userspace_after_signal(dcontext_t *dcontext, kernel_ucontext_t *uc, int sig)
+{
+    sigcontext_t *sc = SIGCXT_FROM_UCXT(uc);
+    app_pc pc = (app_pc)sc->SC_XIP;
+    app_pc original;
+    if (dr_lookup_userspace_code(pc, &original, NULL))
+        pc = original;
+    else if (pc == dcontext->client_userspace_request_pc)
+        pc = dcontext->client_userspace_original_pc;
+    dcontext->client_userspace_target = NULL;
+    dcontext->client_userspace_request_pc = NULL;
+    transfer_from_sig_handler_to_fcache_return(
+        dcontext, uc, NULL, sig, pc, (linkstub_t *)get_asynch_linkstub(), false);
+}
+#endif
+
 /* Returns false if caller should exit */
 static bool
 handle_client_action_from_cache(dcontext_t *dcontext, int sig, dr_signal_action_t action,
                                 sigframe_rt_t *our_frame, sigcontext_t *sc_orig,
-                                sigcontext_t *sc_interrupted, bool blocked)
+                                sigcontext_t *sc_interrupted, bool blocked,
+                                bool request_userspace_reentry)
 {
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
     kernel_ucontext_t *uc = get_ucontext_from_rt_frame(our_frame);
@@ -4506,6 +4540,10 @@ handle_client_action_from_cache(dcontext_t *dcontext, int sig, dr_signal_action_
                                            : "app signal handler is SIG_IGN");
         /* restore original (untranslated) sc */
         *get_sigcontext_from_rt_frame(our_frame) = *sc_orig;
+#if defined(LINUX) && defined(X86) && defined(X64)
+        if (request_userspace_reentry)
+            reenter_userspace_after_signal(dcontext, uc, sig);
+#endif
         return false;
     } else if (!blocked && /* no BYPASS for blocked */
                (action == DR_SIGNAL_BYPASS ||
@@ -4519,6 +4557,10 @@ handle_client_action_from_cache(dcontext_t *dcontext, int sig, dr_signal_action_
              * on request.
              */
             *get_sigcontext_from_rt_frame(our_frame) = *sc_orig;
+#if defined(LINUX) && defined(X86) && defined(X64)
+            if (request_userspace_reentry && default_action[sig] == DEFAULT_IGNORE)
+                reenter_userspace_after_signal(dcontext, uc, sig);
+#endif
             LOG(THREAD, LOG_ASYNCH, 2, "%s: restored xsp=" PFX ", xip=" PFX "\n",
                 __FUNCTION__, get_sigcontext_from_rt_frame(our_frame)->SC_XSP,
                 get_sigcontext_from_rt_frame(our_frame)->SC_XIP);
@@ -4534,12 +4576,17 @@ send_signal_to_client_and_handle_action(dcontext_t *dcontext, int sig,
                                         sigframe_rt_t *frame, sigcontext_t *sc,
                                         sigcontext_t *sc_orig, byte *access_address,
                                         bool blocked, fragment_t *fragment,
-                                        bool no_deliver)
+                                        bool no_deliver, bool *queued_userspace_reentry)
 {
     /* Make a copy of sigcontext_t struct before send_signal_to_client() tweaks it. */
     sigcontext_t sc_interrupted = *sc;
-    dr_signal_action_t action = send_signal_to_client(dcontext, sig, frame, sc_orig,
-                                                      access_address, blocked, fragment);
+    bool request_userspace_reentry;
+    dr_signal_action_t action =
+        send_signal_to_client(dcontext, sig, frame, sc_orig, access_address, blocked,
+                              fragment, &request_userspace_reentry);
+    if (queued_userspace_reentry != NULL)
+        *queued_userspace_reentry =
+            blocked && action == DR_SIGNAL_DELIVER && request_userspace_reentry;
     if (blocked) {
         /* For blocked signal early event we disallow BYPASS (xref i#182/PR 449996). */
         CLIENT_ASSERT(action != DR_SIGNAL_BYPASS, "cannot bypass a blocked signal event");
@@ -4550,7 +4597,8 @@ send_signal_to_client_and_handle_action(dcontext_t *dcontext, int sig,
         }
     }
     return handle_client_action_from_cache(dcontext, sig, action, frame, sc_orig,
-                                           &sc_interrupted, blocked);
+                                           &sc_interrupted, blocked,
+                                           request_userspace_reentry);
 }
 
 static void
@@ -5088,6 +5136,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
         (copied_userspace ||
          (!safe_is_in_fcache(dcontext, pc, xsp) && !is_dynamo_address(pc) &&
           !is_in_client_lib(pc)));
+    bool queued_userspace_reentry = false;
 
     /* We no longer block SUSPEND_SIGNAL (i#184/PR 450670) or SIGSEGV (i#193/PR 287309).
      * But we can have re-entrancy issues in this routine if the app uses the same
@@ -5469,7 +5518,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
 
             if (!send_signal_to_client_and_handle_action(
                     dcontext, sig, frame, sc, &sc_orig, access_address, true /*blocked*/,
-                    f, false /*handle deliver*/)) {
+                    f, false /*handle deliver*/, &queued_userspace_reentry)) {
                 ostd->processing_signal--;
                 return;
             }
@@ -5597,6 +5646,10 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
         if (!blocked && dcontext->signals_pending == 0)
             dcontext->signals_pending = 1;
     }
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (queued_userspace_reentry)
+        reenter_userspace_after_signal(dcontext, ucxt, sig);
+#endif
     ostd->processing_signal--;
 }
 
@@ -6346,7 +6399,7 @@ main_signal_handler_C(byte *xsp)
                  */
                 if (!send_signal_to_client_and_handle_action(
                         dcontext, sig, frame, get_sigcontext_from_rt_frame(frame), sc,
-                        target, false /*!blocked*/, NULL, true /*no_deliver*/)) {
+                        target, false /*!blocked*/, NULL, true /*no_deliver*/, NULL)) {
                     /* client handled fault */
                     break;
                 }
@@ -6538,7 +6591,7 @@ execute_handler_from_cache(dcontext_t *dcontext, int sig, sigframe_rt_t *our_fra
                                                  * interruption point */);
     if (!send_signal_to_client_and_handle_action(dcontext, sig, our_frame, sc, sc_orig,
                                                  access_address, false /*not blocked*/, f,
-                                                 false /*handle deliver*/))
+                                                 false /*handle deliver*/, NULL))
         return false;
 
     LOG(THREAD, LOG_ASYNCH, 2, "execute_handler_from_cache for signal %d\n", sig);
@@ -6742,9 +6795,22 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
     }
 
     sigcontext_t sc_interrupted = *sc;
-    action = send_signal_to_client(dcontext, sig, frame, NULL,
-                                   info->sigpending[sig]->access_address,
-                                   false /*not blocked*/, NULL);
+    bool request_userspace_reentry;
+    action = send_signal_to_client(
+        dcontext, sig, frame, NULL, info->sigpending[sig]->access_address,
+        false /*not blocked*/, NULL, &request_userspace_reentry);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (request_userspace_reentry) {
+        /* Dispatch already owns the original application continuation. A
+         * suppressed/ignored pending signal must not revive the physical
+         * destination whose client observation state was just retired.
+         */
+        if (dcontext->next_tag == dcontext->client_userspace_request_pc)
+            dcontext->next_tag = dcontext->client_userspace_original_pc;
+        dcontext->client_userspace_target = NULL;
+        dcontext->client_userspace_request_pc = NULL;
+    }
+#endif
     /* in order to pass to the client, we come all the way here for signals
      * the app has no handler for
      */

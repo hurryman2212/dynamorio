@@ -1453,6 +1453,22 @@ typedef struct _dr_siginfo_t {
     const void *os_siginfo;
     /** Size in bytes of the information at \p os_siginfo, or zero if unavailable. */
     size_t os_siginfo_size;
+    /**
+     * Initially false. Set to true when this callback retires observation state
+     * for a client-managed userspace code region. If the signal is ignored or
+     * suppressed, resume through ordinary instrumentation at the corresponding
+     * application PC instead of returning directly to that region. Pending
+     * client-managed entry requests are cancelled as well. This does not change
+     * the signal disposition or suppress an application handler. A blocked early
+     * notification still queues the signal before changing the execution route.
+     * Only registered client-managed code on Linux x86-64 is affected; ordinary
+     * code-cache execution and native execution retain their existing behavior.
+     * With DR_SIGNAL_SUPPRESS, any edited raw_mcontext.pc must name original
+     * application code or registered client-managed code. Do not set this flag
+     * when redirecting raw_mcontext.pc into DynamoRIO-generated code; leave it
+     * false to retain the normal raw-context resumption contract.
+     */
+    bool request_userspace_reentry;
 } dr_siginfo_t;
 
 DR_API
