@@ -30,6 +30,14 @@
 
 include(../make/policies.cmake NO_POLICY_SCOPE)
 
+# Private string loops must not be folded back into application-libc calls.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  set_property(
+    SOURCE string.c
+    APPEND
+    PROPERTY COMPILE_OPTIONS -fno-builtin)
+endif()
+
 # ##############################################################################
 # Sources and targets
 
