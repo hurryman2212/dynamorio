@@ -1138,6 +1138,34 @@ DR_API
 reg_t
 dr_syscall_get_param(void *drcontext, int param_num);
 
+#ifdef UNIX
+/** Actual continuation PCs visible in Linux x86-64 syscall entry registers. */
+typedef struct _dr_syscall_continuations_t {
+    size_t size;          /**< Set to sizeof(dr_syscall_continuations_t). */
+    app_pc ordinary;      /**< Generated SYSCALL path. */
+    app_pc thread_create; /**< Generated shared-address-space clone path. */
+    app_pc compat;        /**< Generated INT 0x80 path. */
+} dr_syscall_continuations_t;
+
+DR_API
+/**
+ * Returns the generated syscall continuation addresses for the current thread.
+ * Unlike the application PC in a syscall callback's mcontext, these are the
+ * addresses the kernel observes immediately after the actual syscall instruction.
+ * A collector can distinguish application syscall execution from runtime syscalls
+ * by matching this identity together with the task and invocation registration.
+ *
+ * This does not guarantee that a pending syscall will execute: DynamoRIO or a
+ * client may emulate it. It does not describe native execution, the vDSO, or
+ * runtime-managed shutdown syscalls. Addresses remain valid for this thread's
+ * generated-routine lifetime; do not persist them across exec or detach.
+ * Returns false for other platforms, a foreign thread context, or an invalid
+ * structure size. On failure, the caller's output is unchanged.
+ */
+bool
+dr_get_syscall_continuations(void *drcontext, dr_syscall_continuations_t *continuations);
+#endif
+
 DR_API
 /**
  * Usable only from a pre-syscall (dr_register_pre_syscall_event())

@@ -144,6 +144,10 @@ bool
 instrument_pre_syscall(dcontext_t *dcontext, int sysnum);
 void
 instrument_post_syscall(dcontext_t *dcontext, int sysnum);
+#if defined(LINUX) && defined(X86) && defined(X64)
+bool
+instrument_syscall_execution(dcontext_t *dcontext, cache_pc entry, bool termination);
+#endif
 bool
 instrument_invoke_another_syscall(dcontext_t *dcontext);
 void

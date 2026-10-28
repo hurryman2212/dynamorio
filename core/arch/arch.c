@@ -2676,6 +2676,25 @@ is_after_main_do_syscall_addr(dcontext_t *dcontext, cache_pc pc)
 }
 
 bool
+get_syscall_continuations(dcontext_t *dcontext, cache_pc *ordinary,
+                          cache_pc *thread_create, cache_pc *compat)
+{
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    generated_code_t *code =
+        get_emitted_routines_code(dcontext _IF_X86_64(GENCODE_FROM_DCONTEXT));
+    if (code == NULL || !code->do_syscall || !code->do_clone_syscall ||
+        !code->do_int_syscall)
+        return false;
+    *ordinary = code->do_syscall + code->do_syscall_offs;
+    *thread_create = code->do_clone_syscall + code->do_clone_syscall_offs;
+    *compat = code->do_int_syscall + code->do_int_syscall_offs;
+    return true;
+#    else
+    return false;
+#    endif
+}
+
+bool
 is_after_do_syscall_addr(dcontext_t *dcontext, cache_pc pc)
 {
     generated_code_t *code =
@@ -2688,6 +2707,25 @@ is_after_do_syscall_addr(dcontext_t *dcontext, cache_pc pc)
                 ||
                 pc == (cache_pc)(code->do_vmkuw_syscall + code->do_vmkuw_syscall_offs)));
 }
+#    if defined(LINUX) && defined(X86) && defined(X64)
+cache_pc
+get_syscall_execution_pc(dcontext_t *dcontext, cache_pc entry, bool termination)
+{
+    if (termination)
+        return (cache_pc)application_exit_syscall_end;
+    generated_code_t *code =
+        get_emitted_routines_code(dcontext _IF_X86_64(GENCODE_FROM_DCONTEXT));
+    if (code == NULL)
+        return NULL;
+    if (entry == code->do_syscall)
+        return code->do_syscall + code->do_syscall_offs;
+    if (entry == code->do_clone_syscall)
+        return code->do_clone_syscall + code->do_clone_syscall_offs;
+    if (entry == code->do_int_syscall)
+        return code->do_int_syscall + code->do_int_syscall_offs;
+    return NULL;
+}
+#    endif
 #endif
 
 bool
@@ -2914,6 +2952,17 @@ get_cleanup_and_terminate_global_do_syscall_entry(void)
 #endif
         return get_global_do_syscall_entry();
 }
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+byte *
+get_application_exit_syscall_entry(dcontext_t *dcontext)
+{
+    const bool application = dcontext->application_exit_syscall;
+    dcontext->application_exit_syscall = false;
+    return application ? (byte *)application_exit_syscall
+                       : get_cleanup_and_terminate_global_do_syscall_entry();
+}
+#endif
 
 #ifdef MACOS
 /* There is no single resumption point from sysenter: each sysenter stores

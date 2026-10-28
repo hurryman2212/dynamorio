@@ -343,6 +343,11 @@ static callback_list_t pre_syscall_callbacks = {
 static callback_list_t post_syscall_callbacks = {
     0,
 };
+#if defined(LINUX) && defined(X86) && defined(X64)
+static callback_list_t syscall_execution_callbacks = {
+    0,
+};
+#endif
 static callback_list_t kernel_xfer_callbacks = {
     0,
 };
@@ -976,6 +981,9 @@ free_all_callback_lists(void)
     free_callback_list(&filter_syscall_callbacks);
     free_callback_list(&pre_syscall_callbacks);
     free_callback_list(&post_syscall_callbacks);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    free_callback_list(&syscall_execution_callbacks);
+#endif
     free_callback_list(&kernel_xfer_callbacks);
 #ifdef WINDOWS
     free_callback_list(&exception_callbacks);
@@ -1456,6 +1464,35 @@ dr_unregister_pre_syscall_event(bool (*func)(void *drcontext, int sysnum))
 {
     return remove_callback(&pre_syscall_callbacks, (void (*)(void))func, true);
 }
+
+#ifdef UNIX
+bool
+dr_register_syscall_execution_event(void (*func)(void *drcontext,
+                                                 const dr_syscall_execution_t *execution))
+{
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    if (func == NULL)
+        return false;
+    add_callback(&syscall_execution_callbacks, (void (*)(void))func, true);
+    return true;
+#    else
+    (void)func;
+    return false;
+#    endif
+}
+
+bool
+dr_unregister_syscall_execution_event(
+    void (*func)(void *drcontext, const dr_syscall_execution_t *execution))
+{
+#    if defined(LINUX) && defined(X86) && defined(X64)
+    return remove_callback(&syscall_execution_callbacks, (void (*)(void))func, true);
+#    else
+    (void)func;
+    return false;
+#    endif
+}
+#endif
 
 void
 dr_register_post_syscall_event(void (*func)(void *drcontext, int sysnum))
@@ -2318,6 +2355,38 @@ instrument_post_syscall(dcontext_t *dcontext, int sysnum)
     dcontext->client_data->in_post_syscall = false;
     dcontext->whereami = old_whereami;
 }
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+bool
+instrument_syscall_execution(dcontext_t *dcontext, cache_pc entry, bool termination)
+{
+    if (syscall_execution_callbacks.num == 0 ||
+        dcontext->client_data->skip_client_syscall_events)
+        return false;
+    CLIENT_ASSERT(filter_syscall_callbacks.num > 0,
+                  "A filter event must be provided with syscall execution events");
+    dr_syscall_execution_t execution = {
+        sizeof(execution), dcontext->sys_num,
+        (int)MCXT_SYSNUM_REG(get_mcontext(dcontext)),
+        get_syscall_execution_pc(dcontext, entry, termination), termination
+    };
+    ASSERT(execution.continuation != NULL);
+    const dr_where_am_i_t old_whereami = dcontext->whereami;
+    const bool old_context = dcontext->client_data->mcontext_in_dcontext;
+    dcontext->whereami = DR_WHERE_SYSCALL_HANDLER;
+    dcontext->client_data->mcontext_in_dcontext = true;
+    dcontext->client_data->in_syscall_execution = true;
+    /* call_all() reads a dummy int result. Invoke this void callback with its
+     * actual function type through the same registration/copying machinery. */
+    call_all_ret(, , , syscall_execution_callbacks,
+                 void (*)(void *, const dr_syscall_execution_t *), (void *)dcontext,
+                 &execution);
+    dcontext->client_data->in_syscall_execution = false;
+    dcontext->client_data->mcontext_in_dcontext = old_context;
+    dcontext->whereami = old_whereami;
+    return true;
+}
+#endif
 
 bool
 instrument_invoke_another_syscall(dcontext_t *dcontext)
@@ -7223,6 +7292,10 @@ dr_set_mcontext(void *drcontext, dr_mcontext_t *context)
 {
     priv_mcontext_t *state;
     dcontext_t *dcontext = (dcontext_t *)drcontext;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (dcontext->client_data->in_syscall_execution)
+        return false;
+#endif
     IF_AARCHXX_OR_RISCV64(reg_t stolen_reg_val = 0 /* silence the compiler warning */;)
     IF_RISCV64(reg_t tp_reg_val = 0;)
     CLIENT_ASSERT(!TESTANY(SELFPROT_DCONTEXT, DYNAMO_OPTION(protect_mask)),

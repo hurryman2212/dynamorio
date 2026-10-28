@@ -573,6 +573,15 @@ after_do_syscall_addr(dcontext_t *dcontext);
 bool
 is_after_main_do_syscall_addr(dcontext_t *dcontext, cache_pc pc);
 bool
+get_syscall_continuations(dcontext_t *dcontext, cache_pc *ordinary,
+                          cache_pc *thread_create, cache_pc *compat);
+#    if defined(LINUX) && defined(X86) && defined(X64)
+cache_pc
+get_syscall_execution_pc(dcontext_t *dcontext, cache_pc entry, bool termination);
+byte *
+get_application_exit_syscall_entry(dcontext_t *dcontext);
+#    endif
+bool
 is_after_do_syscall_addr(dcontext_t *dcontext, cache_pc pc);
 #endif
 

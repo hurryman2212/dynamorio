@@ -1507,6 +1507,12 @@ global_do_syscall_wow64_index0(void);
 #ifdef X64
 void
 global_do_syscall_syscall(void);
+#    ifdef LINUX
+void
+application_exit_syscall(void);
+void
+application_exit_syscall_end(void);
+#    endif
 #endif
 void
 get_xmm_caller_saved(dr_zmm_t *xmm_caller_saved_buf);

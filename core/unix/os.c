@@ -4039,7 +4039,7 @@ os_new_thread_pre(dcontext_t *dcontext, bool client_thread)
  * in DR mode.
  */
 static void
-os_clone_pre(dcontext_t *dcontext)
+os_clone_pre(dcontext_t *dcontext, bool application)
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     os_thread_data_t *data = dcontext->os_field;
@@ -4053,6 +4053,15 @@ os_clone_pre(dcontext_t *dcontext)
         bootstrap->runtime_signal_mask = data->runtime_clone_mask;
         bootstrap->runtime_signal_mask_valid = true;
     }
+    /* The syscall identity is final, but callbacks still need the parent's
+     * valid DR and private-library TLS. The child must inherit invalid DR
+     * TLS, and a private file-table snapshot may freeze descriptor changes,
+     * so notify before either transition rather than swapping back later. */
+    if (application)
+        instrument_syscall_execution(dcontext, get_do_clone_syscall_entry(dcontext),
+                                     false);
+#else
+    (void)application;
 #endif
     /* We switch the lib tls segment back to app's segment.
      * Please refer to comment on os_switch_lib_tls.
@@ -5491,7 +5500,7 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
      * i#3526 switch DR's tls to an invalid one before cloning, and switch lib_tls
      * to the app's.
      */
-    os_clone_pre(dcontext);
+    os_clone_pre(dcontext, false /*client thread*/);
 #if (defined(AARCHXX) || defined(RISCV64)) && !defined(MACOS)
     /* We need to invalidate DR's TLS to avoid get_thread_private_dcontext() finding one
      * and hitting asserts in dynamo_thread_init lock calls -- yet we don't want to for
@@ -7316,6 +7325,22 @@ dr_syscall_get_param(void *drcontext, int param_num)
 }
 
 DR_API
+bool
+dr_get_syscall_continuations(void *drcontext, dr_syscall_continuations_t *continuations)
+{
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
+    dr_syscall_continuations_t result = { sizeof(result), NULL, NULL, NULL };
+    if (continuations == NULL || continuations->size != sizeof(result) ||
+        dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
+        dcontext != get_thread_private_dcontext() ||
+        !get_syscall_continuations(dcontext, &result.ordinary, &result.thread_create,
+                                   &result.compat))
+        return false;
+    *continuations = result;
+    return true;
+}
+
+DR_API
 void
 dr_syscall_set_param(void *drcontext, int param_num, reg_t new_value)
 {
@@ -9076,10 +9101,22 @@ retry_exit_check:
     d_r_mutex_unlock(&thread_initexit_lock);
     KSTOP(num_exits_dir_syscall);
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Block signals before publishing the application-only termination site.
+     * Its selector consumes the marker before client exit callbacks can cause
+     * a nested runtime shutdown. */
+    block_all_noncrash_signals_except(NULL, 1, SUSPEND_SIGNAL);
+    dcontext->application_exit_syscall =
+        instrument_syscall_execution(dcontext, NULL, true);
+    cleanup_and_terminate(dcontext, MCXT_SYSNUM_REG(mc), sys_param(dcontext, 0),
+                          sys_param(dcontext, 1), exit_process, sys_param(dcontext, 2),
+                          sys_param(dcontext, 3));
+#else
     block_cleanup_and_terminate(dcontext, MCXT_SYSNUM_REG(mc), sys_param(dcontext, 0),
                                 sys_param(dcontext, 1), exit_process,
                                 /* SYS_bsdthread_terminate has 2 more args */
                                 sys_param(dcontext, 2), sys_param(dcontext, 3));
+#endif
 }
 
 #if defined(LINUX) && defined(X86) /* XXX i#58: until we have Mac support */
@@ -9547,7 +9584,7 @@ handle_clone_pre(dcontext_t *dcontext)
                                 sys_param_addr(dcontext, SYSCALL_PARAM_CLONE_STACK), NULL,
                                 NULL);
         }
-        os_clone_pre(dcontext);
+        os_clone_pre(dcontext, true /*application thread*/);
 #    if defined(LINUX) && defined(X86) && defined(X64)
         file_table_clone_begin(dcontext);
 #    endif
@@ -10016,7 +10053,7 @@ pre_system_call(dcontext_t *dcontext)
         create_clone_record(dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/, NULL,
                             NULL);
 #    endif
-        os_clone_pre(dcontext);
+        os_clone_pre(dcontext, true /*application vfork*/);
 #    ifndef LINUX
         os_new_thread_pre(dcontext, false /*application thread*/);
 #    endif

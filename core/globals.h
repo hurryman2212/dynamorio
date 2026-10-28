@@ -430,6 +430,9 @@ typedef struct _client_data_t {
     /* flags for asserts on linux and for getting param base right on windows */
     bool in_pre_syscall;
     bool in_post_syscall;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    bool in_syscall_execution;
+#endif
     /* flag for dr_syscall_invoke_another() */
     bool invoke_another_syscall;
     /* flags for dr_get_mcontext (i#117/PR 395156) */
@@ -894,6 +897,11 @@ struct _dcontext_t {
     fragment_t *last_fragment;      /* cached value of linkstub_fragment(last_exit) */
 
     int sys_num; /* holds normalized syscall number */
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* Consumed before client exit callbacks, so nested runtime termination
+     * cannot use the application's separately identifiable syscall site. */
+    bool application_exit_syscall;
+#endif
 #ifdef WINDOWS
     reg_t *sys_param_base; /* used for post_system_call */
 #endif

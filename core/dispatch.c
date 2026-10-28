@@ -2198,6 +2198,12 @@ handle_system_call(dcontext_t *dcontext)
         }
 #    endif
 
+#    if defined(LINUX) && defined(X86) && defined(X64)
+        /* Shared-address-space creation notified before os_clone_pre changed
+         * the TLS state that the child will inherit. */
+        if (!was_thread_create_syscall(dcontext))
+            instrument_syscall_execution(dcontext, do_syscall, false);
+#    endif
         SELF_PROTECT_LOCAL(dcontext, READONLY);
 
         set_at_syscall(dcontext, true);

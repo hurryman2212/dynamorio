@@ -159,6 +159,9 @@ DECL_EXTERN(dynamo_thread_stack_free_and_exit)
 DECL_EXTERN(dynamorio_app_take_over_helper)
 DECL_EXTERN(found_modified_code)
 DECL_EXTERN(get_cleanup_and_terminate_global_do_syscall_entry)
+#if defined(LINUX) && defined(X64)
+DECL_EXTERN(get_application_exit_syscall_entry)
+#endif
 #ifdef INTERNAL
 DECL_EXTERN(d_r_internal_error)
 #endif
@@ -596,7 +599,12 @@ cat_done_saving_dstack:
          */
         /* avoid sygate sysenter version as our stack may be static const at
          * that point, caller will take care of sygate hack */
+#if defined(LINUX) && defined(X64)
+        mov      REG_XAX, [1*ARG_SZ + REG_XBP] /* dcontext, still alive */
+        CALLC1(GLOBAL_REF(get_application_exit_syscall_entry), REG_XAX)
+#else
         CALLC0(GLOBAL_REF(get_cleanup_and_terminate_global_do_syscall_entry))
+#endif
 #if defined(UNIX) && !defined(X64)
         lea      REG_XSP, [-2*ARG_SZ + REG_XSP] /* maintain align-16 w/ 2 pushes below */
 #endif
@@ -856,6 +864,22 @@ GLOBAL_LABEL(global_do_syscall_syscall:)
         jmp      GLOBAL_REF(dynamorio_sys_exit_group)
 #   endif
         END_FUNC(global_do_syscall_syscall)
+# ifdef LINUX
+/* Application-requested termination uses a site distinct from runtime fatal
+ * cleanup. The selector consumes the application marker before exit callbacks.
+ */
+        DECLARE_FUNC(application_exit_syscall)
+        DECLARE_GLOBAL(application_exit_syscall_end)
+GLOBAL_LABEL(application_exit_syscall:)
+        mov      r10, REG_XCX
+        syscall
+GLOBAL_LABEL(application_exit_syscall_end:)
+#  ifdef DEBUG
+        jmp      GLOBAL_REF(debug_infinite_loop)
+#  endif
+        jmp      GLOBAL_REF(dynamorio_sys_exit_group)
+        END_FUNC(application_exit_syscall)
+# endif
 #endif
 
 #ifdef WINDOWS

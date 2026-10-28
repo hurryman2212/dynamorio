@@ -1348,6 +1348,56 @@ DR_API
 bool
 dr_unregister_pre_syscall_event(bool (*func)(void *drcontext, int sysnum));
 
+#ifdef UNIX
+/** Final execution identity for a prepared Linux x86-64 system call. */
+typedef struct _dr_syscall_execution_t {
+    size_t size;         /**< Size of this structure. */
+    int original_number; /**< Number after client pre-syscall callbacks. */
+    int kernel_number;   /**< Number in the registers that enter the kernel. */
+    app_pc continuation; /**< PC immediately following the actual syscall instruction. */
+    bool termination;    /**< Application-requested thread or process termination. */
+} dr_syscall_execution_t;
+
+DR_API
+/**
+ * Registers a read-only notification after DynamoRIO has prepared an intercepted
+ * system call and selected its execution routine. A syscall filter event must
+ * also be registered. The callback cannot skip the syscall, modify parameters,
+ * redirect execution, or change the application machine context. The supplied
+ * execution identity is valid only during this callback and must be copied if
+ * needed later. dr_get_mcontext() can inspect the prepared context;
+ * dr_set_mcontext() rejects changes from this callback.
+ *
+ * Unlike the pre-syscall event, this notification sees DynamoRIO's final number
+ * and execution PC, including an execve rewritten to execveat. Emulated or
+ * client-skipped syscalls do not generate this notification. It still does not
+ * prove kernel entry: a signal can defer a prepared syscall before execution.
+ * Correlation with an actual kernel entry event is required for that proof.
+ * Shared-address-space clone and vfork notify before installing the TLS that
+ * the child inherits, so the callback runs with normal DynamoRIO TLS state.
+ *
+ * An application exit or exit_group generates this notification before runtime
+ * cleanup, and executes through a dedicated termination instruction. Runtime
+ * shutdown, private runtime syscalls and signal-handler restoration performed
+ * by DynamoRIO itself are not reported. An application rt_sigreturn uses the
+ * ordinary generated syscall routine and is reported after its signal-return
+ * transfer event, before kernel entry.
+ *
+ * Returns false on unsupported platforms or for a NULL callback. Currently
+ * supported on Linux x86-64 only. Continuation PCs must not be reused across
+ * exec, detach or a later execution notification.
+ */
+bool
+dr_register_syscall_execution_event(
+    void (*func)(void *drcontext, const dr_syscall_execution_t *execution));
+
+DR_API
+/** Unregisters a syscall execution callback; returns whether it was registered. */
+bool
+dr_unregister_syscall_execution_event(
+    void (*func)(void *drcontext, const dr_syscall_execution_t *execution));
+#endif
+
 DR_API
 /**
  * Registers a callback function for the post-syscall event.  DR calls
@@ -1364,10 +1414,13 @@ DR_API
  *
  * System calls that change control flow or terminate the current
  * thread or process typically do not have a post-syscall event.
- * These include SYS_exit, SYS_exit_group, SYS_execve, SYS_sigreturn,
- * and SYS_rt_sigreturn on Linux, and NtTerminateThread,
+ * These include SYS_exit, SYS_exit_group and successful SYS_execve on Linux,
+ * and NtTerminateThread,
  * NtTerminateProcess (depending on the parameters), NtCallbackReturn,
  * and NtContinue on Windows.
+ * On Linux x86-64, SYS_rt_sigreturn has a post-syscall event after restoring
+ * the interrupted application context. Its result register holds that
+ * context's application value, not an ordinary syscall return value.
  *
  * The application's machine state can be accessed and set with
  * dr_get_mcontext() and dr_set_mcontext().
