@@ -456,14 +456,34 @@ config_read(config_info_t *cfg, const char *appname_in, process_id_t pid, const 
         if (pid == 0 && cfg == &config)
             pid_to_check = get_process_id();
         if (pid_to_check != 0) {
-            /* 1) <local>/appname.<pid>.1config
-             * only makes sense for main config for this process
+            /* 1) One-time config in this PID-number namespace. Keep the same
+             * identity and format as libutil's get_config_file_name(). The raw
+             * stat helper is usable before heap, TLS and logging initialization.
              */
-            snprintf(cfg->fname_app, BUFFER_SIZE_ELEMENTS(cfg->fname_app),
-                     "%s/%s/%s.%d.1%s", local, LOCAL_CONFIG_SUBDIR, appname, pid_to_check,
-                     sfx);
-            NULL_TERMINATE_BUFFER(cfg->fname_app);
-            f_app = log_path_and_open(cfg->fname_app, OS_OPEN_READ);
+#    if defined(LINUX) && !defined(LINUX_KERNEL)
+            struct stat64 pid_namespace;
+
+            if (dr_stat_syscall("/proc/self/ns/pid", &pid_namespace) == 0) {
+                int written = snprintf(
+                    cfg->fname_app, BUFFER_SIZE_ELEMENTS(cfg->fname_app),
+                    "%s/%s/%s.pidns-" UINT64_FORMAT_STRING "-" UINT64_FORMAT_STRING
+                    ".%d.1%s",
+                    local, LOCAL_CONFIG_SUBDIR, appname, (uint64)pid_namespace.st_dev,
+                    (uint64)pid_namespace.st_ino, pid_to_check, sfx);
+                NULL_TERMINATE_BUFFER(cfg->fname_app);
+                if (written < 0 || (size_t)written >= sizeof(cfg->fname_app))
+                    cfg->fname_app[0] = '\0';
+            } else
+#    endif
+            {
+                /* No namespace interface: retain the legacy one-time lookup. */
+                snprintf(cfg->fname_app, BUFFER_SIZE_ELEMENTS(cfg->fname_app),
+                         "%s/%s/%s.%d.1%s", local, LOCAL_CONFIG_SUBDIR, appname,
+                         pid_to_check, sfx);
+                NULL_TERMINATE_BUFFER(cfg->fname_app);
+            }
+            if (cfg->fname_app[0] != '\0')
+                f_app = log_path_and_open(cfg->fname_app, OS_OPEN_READ);
             if (f_app != INVALID_FILE)
                 cfg->has_1config = true; /* one-time file */
         }

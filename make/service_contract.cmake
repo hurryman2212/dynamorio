@@ -1,4 +1,4 @@
-# Fingerprint the private FD-service protocols together with their producers.
+# Fingerprint private protocols and matching launcher/runtime configuration.
 # Receivers compare this before interpreting protocol-dependent record fields.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" DR_SERVICE_CONFIG)
 file(SHA256 "${CMAKE_CURRENT_LIST_FILE}" DR_SERVICE_GENERATOR_DIGEST)
@@ -7,15 +7,17 @@ set(DR_SERVICE_CONTENT
 )
 foreach(
   INPUT
-  lib/dr_exec_resources.h
-  lib/dr_thread_suspend.h
-  lib/dr_events.h
-  unix/exec_resources.c
-  unix/thread_suspend.c
-  unix/signal.c
-  unix/os.c
-  unix/os_private.h)
-  set(INPUT_PATH "${PROJECT_SOURCE_DIR}/core/${INPUT}")
+  core/lib/dr_exec_resources.h
+  core/lib/dr_thread_suspend.h
+  core/lib/dr_events.h
+  core/unix/exec_resources.c
+  core/unix/thread_suspend.c
+  core/unix/signal.c
+  core/unix/os.c
+  core/unix/os_private.h
+  core/config.c
+  libutil/dr_config.c)
+  set(INPUT_PATH "${PROJECT_SOURCE_DIR}/${INPUT}")
   file(SHA256 "${INPUT_PATH}" DIGEST)
   string(APPEND DR_SERVICE_CONTENT "${INPUT}:${DIGEST}\n")
   set_property(

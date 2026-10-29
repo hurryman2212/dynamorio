@@ -549,9 +549,30 @@ get_config_file_name(const char *process_name, process_id_t pid, bool global,
 #    endif
     dir_len = strlen(fname);
     if (pid > 0) {
-        /* <root>/appname.<pid>.1config */
-        _snprintf(fname + dir_len, fname_len - dir_len, "/%s.%d.1%s", process_name, pid,
-                  get_config_sfx(dr_platform));
+#    if defined(LINUX) && !defined(LINUX_KERNEL)
+        struct stat64 pid_namespace;
+
+        /* PIDs passed to this API belong to the caller's namespace, including
+         * future/fake registrations. /proc/<pid> could use a different proc
+         * mount namespace and need not name a live target at all.
+         */
+        if (dr_stat_syscall("/proc/self/ns/pid", &pid_namespace) == 0) {
+            int written = _snprintf(
+                fname + dir_len, fname_len - dir_len,
+                "/%s.pidns-" UINT64_FORMAT_STRING "-" UINT64_FORMAT_STRING ".%d.1%s",
+                process_name, (uint64)pid_namespace.st_dev, (uint64)pid_namespace.st_ino,
+                pid, get_config_sfx(dr_platform));
+            if (written < 0 || (size_t)written >= fname_len - dir_len) {
+                fname[0] = '\0';
+                return false;
+            }
+        } else
+#    endif
+        {
+            /* Preserve legacy behavior when PID namespace identity is unavailable. */
+            _snprintf(fname + dir_len, fname_len - dir_len, "/%s.%d.1%s", process_name,
+                      pid, get_config_sfx(dr_platform));
+        }
     } else {
         /* <root>/appname.config */
         _snprintf(fname + dir_len, fname_len - dir_len, "/%s.%s", process_name,
