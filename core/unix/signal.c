@@ -92,6 +92,7 @@
 #endif
 
 #include "instrument.h"
+#include "../userspace_stats.h"
 
 #ifdef VMX86_SERVER
 #    include <errno.h>
@@ -4335,6 +4336,10 @@ transfer_from_sig_handler_to_fcache_return(dcontext_t *dcontext, kernel_ucontext
                                            app_pc next_pc, linkstub_t *last_exit,
                                            bool is_kernel_xfer)
 {
+    if (DYNAMO_OPTION(userspace_transition_stats)) {
+        userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
+        userspace_stats_event(dcontext, USERSPACE_STATS_SIGNAL_REENTRY, 0);
+    }
     dcontext->client_userspace_active = false;
     sigcontext_t *sc = SIGCXT_FROM_UCXT(uc);
     if (is_kernel_xfer) {
@@ -5541,7 +5546,11 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
          * we'll copy the context to the app stack and then adjust the
          * original on our stack so we take over.
          */
+        if (DYNAMO_OPTION(userspace_transition_stats) && client_userspace)
+            userspace_stats_event(dcontext, USERSPACE_STATS_SIGNAL_BEGIN, 0);
         execute_handler_from_cache(dcontext, sig, frame, &sc_orig, f, access_address);
+        if (DYNAMO_OPTION(userspace_transition_stats) && client_userspace)
+            userspace_stats_event(dcontext, USERSPACE_STATS_SIGNAL_END, 0);
 
     } else if (!handled) {
 
@@ -5559,9 +5568,14 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
                 translate_sigcontext(dcontext, ucxt, true /*shouldn't fail*/, &f,
                                      &wrapper);
 
-            if (!send_signal_to_client_and_handle_action(
-                    dcontext, sig, frame, sc, &sc_orig, access_address, true /*blocked*/,
-                    f, false /*handle deliver*/, &queued_userspace_reentry)) {
+            if (DYNAMO_OPTION(userspace_transition_stats) && client_userspace)
+                userspace_stats_event(dcontext, USERSPACE_STATS_SIGNAL_BEGIN, 0);
+            const bool continue_signal = send_signal_to_client_and_handle_action(
+                dcontext, sig, frame, sc, &sc_orig, access_address, true /*blocked*/, f,
+                false /*handle deliver*/, &queued_userspace_reentry);
+            if (DYNAMO_OPTION(userspace_transition_stats) && client_userspace)
+                userspace_stats_event(dcontext, USERSPACE_STATS_SIGNAL_END, 0);
+            if (!continue_signal) {
                 ostd->processing_signal--;
                 return;
             }
@@ -6852,6 +6866,8 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
             dcontext->next_tag = dcontext->client_userspace_original_pc;
         dcontext->client_userspace_target = NULL;
         dcontext->client_userspace_request_pc = NULL;
+        if (DYNAMO_OPTION(userspace_transition_stats))
+            userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
     }
 #endif
     /* in order to pass to the client, we come all the way here for signals
@@ -6860,6 +6876,8 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
     if (action == DR_SIGNAL_REDIRECT) {
         /* send_signal_to_client copied mcontext into frame's sc */
         dcontext->client_userspace_target = NULL;
+        if (DYNAMO_OPTION(userspace_transition_stats))
+            userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
         priv_mcontext_t *mcontext = get_mcontext(dcontext);
         ucontext_to_mcontext(mcontext, uc);
         if (is_building_trace(dcontext)) {
@@ -6908,6 +6926,8 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
      * happens to equal the original PC of an interrupted userspace request.
      */
     dcontext->client_userspace_target = NULL;
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
     if (info->in_sigsuspend)
         terminate_sigsuspend(dcontext, info, uc);
 
@@ -9391,6 +9411,8 @@ handle_suspend_signal(dcontext_t *dcontext, kernel_siginfo_t *siginfo,
             app_pc original_pc;
             if (dr_lookup_userspace_code((app_pc)sc->SC_XIP, &original_pc, NULL))
                 sc->SC_XIP = (reg_t)original_pc;
+            if (DYNAMO_OPTION(userspace_transition_stats))
+                userspace_stats_event(dcontext, USERSPACE_STATS_TAKEOVER, 0);
             transfer_from_sig_handler_to_fcache_return(
                 dcontext, ucxt, NULL, SUSPEND_SIGNAL, (app_pc)sc->SC_XIP,
                 (linkstub_t *)get_asynch_linkstub(), false);

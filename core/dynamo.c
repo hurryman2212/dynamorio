@@ -56,6 +56,7 @@
 #    include "perfctr.h"
 #endif
 #include "instrument.h"
+#include "userspace_stats.h"
 #include "hotpatch.h"
 #include "moduledb.h"
 #include "module_shared.h"
@@ -910,6 +911,10 @@ dynamorio_fork_init(dcontext_t *dcontext)
     /* this must be called after dynamo_other_thread_exit() above */
     signal_fork_init(dcontext);
 #    if defined(LINUX) && defined(X86) && defined(X64)
+    if (dcontext->client_userspace_stats != NULL)
+        memset(dcontext->client_userspace_stats, 0, sizeof(userspace_stats_t));
+#    endif
+#    if defined(LINUX) && defined(X86) && defined(X64)
     /* The inherited channels were invalidated/closed before vanished records
      * were discarded. Register this kernel task in a new address-space realm. */
     os_thread_suspend_register(dcontext);
@@ -1704,6 +1709,16 @@ create_new_dynamo_context(bool initial, byte *dstack_in, priv_mcontext_t *mc)
     /* must set to 0 so can tell if initialized for callbacks! */
     memset(dcontext, 0x0, sizeof(dcontext_t));
     dcontext->allocated_start = alloc_start;
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (DYNAMO_OPTION(userspace_transition_stats)) {
+        /* Generated handoffs write while application state is installed. Keep
+         * the counters writable independently of global self-protection. */
+        userspace_stats_t *state =
+            global_unprotected_heap_alloc(sizeof(userspace_stats_t) HEAPACCT(ACCT_OTHER));
+        memset(state, 0, sizeof(*state));
+        __atomic_store_n(&dcontext->client_userspace_stats, state, __ATOMIC_RELEASE);
+    }
+#endif
 
     /* we share a single dstack across all callbacks */
     if (initial) {
@@ -1767,6 +1782,14 @@ create_new_dynamo_context(bool initial, byte *dstack_in, priv_mcontext_t *mc)
 static void
 delete_dynamo_context(dcontext_t *dcontext, bool free_stack)
 {
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (dcontext->client_userspace_stats != NULL) {
+        userspace_stats_t *state = dcontext->client_userspace_stats;
+        __atomic_store_n(&dcontext->client_userspace_stats, NULL, __ATOMIC_RELEASE);
+        global_unprotected_heap_free(state,
+                                     sizeof(userspace_stats_t) HEAPACCT(ACCT_OTHER));
+    }
+#endif
     if (free_stack) {
         ASSERT(dcontext->dstack != NULL);
         ASSERT(!is_currently_on_dstack(dcontext));

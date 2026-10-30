@@ -10,6 +10,16 @@ foreach(
   core/lib/dr_exec_resources.h
   core/lib/dr_thread_suspend.h
   core/lib/dr_events.h
+  core/lib/dr_userspace_stats.h
+  core/lib/dr_ir_utils.h
+  core/userspace_stats.c
+  core/userspace_stats.h
+  core/globals.h
+  core/optionsx.h
+  core/dispatch.c
+  core/arch/emit_utils_shared.c
+  core/lib/instrument.c
+  core/dynamo.c
   core/unix/exec_resources.c
   core/unix/thread_suspend.c
   core/unix/signal.c
@@ -31,7 +41,7 @@ file(
   OUTPUT
   "${BUILD_INCLUDE}/dr_service_contract.h"
   CONTENT
-  "#ifndef DR_SERVICE_CONTRACT_H\n#define DR_SERVICE_CONTRACT_H\n#define DR_EXEC_RESOURCE_CONTRACT_HASH \"${DR_SERVICE_CONTRACT_HASH}\"\n#define DR_THREAD_SUSPEND_CONTRACT_HASH \"${DR_SERVICE_CONTRACT_HASH}\"\n#endif\n"
+  "#ifndef DR_SERVICE_CONTRACT_H\n#define DR_SERVICE_CONTRACT_H\n#define DR_EXEC_RESOURCE_CONTRACT_HASH \"${DR_SERVICE_CONTRACT_HASH}\"\n#define DR_THREAD_SUSPEND_CONTRACT_HASH \"${DR_SERVICE_CONTRACT_HASH}\"\n#define DR_USERSPACE_TRANSITION_CONTRACT_HASH \"${DR_SERVICE_CONTRACT_HASH}\"\n#endif\n"
   @ONLY)
 
 # Internal DR sources include the build root without exporting all API headers.

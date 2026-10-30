@@ -1155,6 +1155,7 @@ struct _dcontext_t {
     /* The x86-64 FXSAVE image is 512 bytes and requires 16-byte alignment. */
     byte client_userspace_fpstate[512 + 15];
     bool client_userspace_fpstate_valid;
+    struct _userspace_stats_t *client_userspace_stats;
 #endif
 #ifdef LINUX
     /* State for handling restartable sequences ("rseq"). */

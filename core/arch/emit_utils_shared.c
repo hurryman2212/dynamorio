@@ -47,6 +47,7 @@
 #include "../globals.h"
 #include "../link.h"
 #include "../fragment.h"
+#include "../userspace_stats.h"
 
 #include "arch.h"
 #include "instr.h"
@@ -2133,6 +2134,100 @@ append_jmp_to_fcache_target(dcontext_t *dcontext, instrlist_t *ilist,
  *
  *  # now executing in fcache
  */
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Application FP state can already be restored here. Emit only scalar integer
+ * instructions, while GPRs and flags still have their saved application values.
+ * The ordinary emitter does not call this helper when diagnostics are disabled. */
+static void
+append_userspace_stats_commit(dcontext_t *dcontext, instrlist_t *ilist, bool probe)
+{
+    const int base = offsetof(userspace_stats_t, counts);
+    const int source = base +
+        (probe ? offsetof(dr_userspace_transition_counts_t, probe_route)
+               : offsetof(dr_userspace_transition_counts_t, pending_route));
+    const int active = base + offsetof(dr_userspace_transition_counts_t, active_route);
+    const int writer = offsetof(userspace_stats_t, writing);
+    const int incomplete = base + offsetof(dr_userspace_transition_counts_t, incomplete);
+    const int overflow = base + offsetof(dr_userspace_transition_counts_t, overflow);
+    const int counter = base +
+        (probe ? offsetof(dr_userspace_transition_counts_t, probe_returns)
+               : offsetof(dr_userspace_transition_counts_t, dispatch_entries));
+    instr_t *done = INSTR_CREATE_label(dcontext);
+    instr_t *busy = INSTR_CREATE_label(dcontext);
+    instr_t *invalid = INSTR_CREATE_label(dcontext);
+    instr_t *release = INSTR_CREATE_label(dcontext);
+    instr_t *increment = INSTR_CREATE_label(dcontext);
+    instr_t *commit = INSTR_CREATE_label(dcontext);
+    APP(ilist,
+        INSTR_CREATE_mov_ld(
+            dcontext, opnd_create_reg(REG_XDX),
+            OPND_CREATE_MEMPTR(REG_DCTXT, offsetof(dcontext_t, client_userspace_stats))));
+    APP(ilist,
+        INSTR_CREATE_test(dcontext, opnd_create_reg(REG_XDX), opnd_create_reg(REG_XDX)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_je, opnd_create_instr(done)));
+    APP(ilist,
+        INSTR_CREATE_cmp(dcontext, OPND_CREATE_MEM64(REG_XDX, source),
+                         OPND_CREATE_INT8(0)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_je, opnd_create_instr(probe ? busy : done)));
+    APP(ilist,
+        INSTR_CREATE_cmp(
+            dcontext,
+            OPND_CREATE_MEM8(REG_DCTXT, offsetof(dcontext_t, client_userspace_active)),
+            OPND_CREATE_INT8(0)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_je, opnd_create_instr(done)));
+    APP(ilist,
+        INSTR_CREATE_mov_imm(dcontext, opnd_create_reg(REG_EAX), OPND_CREATE_INT32(1)));
+    APP(ilist,
+        INSTR_CREATE_xchg(dcontext, OPND_CREATE_MEM32(REG_XDX, writer),
+                          opnd_create_reg(REG_EAX)));
+    APP(ilist,
+        INSTR_CREATE_test(dcontext, opnd_create_reg(REG_EAX), opnd_create_reg(REG_EAX)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_jne, opnd_create_instr(busy)));
+    APP(ilist,
+        INSTR_CREATE_mov_ld(dcontext, opnd_create_reg(REG_XCX),
+                            OPND_CREATE_MEM64(REG_XDX, source)));
+    APP(ilist, INSTR_CREATE_cmp(dcontext, opnd_create_reg(REG_XCX), OPND_CREATE_INT8(1)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_jb, opnd_create_instr(invalid)));
+    APP(ilist, INSTR_CREATE_cmp(dcontext, opnd_create_reg(REG_XCX), OPND_CREATE_INT8(2)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_ja, opnd_create_instr(invalid)));
+    APP(ilist,
+        INSTR_CREATE_cmp(dcontext, OPND_CREATE_MEM64(REG_XDX, active),
+                         OPND_CREATE_INT8(0)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_jne, opnd_create_instr(invalid)));
+    opnd_t value = opnd_create_base_disp(REG_XDX, REG_XCX, 8, counter - 8, OPSZ_8);
+    APP(ilist, INSTR_CREATE_cmp(dcontext, value, OPND_CREATE_INT8(-1)));
+    APP(ilist, INSTR_CREATE_jcc(dcontext, OP_jne, opnd_create_instr(increment)));
+    APP(ilist,
+        INSTR_CREATE_mov_imm(dcontext, OPND_CREATE_MEM64(REG_XDX, overflow),
+                             OPND_CREATE_INT32(1)));
+    APP(ilist, INSTR_CREATE_jmp(dcontext, opnd_create_instr(commit)));
+    APP(ilist, increment);
+    APP(ilist, INSTR_CREATE_inc(dcontext, value));
+    APP(ilist, commit);
+    APP(ilist,
+        INSTR_CREATE_mov_st(dcontext, OPND_CREATE_MEM64(REG_XDX, active),
+                            opnd_create_reg(REG_XCX)));
+    APP(ilist,
+        INSTR_CREATE_mov_imm(dcontext, OPND_CREATE_MEM64(REG_XDX, source),
+                             OPND_CREATE_INT32(0)));
+    APP(ilist, INSTR_CREATE_jmp(dcontext, opnd_create_instr(release)));
+    APP(ilist, invalid);
+    APP(ilist,
+        INSTR_CREATE_mov_imm(dcontext, OPND_CREATE_MEM64(REG_XDX, incomplete),
+                             OPND_CREATE_INT32(1)));
+    APP(ilist, release);
+    APP(ilist,
+        INSTR_CREATE_mov_imm(dcontext, OPND_CREATE_MEM32(REG_XDX, writer),
+                             OPND_CREATE_INT32(0)));
+    APP(ilist, INSTR_CREATE_jmp(dcontext, opnd_create_instr(done)));
+    APP(ilist, busy);
+    APP(ilist,
+        INSTR_CREATE_mov_imm(dcontext, OPND_CREATE_MEM64(REG_XDX, incomplete),
+                             OPND_CREATE_INT32(1)));
+    APP(ilist, done);
+}
+#endif
+
 static byte *
 emit_fcache_enter_common(dcontext_t *dcontext, generated_code_t *code, byte *pc,
                          bool absolute, bool shared)
@@ -2155,6 +2250,10 @@ emit_fcache_enter_common(dcontext_t *dcontext, generated_code_t *code, byte *pc,
     append_fcache_enter_prologue(dcontext, &ilist, absolute);
     append_setup_fcache_target(dcontext, &ilist, absolute, shared);
     append_call_exit_dr_hook(dcontext, &ilist, absolute, shared);
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (DYNAMO_OPTION(userspace_transition_stats) && GENCODE_IS_X64(code->gencode_mode))
+        append_userspace_stats_commit(dcontext, &ilist, false);
+#endif
 
 #ifdef WINDOWS
     /* i#249: isolate the PEB and TEB */
@@ -2779,6 +2878,8 @@ encode_client_userspace_call_probe(byte *buffer, size_t capacity, app_pc executi
         INSTR_CREATE_test(dcontext, opnd_create_reg(DR_REG_AL),
                           opnd_create_reg(DR_REG_AL)));
     APP(&ilist, INSTR_CREATE_jcc(dcontext, OP_jz, opnd_create_instr(fallback)));
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        append_userspace_stats_commit(dcontext, &ilist, true);
     APP(&ilist,
         INSTR_CREATE_lea(
             dcontext, opnd_create_reg(REG_XAX),

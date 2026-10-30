@@ -204,6 +204,7 @@ set(CORE_SRCS
     dynamo.c
     fragment.c
     fragment_shared.c
+    userspace_stats.c
     fcache.c
     link.c
     dispatch.c
@@ -1361,6 +1362,8 @@ dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_exec_resources.h
                  dr_exec_resources.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_thread_suspend.h
                  dr_thread_suspend.h)
+dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_userspace_stats.h
+                 dr_userspace_stats.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/annotations_api.h dr_annotation.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_inject.h dr_inject.h)
 dr_export_header(${CMAKE_CURRENT_SOURCE_DIR}/module_api.h dr_modules.h)

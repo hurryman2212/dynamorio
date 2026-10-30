@@ -56,6 +56,7 @@
 #include "ir_utils.h" /* IWYU pragma: keep */
 #include "../fragment.h"
 #include "../fragment_shared.h"
+#include "../userspace_stats.h"
 #include "../fcache.h"
 #include "../emit.h" /* IWYU pragma: keep */
 #include "../link.h"
@@ -5423,6 +5424,8 @@ dr_cancel_suspended_userspace_execution(void *drcontext)
     CLIENT_ASSERT(OWN_MUTEX(&all_threads_synch_lock) && OWN_MUTEX(&thread_initexit_lock),
                   "userspace cancellation requires suspended threads");
     atomic_add_exchange_int64(&dcontext->client_userspace_generation, 1);
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
     dcontext->client_userspace_target = NULL;
     if (dcontext->client_userspace_request_pc != NULL &&
         dcontext->next_tag == dcontext->client_userspace_request_pc)
@@ -7685,14 +7688,22 @@ dr_redirect_userspace_execution(dr_mcontext_t *mcontext, uint64 generation)
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     dcontext_t *dcontext = get_thread_private_dcontext();
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        userspace_stats_event(dcontext, USERSPACE_STATS_REQUEST, 0);
     if (dcontext == NULL || mcontext == NULL || mcontext->size != sizeof(dr_mcontext_t) ||
         mcontext->flags != DR_MC_ALL || mcontext->pc == NULL ||
         dr_get_isa_mode(dcontext) != DR_ISA_AMD64 ||
-        generation != dr_userspace_execution_generation(dcontext))
+        generation != dr_userspace_execution_generation(dcontext)) {
+        if (DYNAMO_OPTION(userspace_transition_stats))
+            userspace_stats_event(dcontext, USERSPACE_STATS_REJECT, 0);
         return false;
+    }
     const size_t fpstate_size = proc_fpstate_save_size();
-    if (fpstate_size != 512)
+    if (fpstate_size != 512) {
+        if (DYNAMO_OPTION(userspace_transition_stats))
+            userspace_stats_event(dcontext, USERSPACE_STATS_REJECT, 0);
         return false;
+    }
     /* SAVE_FLOAT follows the full aligned out-of-line context frame. Copy it
      * before dispatch resets the clean-call stack; a non-returning redirect does
      * not execute the usual FXRSTOR cleanup emitted after the call.
@@ -7705,15 +7716,24 @@ dr_redirect_userspace_execution(dr_mcontext_t *mcontext, uint64 generation)
     dcontext->client_userspace_request_generation = generation;
     dcontext->client_userspace_request_pc = mcontext->pc;
     dcontext->client_userspace_original_pc = mcontext->pc;
-    dr_lookup_userspace_code(mcontext->pc, &dcontext->client_userspace_original_pc, NULL);
+    const bool prepared = dr_lookup_userspace_code(
+        mcontext->pc, &dcontext->client_userspace_original_pc, NULL);
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        userspace_stats_event(dcontext, USERSPACE_STATS_QUEUE,
+                              prepared ? DR_USERSPACE_ROUTE_PREPARED
+                                       : DR_USERSPACE_ROUTE_ORIGINAL);
     dcontext->client_userspace_target = mcontext->pc;
     if (generation != dr_userspace_execution_generation(dcontext)) {
+        if (DYNAMO_OPTION(userspace_transition_stats))
+            userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
         dcontext->client_userspace_target = NULL;
         dcontext->client_userspace_request_pc = NULL;
         dcontext->client_userspace_fpstate_valid = false;
         return false;
     }
     if (!dr_redirect_execution(mcontext)) {
+        if (DYNAMO_OPTION(userspace_transition_stats))
+            userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
         dcontext->client_userspace_target = NULL;
         dcontext->client_userspace_request_pc = NULL;
         dcontext->client_userspace_fpstate_valid = false;
@@ -8101,6 +8121,10 @@ client_userspace_call_observe(dcontext_t *dcontext)
         CLIENT_ASSERT(false, "CALL probe return address has no registered continuation");
         dr_abort();
     }
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        userspace_stats_event(dcontext, USERSPACE_STATS_PROBE,
+                              copied ? DR_USERSPACE_ROUTE_PREPARED
+                                     : DR_USERSPACE_ROUTE_ORIGINAL);
     mc->pc = original;
     dcontext->next_tag = original;
     dcontext->client_userspace_original_pc = original;
@@ -8141,6 +8165,8 @@ client_userspace_call_observe(dcontext_t *dcontext)
 void
 client_userspace_call_fallback(dcontext_t *dcontext)
 {
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        userspace_stats_event(dcontext, USERSPACE_STATS_PROBE_FALLBACK, 0);
     priv_mcontext_t *mc = get_mcontext(dcontext);
     dr_mcontext_t source = { sizeof(source), DR_MC_ALL };
     priv_mcontext_to_dr_mcontext(&source, mc);
@@ -8161,6 +8187,8 @@ client_userspace_gate_dispatch(dcontext_t *dcontext)
      */
     os_swap_context(dcontext, false, DR_STATE_ALL);
     ENTERING_DR();
+    if (DYNAMO_OPTION(userspace_transition_stats))
+        userspace_stats_event(dcontext, USERSPACE_STATS_GATE, 0);
     dcontext->client_userspace_active = false;
     dcontext->client_userspace_fpstate_valid = true;
     priv_mcontext_t *mc = get_mcontext(dcontext);

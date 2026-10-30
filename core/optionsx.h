@@ -1004,6 +1004,8 @@ OPTION_DEFAULT_INTERNAL(bool, remove_shared_trace_heads, true,
 OPTION_DEFAULT(bool, remove_trace_components, false, "remove bb components of new traces")
 
 OPTION_DEFAULT(bool, shared_deletion, true, "enable shared fragment deletion")
+PC_OPTION_DEFAULT(bool, userspace_transition_stats, false,
+                  "count managed userspace transitions (startup-only diagnostic)")
 OPTION_DEFAULT(bool, syscalls_synch_flush, true,
                "syscalls are flush synch points (currently for shared_deletion only)")
 OPTION_DEFAULT(uint, lazy_deletion_max_pending, 128,

@@ -963,6 +963,24 @@ DR_API
 uint64
 dr_userspace_execution_generation(void *drcontext);
 
+#include "dr_userspace_stats.h" /* IWYU pragma: export */
+
+DR_API
+/**
+ * Reads diagnostic counters for the current thread only. Enable the startup-only
+ * -userspace_transition_stats option before initialization. Initialize struct_size
+ * and contract to sizeof(*result) and DR_USERSPACE_TRANSITION_CONTRACT_HASH.
+ * Returns false without waiting when disabled, incompatible, or a counter update
+ * is interrupted by this call. No allocation, callbacks, or output are performed.
+ * Successful snapshots may report overflow, incomplete, or an open/pending episode;
+ * these must not be inferred to be completed transitions. Probe returns are separate
+ * from dispatcher entries. Signal interruptions that resume managed code do not
+ * count as signal_reentries into the code cache. Supported on Linux x86-64 only.
+ */
+bool
+dr_get_userspace_transition_stats(void *drcontext,
+                                  dr_userspace_transition_stats_t *result);
+
 /** One gateway in a batch, ordered by its non-overlapping code offset. */
 typedef struct _dr_userspace_bound_gate_t {
     size_t offset;

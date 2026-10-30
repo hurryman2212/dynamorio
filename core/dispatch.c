@@ -53,6 +53,7 @@
 #include "emit.h"
 #include "arch.h"
 #include "instrument.h"
+#include "userspace_stats.h"
 
 #ifdef DGC_DIAGNOSTICS
 #    include "instr.h"
@@ -179,10 +180,15 @@ d_r_dispatch(dcontext_t *dcontext)
                     &dcontext->client_userspace_generation)) {
             dcontext->client_userspace_target = NULL;
             dcontext->client_userspace_request_pc = NULL;
+            if (DYNAMO_OPTION(userspace_transition_stats))
+                userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
         }
     }
 #endif
     dispatch_enter_dynamorio(dcontext);
+    if (DYNAMO_OPTION(userspace_transition_stats) &&
+        dcontext->client_userspace_target == NULL)
+        userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
     LOG(THREAD, LOG_INTERP, 2, "\nd_r_dispatch: target = " PFX "\n", dcontext->next_tag);
 
     /* This is really a 1-iter loop most of the time: we only iterate
@@ -212,6 +218,8 @@ d_r_dispatch(dcontext_t *dcontext)
                     dcontext->client_userspace_active = false;
                     dcontext->next_tag = dcontext->client_userspace_original_pc;
                     dcontext->client_userspace_request_pc = NULL;
+                    if (DYNAMO_OPTION(userspace_transition_stats))
+                        userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
                     continue;
                 }
                 enter_nolinking(dcontext, NULL, false);
@@ -228,6 +236,8 @@ d_r_dispatch(dcontext_t *dcontext)
                  */
                 os_swap_context(dcontext, false /*to DR*/, DR_STATE_ALL);
                 dcontext->client_userspace_active = false;
+                if (DYNAMO_OPTION(userspace_transition_stats))
+                    userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
                 KSTOP_NOT_MATCHING(fcache_default);
                 dcontext->whereami = DR_WHERE_DISPATCH;
                 enter_couldbelinking(dcontext, NULL, true);
@@ -235,6 +245,8 @@ d_r_dispatch(dcontext_t *dcontext)
                 receive_pending_signal(dcontext);
                 continue;
             }
+            if (DYNAMO_OPTION(userspace_transition_stats))
+                userspace_stats_event(dcontext, USERSPACE_STATS_CANCEL, 0);
         }
 #endif
         if (is_in_dynamo_dll(dcontext->next_tag) ||
